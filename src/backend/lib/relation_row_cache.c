@@ -1,8 +1,9 @@
-﻿#include "postgres.h"
+#include "postgres.h"
 
 #include "access/tableam.h"
 #include "common/hashfn.h"
 #include "executor/tuptable.h"
+#include "access/htup_details.h"
 #include "lib/relation_row_cache.h"
 #include "lib/tid_row_cache.h"
 #include "utils/memutils.h"
@@ -28,6 +29,8 @@ typedef struct RelationRowCacheEntry
 
 static MemoryContext RelationRowCacheContext = NULL;
 static relation_row_cache_hash *RelationRowCacheHash = NULL;
+static Oid RelationRowCacheFastRelid = InvalidOid;
+static RelationRowCacheEntry *RelationRowCacheFastEntry = NULL;
 
 /* 计算一级 hash（relid）的哈希值。 */
 static inline uint32
@@ -53,6 +56,20 @@ RelationRowCacheKeysEqual(Oid a, Oid b)
 #define SH_DEFINE
 #include "lib/simplehash.h"
 
+static inline RelationRowCacheEntry *
+RelationRowCacheLookupRelEntry(Oid relid)
+{
+	RelationRowCacheEntry *entry;
+
+	if (RelationRowCacheFastRelid == relid)
+		return RelationRowCacheFastEntry;
+
+	entry = relation_row_cache_lookup(RelationRowCacheHash, relid);
+	RelationRowCacheFastRelid = relid;
+	RelationRowCacheFastEntry = entry;
+	return entry;
+}
+
 /*
  * 清理单个关系缓存条目。
  * 通过删除该关系的子上下文，一次性释放其二级 tid 缓存和所有元组副本。
@@ -60,6 +77,12 @@ RelationRowCacheKeysEqual(Oid a, Oid b)
 static void
 RelationRowCacheResetEntry(RelationRowCacheEntry *entry)
 {
+	if (RelationRowCacheFastRelid == entry->relid)
+	{
+		RelationRowCacheFastRelid = InvalidOid;
+		RelationRowCacheFastEntry = NULL;
+	}
+
 	if (entry->row_ctx != NULL)
 	{
 		MemoryContextDelete(entry->row_ctx);
@@ -99,7 +122,7 @@ RelationRowCacheDropRelation(Oid relid)
 
 	RelationRowCacheBackendInit();
 
-	entry = relation_row_cache_lookup(RelationRowCacheHash, relid);
+	entry = RelationRowCacheLookupRelEntry(relid);
 	if (entry == NULL)
 		return;
 
@@ -142,6 +165,8 @@ RelationRowCacheLoadRelation(Relation rel)
 									   ALLOCSET_DEFAULT_SIZES);
 	entry->tid_cache = TidRowCacheCreate(entry->row_ctx, 128);
 	entry->natts = RelationGetDescr(rel)->natts;
+	RelationRowCacheFastRelid = entry->relid;
+	RelationRowCacheFastEntry = entry;
 
 	if (!ActiveSnapshotSet())
 	{
@@ -181,8 +206,7 @@ RelationRowCacheFillSlot(TupleTableSlot *slot)
 	RelationRowCacheBackendInit();
 
 	/* 查询顺序：先按 relid 命中一级，再按 tid 命中二级。 */
-	rel_entry = relation_row_cache_lookup(RelationRowCacheHash,
-									  slot->tts_tableOid);
+	rel_entry = RelationRowCacheLookupRelEntry(slot->tts_tableOid);
 	if (rel_entry == NULL || rel_entry->tid_cache == NULL)
 		return false;
 
@@ -191,4 +215,76 @@ RelationRowCacheFillSlot(TupleTableSlot *slot)
 		return false;
 
 	return TidRowCacheFillSlot(tid_entry, rel_entry->relid, slot);
+}
+
+/*
+ * Conservative MVCC visibility check based on tuple header bits already in
+ * cache. Unknown states are treated as "not visible" to preserve correctness.
+ */
+static bool
+RelationRowCacheTupleVisibleMVCC(HeapTuple tuple, Snapshot snapshot)
+{
+	uint16		infomask;
+	HeapTupleHeaderData *thdr;
+
+	if (!IsMVCCSnapshot(snapshot))
+		return false;
+
+	thdr = tuple->t_data;
+	infomask = thdr->t_infomask;
+
+	if (HeapTupleHeaderXminInvalid(thdr))
+		return false;
+	if (!HeapTupleHeaderXminCommitted(thdr))
+		return false;
+
+	if (infomask & HEAP_XMAX_INVALID)
+		return true;
+	if (HEAP_XMAX_IS_LOCKED_ONLY(infomask))
+		return true;
+	if (infomask & HEAP_XMAX_COMMITTED)
+		return false;
+
+	/* Unknown xmax state: be conservative and let caller fallback if needed. */
+	return false;
+}
+
+bool
+RelationRowCacheFetchWithVisibility(Oid relid,
+									ItemPointer tid,
+									Snapshot snapshot,
+									TupleTableSlot *slot,
+									bool *is_visible,
+									bool *has_hot_chain)
+{
+	RelationRowCacheEntry *rel_entry;
+	TidRowCacheEntry *tid_entry;
+
+	Assert(slot != NULL);
+	Assert(is_visible != NULL);
+	Assert(has_hot_chain != NULL);
+
+	*is_visible = false;
+	*has_hot_chain = false;
+
+	if (!OidIsValid(relid) || !ItemPointerIsValid(tid))
+		return false;
+
+	RelationRowCacheBackendInit();
+
+	rel_entry = RelationRowCacheLookupRelEntry(relid);
+	if (rel_entry == NULL || rel_entry->tid_cache == NULL)
+		return false;
+
+	tid_entry = TidRowCacheLookupEntry(rel_entry->tid_cache, tid);
+	if (tid_entry == NULL)
+		return false;
+
+	*has_hot_chain = HeapTupleIsHotUpdated(tid_entry->heap_tuple);
+	*is_visible = RelationRowCacheTupleVisibleMVCC(tid_entry->heap_tuple, snapshot);
+
+	if (*is_visible)
+		return TidRowCacheFillSlot(tid_entry, rel_entry->relid, slot);
+
+	return true;
 }

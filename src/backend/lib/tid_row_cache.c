@@ -1,4 +1,4 @@
-﻿#include "postgres.h"
+#include "postgres.h"
 
 #include <string.h>
 

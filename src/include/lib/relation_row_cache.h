@@ -5,6 +5,7 @@
 
 #include "executor/tuptable.h"
 #include "utils/rel.h"
+#include "utils/snapshot.h"
 
 /* 在 TopMemoryContext 中初始化后端级全局缓存状态。 */
 extern void RelationRowCacheBackendInit(void);
@@ -12,6 +13,16 @@ extern void RelationRowCacheBackendInit(void);
 extern void RelationRowCacheLoadRelation(Relation rel);
 /* 使用 slot->tts_tableOid + slot->tts_tid 从缓存回填现有 slot。 */
 extern bool RelationRowCacheFillSlot(TupleTableSlot *slot);
+/*
+ * 按 (relid, tid) 查询缓存，并给出可见性与 HOT 链信息。
+ * 返回值表示是否命中缓存项；命中时由 *is_visible / *has_hot_chain 返回判定结果。
+ */
+extern bool RelationRowCacheFetchWithVisibility(Oid relid,
+												ItemPointer tid,
+												Snapshot snapshot,
+												TupleTableSlot *slot,
+												bool *is_visible,
+												bool *has_hot_chain);
 /* 删除该关系的子上下文，从而整体释放该关系缓存。 */
 extern void RelationRowCacheDropRelation(Oid relid);
 
