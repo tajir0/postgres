@@ -5,6 +5,7 @@
 #include "common/hashfn.h"
 #include "executor/tuptable.h"
 #include "lib/tid_row_cache.h"
+#include "utils/datum.h"
 
 #define SH_PREFIX tid_row_cache
 #define SH_ELEMENT_TYPE TidRowCacheEntry
