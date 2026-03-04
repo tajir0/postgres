@@ -1,9 +1,9 @@
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/tableam.h"
 #include "common/hashfn.h"
 #include "executor/tuptable.h"
-#include "access/htup_details.h"
 #include "lib/relation_row_cache.h"
 #include "lib/tid_row_cache.h"
 #include "utils/memutils.h"
@@ -13,7 +13,7 @@ typedef struct RelationRowCacheEntry
 {
 	char		status;
 	Oid			relid;
-	/* 每个关系独立子上下文，删除后可整体释放该关系的 tid 缓存。 */
+	/* Per-relation context to drop the entire second-level cache at once. */
 	MemoryContext row_ctx;
 	TidRowCache *tid_cache;
 	int			natts;
@@ -32,14 +32,12 @@ static relation_row_cache_hash *RelationRowCacheHash = NULL;
 static Oid RelationRowCacheFastRelid = InvalidOid;
 static RelationRowCacheEntry *RelationRowCacheFastEntry = NULL;
 
-/* 计算一级 hash（relid）的哈希值。 */
 static inline uint32
 RelationRowCacheHashKey(Oid relid)
 {
 	return murmurhash32(relid);
 }
 
-/* 比较两个 relid 是否相等。 */
 static inline bool
 RelationRowCacheKeysEqual(Oid a, Oid b)
 {
@@ -71,9 +69,29 @@ RelationRowCacheLookupRelEntry(Oid relid)
 }
 
 /*
- * 清理单个关系缓存条目。
- * 通过删除该关系的子上下文，一次性释放其二级 tid 缓存和所有元组副本。
+ * Estimate second-level hash size from reltuples and keep slack to reduce
+ * probe length and table growth.
  */
+static uint32
+RelationRowCacheEstimateElements(Relation rel)
+{
+	double		reltuples = rel->rd_rel->reltuples;
+	uint64		est;
+
+	if (reltuples > 1.0)
+		est = (uint64) (reltuples * 1.3) + 1;
+	else
+		est = 1024;
+
+	if (est < 128)
+		est = 128;
+	if (est > (PG_UINT32_MAX / 2))
+		est = (PG_UINT32_MAX / 2);
+
+	return (uint32) est;
+}
+
+/* Drop one relation entry and all second-level memory in one shot. */
 static void
 RelationRowCacheResetEntry(RelationRowCacheEntry *entry)
 {
@@ -92,29 +110,20 @@ RelationRowCacheResetEntry(RelationRowCacheEntry *entry)
 	entry->natts = 0;
 }
 
-/*
- * 初始化后端级关系行缓存。
- * 创建一级 hash：relid -> RelationRowCacheEntry。
- */
 void
 RelationRowCacheBackendInit(void)
 {
 	if (RelationRowCacheHash != NULL)
 		return;
 
-	/* 后端生命周期根上下文，承载一级 hash。 */
 	RelationRowCacheContext = AllocSetContextCreate(TopMemoryContext,
-													"BackendRelationRowCache",
-													ALLOCSET_DEFAULT_SIZES);
+												"BackendRelationRowCache",
+												ALLOCSET_DEFAULT_SIZES);
 	RelationRowCacheHash = relation_row_cache_create(RelationRowCacheContext,
-												 16,
-												 NULL);
+											 16,
+											 NULL);
 }
 
-/*
- * 删除单个关系的缓存。
- * 先释放该关系子上下文，再从一级 hash 移除条目。
- */
 void
 RelationRowCacheDropRelation(Oid relid)
 {
@@ -130,16 +139,13 @@ RelationRowCacheDropRelation(Oid relid)
 	relation_row_cache_delete(RelationRowCacheHash, relid);
 }
 
-/*
- * 将整张表导入缓存。
- * 若该关系已存在缓存，则先清理旧缓存，再重建二级 tid 缓存。
- */
 void
 RelationRowCacheLoadRelation(Relation rel)
 {
 	RelationRowCacheEntry *entry;
 	TableScanDesc scan;
 	TupleTableSlot *scan_slot;
+	uint32		est_nelements;
 	bool		found;
 	bool		pushed_snapshot = false;
 
@@ -148,8 +154,8 @@ RelationRowCacheLoadRelation(Relation rel)
 	RelationRowCacheBackendInit();
 
 	entry = relation_row_cache_insert(RelationRowCacheHash,
-									  RelationGetRelid(rel),
-									  &found);
+								  RelationGetRelid(rel),
+								  &found);
 	if (!found)
 	{
 		entry->row_ctx = NULL;
@@ -159,11 +165,11 @@ RelationRowCacheLoadRelation(Relation rel)
 
 	RelationRowCacheResetEntry(entry);
 
-	/* 为该关系创建二级 tid 缓存专用子上下文。 */
 	entry->row_ctx = AllocSetContextCreate(RelationRowCacheContext,
 									   "RelationTidRowCache",
 									   ALLOCSET_DEFAULT_SIZES);
-	entry->tid_cache = TidRowCacheCreate(entry->row_ctx, 128);
+	est_nelements = RelationRowCacheEstimateElements(rel);
+	entry->tid_cache = TidRowCacheCreate(entry->row_ctx, est_nelements);
 	entry->natts = RelationGetDescr(rel)->natts;
 	RelationRowCacheFastRelid = entry->relid;
 	RelationRowCacheFastEntry = entry;
@@ -177,7 +183,6 @@ RelationRowCacheLoadRelation(Relation rel)
 	scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL);
 	scan_slot = table_slot_create(rel, NULL);
 
-	/* 将整张表导入到二级 tid 缓存。 */
 	while (table_scan_getnextslot(scan, ForwardScanDirection, scan_slot))
 		TidRowCacheStoreFromSlot(entry->tid_cache, scan_slot, entry->row_ctx);
 
@@ -188,10 +193,6 @@ RelationRowCacheLoadRelation(Relation rel)
 		PopActiveSnapshot();
 }
 
-/*
- * 按已有 slot 的 tableOid + tid 回填缓存内容。
- * 返回 true 表示命中并已回填，false 表示未命中或参数无效。
- */
 bool
 RelationRowCacheFillSlot(TupleTableSlot *slot)
 {
@@ -205,7 +206,6 @@ RelationRowCacheFillSlot(TupleTableSlot *slot)
 
 	RelationRowCacheBackendInit();
 
-	/* 查询顺序：先按 relid 命中一级，再按 tid 命中二级。 */
 	rel_entry = RelationRowCacheLookupRelEntry(slot->tts_tableOid);
 	if (rel_entry == NULL || rel_entry->tid_cache == NULL)
 		return false;
@@ -214,7 +214,7 @@ RelationRowCacheFillSlot(TupleTableSlot *slot)
 	if (tid_entry == NULL)
 		return false;
 
-	return TidRowCacheFillSlot(tid_entry, rel_entry->relid, slot);
+	return TidRowCacheFillSlot(tid_entry, rel_entry->relid, &slot->tts_tid, slot);
 }
 
 /*
@@ -245,7 +245,6 @@ RelationRowCacheTupleVisibleMVCC(HeapTuple tuple, Snapshot snapshot)
 	if (infomask & HEAP_XMAX_COMMITTED)
 		return false;
 
-	/* Unknown xmax state: be conservative and let caller fallback if needed. */
 	return false;
 }
 
@@ -284,7 +283,7 @@ RelationRowCacheFetchWithVisibility(Oid relid,
 	*is_visible = RelationRowCacheTupleVisibleMVCC(tid_entry->heap_tuple, snapshot);
 
 	if (*is_visible)
-		return TidRowCacheFillSlot(tid_entry, rel_entry->relid, slot);
+		return TidRowCacheFillSlot(tid_entry, rel_entry->relid, tid, slot);
 
 	return true;
 }

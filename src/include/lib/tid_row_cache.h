@@ -5,12 +5,10 @@
 
 #include "executor/tuptable.h"
 
-typedef struct tid_row_cache_hash TidRowCache;
+typedef struct TidRowCache TidRowCache;
 
 typedef struct TidRowCacheEntry
 {
-	char		status;
-	ItemPointerData tid;
 	/* 完整拷贝的元组负载，供后端生命周期内读取。 */
 	Datum	   *tts_values;
 	bool	   *tts_isnull;
@@ -28,6 +26,7 @@ extern void TidRowCacheStoreFromSlot(TidRowCache *cache,
 /* 将缓存中的元组负载写回到现有 slot。 */
 extern bool TidRowCacheFillSlot(const TidRowCacheEntry *entry,
 								Oid relid,
+								ItemPointer tid,
 								TupleTableSlot *slot);
 
 #endif							/* TID_ROW_CACHE_H */
