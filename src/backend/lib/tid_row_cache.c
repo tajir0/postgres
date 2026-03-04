@@ -232,7 +232,6 @@ TidRowCacheFillSlot(const TidRowCacheEntry *entry,
 
 	ExecForceStoreHeapTuple(tuple_copy, slot, true);
 
-	slot_getallattrs(slot);
 	memcpy(slot->tts_values,
 		   entry->tts_values,
 		   sizeof(Datum) * entry->natts);
