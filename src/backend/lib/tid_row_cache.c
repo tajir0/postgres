@@ -218,8 +218,6 @@ TidRowCacheFillSlot(const TidRowCacheEntry *entry,
 					ItemPointer tid,
 					TupleTableSlot *slot)
 {
-	HeapTuple	tuple_copy;
-
 	Assert(entry != NULL);
 	Assert(slot != NULL);
 	Assert(tid != NULL);
@@ -227,10 +225,11 @@ TidRowCacheFillSlot(const TidRowCacheEntry *entry,
 	if (slot->tts_tupleDescriptor->natts != entry->natts)
 		return false;
 
-	tuple_copy = heap_copytuple(entry->heap_tuple);
-	tuple_copy->t_tableOid = relid;
-
-	ExecForceStoreHeapTuple(tuple_copy, slot, true);
+	/*
+	 * Use cached tuple directly for all slot types and keep shouldFree=false,
+	 * so slot never owns/free this tuple.
+	 */
+	ExecForceStoreHeapTupleNoCopy(entry->heap_tuple, slot, false);
 
 	memcpy(slot->tts_values,
 		   entry->tts_values,
