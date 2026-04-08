@@ -197,7 +197,7 @@ bool
 RelationRowCacheFillSlot(TupleTableSlot *slot)
 {
 	RelationRowCacheEntry *rel_entry;
-	TidRowCacheEntry *tid_entry;
+	FlatCachedTuple *flat;
 
 	Assert(slot != NULL);
 
@@ -210,11 +210,11 @@ RelationRowCacheFillSlot(TupleTableSlot *slot)
 	if (rel_entry == NULL || rel_entry->tid_cache == NULL)
 		return false;
 
-	tid_entry = TidRowCacheLookupEntry(rel_entry->tid_cache, &slot->tts_tid);
-	if (tid_entry == NULL)
+	flat = TidRowCacheLookupEntry(rel_entry->tid_cache, &slot->tts_tid);
+	if (flat == NULL)
 		return false;
 
-	return TidRowCacheFillSlot(tid_entry, rel_entry->relid, &slot->tts_tid, slot);
+	return TidRowCacheFillSlot(flat, rel_entry->relid, &slot->tts_tid, slot);
 }
 
 /*
@@ -257,7 +257,8 @@ RelationRowCacheFetchWithVisibility(Oid relid,
 									bool *has_hot_chain)
 {
 	RelationRowCacheEntry *rel_entry;
-	TidRowCacheEntry *tid_entry;
+	FlatCachedTuple *flat;
+	HeapTupleData htup;
 
 	Assert(slot != NULL);
 	Assert(is_visible != NULL);
@@ -275,15 +276,20 @@ RelationRowCacheFetchWithVisibility(Oid relid,
 	if (rel_entry == NULL || rel_entry->tid_cache == NULL)
 		return false;
 
-	tid_entry = TidRowCacheLookupEntry(rel_entry->tid_cache, tid);
-	if (tid_entry == NULL)
+	flat = TidRowCacheLookupEntry(rel_entry->tid_cache, tid);
+	if (flat == NULL)
 		return false;
 
-	*has_hot_chain = HeapTupleIsHotUpdated(tid_entry->heap_tuple);
-	*is_visible = RelationRowCacheTupleVisibleMVCC(tid_entry->heap_tuple, snapshot);
+	htup.t_data = (HeapTupleHeader) FLAT_TUPLE_HTUP_DATA(flat);
+	htup.t_len = flat->htup_len;
+	htup.t_tableOid = relid;
+	ItemPointerCopy(tid, &htup.t_self);
+
+	*has_hot_chain = HeapTupleIsHotUpdated(&htup);
+	*is_visible = RelationRowCacheTupleVisibleMVCC(&htup, snapshot);
 
 	if (*is_visible)
-		return TidRowCacheFillSlot(tid_entry, rel_entry->relid, tid, slot);
+		return TidRowCacheFillSlot(flat, rel_entry->relid, tid, slot);
 
 	return true;
 }

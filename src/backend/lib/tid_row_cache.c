@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "access/htup_details.h"
 #include "common/hashfn.h"
 #include "executor/tuptable.h"
 #include "lib/tid_row_cache.h"
@@ -12,7 +13,7 @@
 typedef struct TidRowBlock
 {
 	int			capacity;
-	TidRowCacheEntry **entries;
+	FlatCachedTuple **entries;
 } TidRowBlock;
 
 typedef struct TidRowBlockMapEntry
@@ -34,7 +35,6 @@ typedef struct TidRowBlockMapEntry
 static inline uint32
 TidRowBlockHashKey(const BlockNumber key)
 {
-	/* BlockNumber is 32bit, hashing it directly is enough here. */
 	return murmurhash32((uint32) key);
 }
 
@@ -77,7 +77,7 @@ static void
 TidRowBlockEnsureCapacity(TidRowBlock *block, OffsetNumber off)
 {
 	int			newcap;
-	TidRowCacheEntry **newentries;
+	FlatCachedTuple **newentries;
 
 	if ((int) off < block->capacity)
 		return;
@@ -86,11 +86,11 @@ TidRowBlockEnsureCapacity(TidRowBlock *block, OffsetNumber off)
 	while (newcap <= (int) off)
 		newcap <<= 1;
 
-	newentries = (TidRowCacheEntry **) repalloc(block->entries,
-												sizeof(TidRowCacheEntry *) * newcap);
+	newentries = (FlatCachedTuple **) repalloc(block->entries,
+											   sizeof(FlatCachedTuple *) * newcap);
 	MemSet(newentries + block->capacity,
 		   0,
-		   sizeof(TidRowCacheEntry *) * (newcap - block->capacity));
+		   sizeof(FlatCachedTuple *) * (newcap - block->capacity));
 	block->entries = newentries;
 	block->capacity = newcap;
 }
@@ -104,10 +104,6 @@ TidRowCacheCreate(MemoryContext ctx, uint32 nelements)
 	cache = (TidRowCache *) MemoryContextAllocZero(ctx, sizeof(TidRowCache));
 	cache->ctx = ctx;
 
-	/*
-	 * nelements is tuple-level estimate from caller. Convert it to rough block
-	 * count (about tens of tuples per page), keep a floor to avoid frequent grow.
-	 */
 	block_estimate = nelements / 64;
 	if (block_estimate < 128)
 		block_estimate = 128;
@@ -116,7 +112,7 @@ TidRowCacheCreate(MemoryContext ctx, uint32 nelements)
 	return cache;
 }
 
-TidRowCacheEntry *
+FlatCachedTuple *
 TidRowCacheLookupEntry(TidRowCache *cache, ItemPointer tid)
 {
 	BlockNumber blockno;
@@ -138,19 +134,104 @@ TidRowCacheLookupEntry(TidRowCache *cache, ItemPointer tid)
 	return block_entry->block.entries[off];
 }
 
+/*
+ * Flatten a slot's tuple data into a single contiguous palloc'd block.
+ *
+ * Pass-by-val Datums are stored inline in the values[] array.
+ * Pass-by-ref Datums have their payloads copied to the varlen area at
+ * the end of the block, and values[] stores a pointer into that area.
+ */
+static FlatCachedTuple *
+FlattenTupleFromSlot(TupleTableSlot *slot, MemoryContext target_ctx)
+{
+	TupleDesc	desc = slot->tts_tupleDescriptor;
+	int			natts = desc->natts;
+	HeapTuple	htup;
+	Size		total_size;
+	uint32		values_offset,
+				isnull_offset,
+				htup_offset,
+				varlen_offset;
+	FlatCachedTuple *ft;
+	Datum	   *dst_values;
+	bool	   *dst_isnull;
+	char	   *varlen_cursor;
+	MemoryContext old_ctx;
+
+	htup = ExecCopySlotHeapTuple(slot);
+
+	values_offset = MAXALIGN(sizeof(FlatCachedTuple));
+	isnull_offset = values_offset + sizeof(Datum) * natts;
+	htup_offset = MAXALIGN(isnull_offset + sizeof(bool) * natts);
+
+	varlen_offset = htup_offset + MAXALIGN(htup->t_len);
+	total_size = varlen_offset;
+
+	for (int i = 0; i < natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(desc, i);
+
+		if (!slot->tts_isnull[i] && !attr->attbyval)
+			total_size += MAXALIGN(datumGetSize(slot->tts_values[i],
+												false, attr->attlen));
+	}
+
+	old_ctx = MemoryContextSwitchTo(target_ctx);
+	ft = (FlatCachedTuple *) palloc0(total_size);
+	MemoryContextSwitchTo(old_ctx);
+
+	ft->total_size = total_size;
+	ft->natts = natts;
+	ft->htup_offset = htup_offset;
+	ft->htup_len = htup->t_len;
+
+	dst_values = FLAT_TUPLE_VALUES(ft);
+	dst_isnull = FLAT_TUPLE_ISNULL(ft);
+	varlen_cursor = (char *) ft + varlen_offset;
+
+	for (int i = 0; i < natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(desc, i);
+
+		dst_isnull[i] = slot->tts_isnull[i];
+
+		if (slot->tts_isnull[i])
+		{
+			dst_values[i] = (Datum) 0;
+		}
+		else if (attr->attbyval)
+		{
+			dst_values[i] = slot->tts_values[i];
+		}
+		else
+		{
+			Size		datum_size = datumGetSize(slot->tts_values[i],
+												 false, attr->attlen);
+
+			memcpy(varlen_cursor,
+				   DatumGetPointer(slot->tts_values[i]),
+				   datum_size);
+			dst_values[i] = PointerGetDatum(varlen_cursor);
+			varlen_cursor += MAXALIGN(datum_size);
+		}
+	}
+
+	memcpy((char *) ft + htup_offset, htup->t_data, htup->t_len);
+
+	heap_freetuple(htup);
+	return ft;
+}
+
 void
 TidRowCacheStoreFromSlot(TidRowCache *cache,
 						 TupleTableSlot *slot,
 						 MemoryContext target_ctx)
 {
 	TidRowBlockMapEntry *block_entry;
-	TidRowCacheEntry *entry;
-	TupleDesc	desc = slot->tts_tupleDescriptor;
-	MemoryContext old_ctx;
+	FlatCachedTuple *ft;
 	BlockNumber blockno;
 	OffsetNumber off;
 	bool		found;
-	int			i;
 
 	Assert(cache != NULL);
 	Assert(slot != NULL);
@@ -161,83 +242,57 @@ TidRowCacheStoreFromSlot(TidRowCache *cache,
 	blockno = ItemPointerGetBlockNumberNoCheck(&slot->tts_tid);
 	off = ItemPointerGetOffsetNumberNoCheck(&slot->tts_tid);
 
-	old_ctx = MemoryContextSwitchTo(target_ctx);
-
 	block_entry = tid_row_block_map_insert(cache->blocks, blockno, &found);
 	if (!found)
 	{
+		MemoryContext old_ctx = MemoryContextSwitchTo(target_ctx);
+
 		block_entry->block.capacity = TidRowBlockInitialCapacity(off);
 		block_entry->block.entries =
-			(TidRowCacheEntry **) palloc0(sizeof(TidRowCacheEntry *) *
-										  block_entry->block.capacity);
+			(FlatCachedTuple **) palloc0(sizeof(FlatCachedTuple *) *
+										 block_entry->block.capacity);
+		MemoryContextSwitchTo(old_ctx);
 	}
 	else
 		TidRowBlockEnsureCapacity(&block_entry->block, off);
 
-	entry = block_entry->block.entries[off];
-	if (entry == NULL)
-	{
-		entry = (TidRowCacheEntry *) palloc0(sizeof(TidRowCacheEntry));
-		block_entry->block.entries[off] = entry;
-	}
-	else
-	{
-		if (entry->tts_values)
-			pfree(entry->tts_values);
-		if (entry->tts_isnull)
-			pfree(entry->tts_isnull);
-		if (entry->heap_tuple)
-			heap_freetuple(entry->heap_tuple);
-	}
+	if (block_entry->block.entries[off] != NULL)
+		pfree(block_entry->block.entries[off]);
 
-	entry->natts = desc->natts;
-	entry->tts_values = (Datum *) palloc0(sizeof(Datum) * desc->natts);
-	entry->tts_isnull = (bool *) palloc(sizeof(bool) * desc->natts);
-
-	for (i = 0; i < desc->natts; i++)
-	{
-		Form_pg_attribute attr = TupleDescAttr(desc, i);
-
-		entry->tts_isnull[i] = slot->tts_isnull[i];
-		if (slot->tts_isnull[i])
-			entry->tts_values[i] = (Datum) 0;
-		else
-			entry->tts_values[i] = datumCopy(slot->tts_values[i],
-											 attr->attbyval,
-											 attr->attlen);
-	}
-
-	entry->heap_tuple = ExecCopySlotHeapTuple(slot);
-
-	MemoryContextSwitchTo(old_ctx);
+	ft = FlattenTupleFromSlot(slot, target_ctx);
+	block_entry->block.entries[off] = ft;
 }
 
 bool
-TidRowCacheFillSlot(const TidRowCacheEntry *entry,
+TidRowCacheFillSlot(const FlatCachedTuple *flat,
 					Oid relid,
 					ItemPointer tid,
 					TupleTableSlot *slot)
 {
-	Assert(entry != NULL);
+	HeapTupleData htup;
+	Datum	   *src_values;
+	bool	   *src_isnull;
+
+	Assert(flat != NULL);
 	Assert(slot != NULL);
 	Assert(tid != NULL);
 
-	if (slot->tts_tupleDescriptor->natts != entry->natts)
+	if (slot->tts_tupleDescriptor->natts != flat->natts)
 		return false;
 
-	/*
-	 * Use cached tuple directly for all slot types and keep shouldFree=false,
-	 * so slot never owns/free this tuple.
-	 */
-	ExecForceStoreHeapTupleNoCopy(entry->heap_tuple, slot, false);
+	htup.t_data = (HeapTupleHeader) FLAT_TUPLE_HTUP_DATA(flat);
+	htup.t_len = flat->htup_len;
+	htup.t_tableOid = relid;
+	ItemPointerCopy(tid, &htup.t_self);
 
-	memcpy(slot->tts_values,
-		   entry->tts_values,
-		   sizeof(Datum) * entry->natts);
-	memcpy(slot->tts_isnull,
-		   entry->tts_isnull,
-		   sizeof(bool) * entry->natts);
-	slot->tts_nvalid = entry->natts;
+	ExecForceStoreHeapTupleNoCopy(&htup, slot, false);
+
+	src_values = FLAT_TUPLE_VALUES(flat);
+	src_isnull = FLAT_TUPLE_ISNULL(flat);
+
+	memcpy(slot->tts_values, src_values, sizeof(Datum) * flat->natts);
+	memcpy(slot->tts_isnull, src_isnull, sizeof(bool) * flat->natts);
+	slot->tts_nvalid = flat->natts;
 	ItemPointerCopy(tid, &slot->tts_tid);
 	slot->tts_tableOid = relid;
 
