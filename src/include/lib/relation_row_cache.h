@@ -7,15 +7,18 @@
 #include "utils/rel.h"
 #include "utils/snapshot.h"
 
-/* 在 TopMemoryContext 中初始化后端级全局缓存状态。 */
-extern void RelationRowCacheBackendInit(void);
-/* 扫描指定关系的可见元组，重建该关系的缓存。 */
+/* Shared memory sizing and initialization (called from ipci.c). */
+extern Size RowCacheShmemSize(void);
+extern void RowCacheShmemInit(void);
+
+/* Load all visible tuples of a relation into the shared row cache. */
 extern void RelationRowCacheLoadRelation(Relation rel);
-/* 使用 slot->tts_tableOid + slot->tts_tid 从缓存回填现有 slot。 */
+/* Fill slot from the shared cache using slot->tts_tableOid + slot->tts_tid. */
 extern bool RelationRowCacheFillSlot(TupleTableSlot *slot);
 /*
- * 按 (relid, tid) 查询缓存，并给出可见性与 HOT 链信息。
- * 返回值表示是否命中缓存项；命中时由 *is_visible / *has_hot_chain 返回判定结果。
+ * Lookup (relid, tid) in the shared cache and report visibility / HOT-chain
+ * status.  Returns true if the cache entry was found; *is_visible and
+ * *has_hot_chain carry the MVCC results.
  */
 extern bool RelationRowCacheFetchWithVisibility(Oid relid,
 												ItemPointer tid,
@@ -23,7 +26,7 @@ extern bool RelationRowCacheFetchWithVisibility(Oid relid,
 												TupleTableSlot *slot,
 												bool *is_visible,
 												bool *has_hot_chain);
-/* 删除该关系的子上下文，从而整体释放该关系缓存。 */
+/* Drop the shared cache for a relation. */
 extern void RelationRowCacheDropRelation(Oid relid);
 
 #endif							/* RELATION_ROW_CACHE_H */

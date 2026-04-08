@@ -3,146 +3,23 @@
 #include <string.h>
 
 #include "access/htup_details.h"
-#include "common/hashfn.h"
 #include "executor/tuptable.h"
 #include "lib/tid_row_cache.h"
-#include "storage/itemptr.h"
-#include "storage/off.h"
 #include "utils/datum.h"
-
-typedef struct TidRowBlock
-{
-	int			capacity;
-	FlatCachedTuple **entries;
-} TidRowBlock;
-
-typedef struct TidRowBlockMapEntry
-{
-	char		status;
-	BlockNumber blockno;
-	uint32		hash;
-	TidRowBlock block;
-} TidRowBlockMapEntry;
-
-#define SH_PREFIX tid_row_block_map
-#define SH_ELEMENT_TYPE TidRowBlockMapEntry
-#define SH_KEY_TYPE BlockNumber
-#define SH_KEY blockno
-#define SH_SCOPE static inline
-#define SH_DECLARE
-#include "lib/simplehash.h"
-
-static inline uint32
-TidRowBlockHashKey(const BlockNumber key)
-{
-	return murmurhash32((uint32) key);
-}
-
-static inline bool
-TidRowBlockKeysEqual(const BlockNumber a, const BlockNumber b)
-{
-	return a == b;
-}
-
-#define SH_PREFIX tid_row_block_map
-#define SH_ELEMENT_TYPE TidRowBlockMapEntry
-#define SH_KEY_TYPE BlockNumber
-#define SH_KEY blockno
-#define SH_HASH_KEY(tb, key) TidRowBlockHashKey(key)
-#define SH_EQUAL(tb, a, b) TidRowBlockKeysEqual(a, b)
-#define SH_STORE_HASH
-#define SH_GET_HASH(tb, a) ((a)->hash)
-#define SH_SCOPE static inline
-#define SH_DEFINE
-#include "lib/simplehash.h"
-
-struct TidRowCache
-{
-	MemoryContext ctx;
-	tid_row_block_map_hash *blocks;
-};
-
-static inline int
-TidRowBlockInitialCapacity(OffsetNumber off)
-{
-	int			cap = 16;
-
-	while (cap <= (int) off)
-		cap <<= 1;
-
-	return cap;
-}
-
-static void
-TidRowBlockEnsureCapacity(TidRowBlock *block, OffsetNumber off)
-{
-	int			newcap;
-	FlatCachedTuple **newentries;
-
-	if ((int) off < block->capacity)
-		return;
-
-	newcap = block->capacity;
-	while (newcap <= (int) off)
-		newcap <<= 1;
-
-	newentries = (FlatCachedTuple **) repalloc(block->entries,
-											   sizeof(FlatCachedTuple *) * newcap);
-	MemSet(newentries + block->capacity,
-		   0,
-		   sizeof(FlatCachedTuple *) * (newcap - block->capacity));
-	block->entries = newentries;
-	block->capacity = newcap;
-}
-
-TidRowCache *
-TidRowCacheCreate(MemoryContext ctx, uint32 nelements)
-{
-	TidRowCache *cache;
-	uint32		block_estimate;
-
-	cache = (TidRowCache *) MemoryContextAllocZero(ctx, sizeof(TidRowCache));
-	cache->ctx = ctx;
-
-	block_estimate = nelements / 64;
-	if (block_estimate < 128)
-		block_estimate = 128;
-
-	cache->blocks = tid_row_block_map_create(ctx, block_estimate, NULL);
-	return cache;
-}
-
-FlatCachedTuple *
-TidRowCacheLookupEntry(TidRowCache *cache, ItemPointer tid)
-{
-	BlockNumber blockno;
-	OffsetNumber off;
-	TidRowBlockMapEntry *block_entry;
-
-	Assert(cache != NULL);
-	Assert(tid != NULL);
-
-	blockno = ItemPointerGetBlockNumberNoCheck(tid);
-	off = ItemPointerGetOffsetNumberNoCheck(tid);
-
-	block_entry = tid_row_block_map_lookup(cache->blocks, blockno);
-	if (block_entry == NULL)
-		return NULL;
-	if ((int) off >= block_entry->block.capacity)
-		return NULL;
-
-	return block_entry->block.entries[off];
-}
+#include "utils/dsa.h"
 
 /*
- * Flatten a slot's tuple data into a single contiguous palloc'd block.
+ * Flatten a slot's tuple data into a single contiguous DSA block.
  *
  * Pass-by-val Datums are stored inline in the values[] array.
  * Pass-by-ref Datums have their payloads copied to the varlen area at
- * the end of the block, and values[] stores a pointer into that area.
+ * the end of the block; values[] stores a pointer into that area
+ * (valid in the current process's DSA mapping).
+ *
+ * Returns a dsa_pointer to the allocated FlatCachedTuple block.
  */
-static FlatCachedTuple *
-FlattenTupleFromSlot(TupleTableSlot *slot, MemoryContext target_ctx)
+dsa_pointer
+RowCacheFlattenTuple(dsa_area *area, TupleTableSlot *slot)
 {
 	TupleDesc	desc = slot->tts_tupleDescriptor;
 	int			natts = desc->natts;
@@ -153,11 +30,12 @@ FlattenTupleFromSlot(TupleTableSlot *slot, MemoryContext target_ctx)
 				htup_offset,
 				varlen_offset;
 	FlatCachedTuple *ft;
+	dsa_pointer dp;
 	Datum	   *dst_values;
 	bool	   *dst_isnull;
 	char	   *varlen_cursor;
-	MemoryContext old_ctx;
 
+	slot_getallattrs(slot);
 	htup = ExecCopySlotHeapTuple(slot);
 
 	values_offset = MAXALIGN(sizeof(FlatCachedTuple));
@@ -176,9 +54,9 @@ FlattenTupleFromSlot(TupleTableSlot *slot, MemoryContext target_ctx)
 												false, attr->attlen));
 	}
 
-	old_ctx = MemoryContextSwitchTo(target_ctx);
-	ft = (FlatCachedTuple *) palloc0(total_size);
-	MemoryContextSwitchTo(old_ctx);
+	dp = dsa_allocate(area, total_size);
+	ft = (FlatCachedTuple *) dsa_get_address(area, dp);
+	memset(ft, 0, total_size);
 
 	ft->total_size = total_size;
 	ft->natts = natts;
@@ -219,55 +97,21 @@ FlattenTupleFromSlot(TupleTableSlot *slot, MemoryContext target_ctx)
 	memcpy((char *) ft + htup_offset, htup->t_data, htup->t_len);
 
 	heap_freetuple(htup);
-	return ft;
+	return dp;
 }
 
-void
-TidRowCacheStoreFromSlot(TidRowCache *cache,
-						 TupleTableSlot *slot,
-						 MemoryContext target_ctx)
-{
-	TidRowBlockMapEntry *block_entry;
-	FlatCachedTuple *ft;
-	BlockNumber blockno;
-	OffsetNumber off;
-	bool		found;
-
-	Assert(cache != NULL);
-	Assert(slot != NULL);
-	Assert(ItemPointerIsValid(&slot->tts_tid));
-	Assert(!TTS_EMPTY(slot));
-
-	slot_getallattrs(slot);
-	blockno = ItemPointerGetBlockNumberNoCheck(&slot->tts_tid);
-	off = ItemPointerGetOffsetNumberNoCheck(&slot->tts_tid);
-
-	block_entry = tid_row_block_map_insert(cache->blocks, blockno, &found);
-	if (!found)
-	{
-		MemoryContext old_ctx = MemoryContextSwitchTo(target_ctx);
-
-		block_entry->block.capacity = TidRowBlockInitialCapacity(off);
-		block_entry->block.entries =
-			(FlatCachedTuple **) palloc0(sizeof(FlatCachedTuple *) *
-										 block_entry->block.capacity);
-		MemoryContextSwitchTo(old_ctx);
-	}
-	else
-		TidRowBlockEnsureCapacity(&block_entry->block, off);
-
-	if (block_entry->block.entries[off] != NULL)
-		pfree(block_entry->block.entries[off]);
-
-	ft = FlattenTupleFromSlot(slot, target_ctx);
-	block_entry->block.entries[off] = ft;
-}
-
+/*
+ * Unflatten a FlatCachedTuple back into a TupleTableSlot.
+ *
+ * Reconstructs a HeapTupleData on the stack and stores it via
+ * ExecForceStoreHeapTupleNoCopy, then copies the pre-decoded
+ * values[] and isnull[] arrays into the slot.
+ */
 bool
-TidRowCacheFillSlot(const FlatCachedTuple *flat,
-					Oid relid,
-					ItemPointer tid,
-					TupleTableSlot *slot)
+RowCacheUnflattenToSlot(const FlatCachedTuple *flat,
+						Oid relid,
+						ItemPointer tid,
+						TupleTableSlot *slot)
 {
 	HeapTupleData htup;
 	Datum	   *src_values;

@@ -4,16 +4,15 @@
 #include "postgres.h"
 
 #include "executor/tuptable.h"
-
-typedef struct TidRowCache TidRowCache;
+#include "utils/dsa.h"
 
 /*
  * FlatCachedTuple: single-allocation flat storage for a cached tuple.
  *
  * All per-tuple data (values[], isnull[], HeapTupleHeader, and pass-by-ref
- * Datum payloads) are packed into one contiguous palloc'd block.  This
- * replaces the previous TidRowCacheEntry which scattered data across
- * three independent palloc calls (values, isnull, heap_tuple).
+ * Datum payloads) are packed into one contiguous block allocated via
+ * dsa_allocate.  This replaces the previous TidRowCacheEntry which scattered
+ * data across three independent palloc calls.
  *
  * Memory layout after the fixed header:
  *   Datum   values[natts]       -- starts at MAXALIGN(sizeof(FlatCachedTuple))
@@ -36,15 +35,10 @@ typedef struct FlatCachedTuple
 #define FLAT_TUPLE_HTUP_DATA(ft) \
 	((char *)(ft) + (ft)->htup_offset)
 
-extern TidRowCache *TidRowCacheCreate(MemoryContext ctx, uint32 nelements);
-extern FlatCachedTuple *TidRowCacheLookupEntry(TidRowCache *cache,
-											   ItemPointer tid);
-extern void TidRowCacheStoreFromSlot(TidRowCache *cache,
-									 TupleTableSlot *slot,
-									 MemoryContext target_ctx);
-extern bool TidRowCacheFillSlot(const FlatCachedTuple *flat,
-								Oid relid,
-								ItemPointer tid,
-								TupleTableSlot *slot);
+extern dsa_pointer RowCacheFlattenTuple(dsa_area *area, TupleTableSlot *slot);
+extern bool RowCacheUnflattenToSlot(const FlatCachedTuple *flat,
+									Oid relid,
+									ItemPointer tid,
+									TupleTableSlot *slot);
 
 #endif							/* TID_ROW_CACHE_H */

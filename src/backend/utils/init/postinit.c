@@ -35,7 +35,6 @@
 #include "catalog/pg_tablespace.h"
 #include "libpq/auth.h"
 #include "libpq/libpq-be.h"
-#include "lib/relation_row_cache.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -664,9 +663,6 @@ BaseInit(void)
 	 * drop ephemeral slots, which in turn triggers stats reporting.
 	 */
 	ReplicationSlotInitialize();
-
-	/* Initialize backend-local row cache context and top-level hash. */
-	RelationRowCacheBackendInit();
 }
 
 

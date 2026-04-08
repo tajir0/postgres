@@ -2,227 +2,308 @@
 
 #include "access/htup_details.h"
 #include "access/tableam.h"
-#include "common/hashfn.h"
 #include "executor/tuptable.h"
+#include "lib/dshash.h"
 #include "lib/relation_row_cache.h"
 #include "lib/tid_row_cache.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
+#include "utils/dsa.h"
+#include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 
-typedef struct RelationRowCacheEntry
+/* ----------------------------------------------------------------
+ * Data structures
+ * ---------------------------------------------------------------- */
+
+#define ROW_CACHE_MAX_RELATIONS 128
+
+typedef struct RowCacheShmemControl
 {
-	char		status;
-	Oid			relid;
-	/* Per-relation context to drop the entire second-level cache at once. */
-	MemoryContext row_ctx;
-	TidRowCache *tid_cache;
+	dsa_handle	global_dsa_handle;
+	LWLock		control_lock;
+} RowCacheShmemControl;
+
+typedef struct RowCacheRelEntry
+{
+	Oid			relid;			/* hash key */
+	dshash_table_handle tid_hash_handle;
+	LWLock		rel_lock;
 	int			natts;
-} RelationRowCacheEntry;
+	bool		loaded;
+} RowCacheRelEntry;
 
-#define SH_PREFIX relation_row_cache
-#define SH_ELEMENT_TYPE RelationRowCacheEntry
-#define SH_KEY_TYPE Oid
-#define SH_KEY relid
-#define SH_SCOPE static inline
-#define SH_DECLARE
-#include "lib/simplehash.h"
-
-static MemoryContext RelationRowCacheContext = NULL;
-static relation_row_cache_hash *RelationRowCacheHash = NULL;
-static Oid RelationRowCacheFastRelid = InvalidOid;
-static RelationRowCacheEntry *RelationRowCacheFastEntry = NULL;
-
-static inline uint32
-RelationRowCacheHashKey(Oid relid)
+typedef struct TidBlockEntry
 {
-	return murmurhash32(relid);
-}
+	BlockNumber blockno;		/* hash key */
+	int			capacity;
+	dsa_pointer entries_dp;		/* → dsa_pointer[capacity] array */
+} TidBlockEntry;
 
-static inline bool
-RelationRowCacheKeysEqual(Oid a, Oid b)
+typedef struct LocalRelAttachEntry
 {
-	return a == b;
-}
+	Oid			relid;			/* hash key */
+	dshash_table *tid_hash;
+} LocalRelAttachEntry;
 
-#define SH_PREFIX relation_row_cache
-#define SH_ELEMENT_TYPE RelationRowCacheEntry
-#define SH_KEY_TYPE Oid
-#define SH_KEY relid
-#define SH_HASH_KEY(tb, key) RelationRowCacheHashKey(key)
-#define SH_EQUAL(tb, a, b) RelationRowCacheKeysEqual(a, b)
-#define SH_SCOPE static inline
-#define SH_DEFINE
-#include "lib/simplehash.h"
+/* ----------------------------------------------------------------
+ * Global / backend-local state
+ * ---------------------------------------------------------------- */
 
-static inline RelationRowCacheEntry *
-RelationRowCacheLookupRelEntry(Oid relid)
+static RowCacheShmemControl *RowCacheCtl = NULL;
+static HTAB *RowCacheRelHash = NULL;
+static dsa_area *LocalDsa = NULL;
+static HTAB *LocalAttachCache = NULL;
+
+/* ----------------------------------------------------------------
+ * dshash parameters for the inner (BlockNumber → TidBlockEntry) hash
+ * ---------------------------------------------------------------- */
+
+static const dshash_parameters tid_block_dsh_params = {
+	.key_size = sizeof(BlockNumber),
+	.entry_size = sizeof(TidBlockEntry),
+	.compare_function = dshash_memcmp,
+	.hash_function = dshash_memhash,
+	.copy_function = dshash_memcpy,
+	.tranche_id = LWTRANCHE_ROW_CACHE_HASH
+};
+
+/* ----------------------------------------------------------------
+ * Shared-memory sizing and initialization
+ * ---------------------------------------------------------------- */
+
+Size
+RowCacheShmemSize(void)
 {
-	RelationRowCacheEntry *entry;
+	Size		size = 0;
 
-	if (RelationRowCacheFastRelid == relid)
-		return RelationRowCacheFastEntry;
-
-	entry = relation_row_cache_lookup(RelationRowCacheHash, relid);
-	RelationRowCacheFastRelid = relid;
-	RelationRowCacheFastEntry = entry;
-	return entry;
-}
-
-/*
- * Estimate second-level hash size from reltuples and keep slack to reduce
- * probe length and table growth.
- */
-static uint32
-RelationRowCacheEstimateElements(Relation rel)
-{
-	double		reltuples = rel->rd_rel->reltuples;
-	uint64		est;
-
-	if (reltuples > 1.0)
-		est = (uint64) (reltuples * 1.3) + 1;
-	else
-		est = 1024;
-
-	if (est < 128)
-		est = 128;
-	if (est > (PG_UINT32_MAX / 2))
-		est = (PG_UINT32_MAX / 2);
-
-	return (uint32) est;
-}
-
-/* Drop one relation entry and all second-level memory in one shot. */
-static void
-RelationRowCacheResetEntry(RelationRowCacheEntry *entry)
-{
-	if (RelationRowCacheFastRelid == entry->relid)
-	{
-		RelationRowCacheFastRelid = InvalidOid;
-		RelationRowCacheFastEntry = NULL;
-	}
-
-	if (entry->row_ctx != NULL)
-	{
-		MemoryContextDelete(entry->row_ctx);
-		entry->row_ctx = NULL;
-		entry->tid_cache = NULL;
-	}
-	entry->natts = 0;
+	size = add_size(size, MAXALIGN(sizeof(RowCacheShmemControl)));
+	size = add_size(size, hash_estimate_size(ROW_CACHE_MAX_RELATIONS,
+											 sizeof(RowCacheRelEntry)));
+	return size;
 }
 
 void
-RelationRowCacheBackendInit(void)
+RowCacheShmemInit(void)
 {
-	if (RelationRowCacheHash != NULL)
-		return;
-
-	RelationRowCacheContext = AllocSetContextCreate(TopMemoryContext,
-												"BackendRelationRowCache",
-												ALLOCSET_DEFAULT_SIZES);
-	RelationRowCacheHash = relation_row_cache_create(RelationRowCacheContext,
-											 16,
-											 NULL);
-}
-
-void
-RelationRowCacheDropRelation(Oid relid)
-{
-	RelationRowCacheEntry *entry;
-
-	RelationRowCacheBackendInit();
-
-	entry = RelationRowCacheLookupRelEntry(relid);
-	if (entry == NULL)
-		return;
-
-	RelationRowCacheResetEntry(entry);
-	relation_row_cache_delete(RelationRowCacheHash, relid);
-}
-
-void
-RelationRowCacheLoadRelation(Relation rel)
-{
-	RelationRowCacheEntry *entry;
-	TableScanDesc scan;
-	TupleTableSlot *scan_slot;
-	uint32		est_nelements;
 	bool		found;
-	bool		pushed_snapshot = false;
+	HASHCTL		ctl;
 
-	Assert(rel != NULL);
-
-	RelationRowCacheBackendInit();
-
-	entry = relation_row_cache_insert(RelationRowCacheHash,
-								  RelationGetRelid(rel),
-								  &found);
+	RowCacheCtl = (RowCacheShmemControl *)
+		ShmemInitStruct("Row Cache Control",
+						sizeof(RowCacheShmemControl),
+						&found);
 	if (!found)
 	{
-		entry->row_ctx = NULL;
-		entry->tid_cache = NULL;
-		entry->natts = 0;
+		RowCacheCtl->global_dsa_handle = DSA_HANDLE_INVALID;
+		LWLockInitialize(&RowCacheCtl->control_lock, LWTRANCHE_ROW_CACHE_CTL);
 	}
 
-	RelationRowCacheResetEntry(entry);
+	ctl.keysize = sizeof(Oid);
+	ctl.entrysize = sizeof(RowCacheRelEntry);
+	ctl.num_partitions = NUM_BUFFER_PARTITIONS < 16 ? NUM_BUFFER_PARTITIONS : 16;
 
-	entry->row_ctx = AllocSetContextCreate(RelationRowCacheContext,
-									   "RelationTidRowCache",
-									   ALLOCSET_DEFAULT_SIZES);
-	est_nelements = RelationRowCacheEstimateElements(rel);
-	entry->tid_cache = TidRowCacheCreate(entry->row_ctx, est_nelements);
-	entry->natts = RelationGetDescr(rel)->natts;
-	RelationRowCacheFastRelid = entry->relid;
-	RelationRowCacheFastEntry = entry;
-
-	if (!ActiveSnapshotSet())
-	{
-		PushActiveSnapshot(GetTransactionSnapshot());
-		pushed_snapshot = true;
-	}
-
-	scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL);
-	scan_slot = table_slot_create(rel, NULL);
-
-	while (table_scan_getnextslot(scan, ForwardScanDirection, scan_slot))
-		TidRowCacheStoreFromSlot(entry->tid_cache, scan_slot, entry->row_ctx);
-
-	table_endscan(scan);
-	ExecDropSingleTupleTableSlot(scan_slot);
-
-	if (pushed_snapshot)
-		PopActiveSnapshot();
+	RowCacheRelHash = ShmemInitHash("Row Cache Relation Hash",
+									ROW_CACHE_MAX_RELATIONS,
+									ROW_CACHE_MAX_RELATIONS,
+									&ctl,
+									HASH_ELEM | HASH_BLOBS | HASH_PARTITION);
 }
 
-bool
-RelationRowCacheFillSlot(TupleTableSlot *slot)
+/* ----------------------------------------------------------------
+ * DSA lazy initialization
+ * ---------------------------------------------------------------- */
+
+static void
+EnsureRowCacheDsa(void)
 {
-	RelationRowCacheEntry *rel_entry;
-	FlatCachedTuple *flat;
+	if (LocalDsa != NULL)
+		return;
 
-	Assert(slot != NULL);
+	LWLockAcquire(&RowCacheCtl->control_lock, LW_EXCLUSIVE);
 
-	if (!OidIsValid(slot->tts_tableOid) || !ItemPointerIsValid(&slot->tts_tid))
-		return false;
+	if (RowCacheCtl->global_dsa_handle == DSA_HANDLE_INVALID)
+	{
+		dsa_area   *dsa = dsa_create(LWTRANCHE_ROW_CACHE_DSA);
 
-	RelationRowCacheBackendInit();
+		dsa_pin(dsa);
+		dsa_pin_mapping(dsa);
+		RowCacheCtl->global_dsa_handle = dsa_get_handle(dsa);
+		LocalDsa = dsa;
+	}
+	else
+	{
+		LocalDsa = dsa_attach(RowCacheCtl->global_dsa_handle);
+		dsa_pin_mapping(LocalDsa);
+	}
 
-	rel_entry = RelationRowCacheLookupRelEntry(slot->tts_tableOid);
-	if (rel_entry == NULL || rel_entry->tid_cache == NULL)
-		return false;
-
-	flat = TidRowCacheLookupEntry(rel_entry->tid_cache, &slot->tts_tid);
-	if (flat == NULL)
-		return false;
-
-	return TidRowCacheFillSlot(flat, rel_entry->relid, &slot->tts_tid, slot);
+	LWLockRelease(&RowCacheCtl->control_lock);
 }
 
-/*
- * Conservative MVCC visibility check based on tuple header bits already in
- * cache. Unknown states are treated as "not visible" to preserve correctness.
- */
+/* ----------------------------------------------------------------
+ * Backend-local attach cache (avoids repeated dshash_attach)
+ * ---------------------------------------------------------------- */
+
+static void
+EnsureLocalAttachCache(void)
+{
+	HASHCTL		ctl;
+
+	if (LocalAttachCache != NULL)
+		return;
+
+	ctl.keysize = sizeof(Oid);
+	ctl.entrysize = sizeof(LocalRelAttachEntry);
+	LocalAttachCache = hash_create("Row Cache Local Attach",
+								   32, &ctl,
+								   HASH_ELEM | HASH_BLOBS);
+}
+
+static dshash_table *
+LocalAttachGetOrCreate(Oid relid, RowCacheRelEntry *entry)
+{
+	LocalRelAttachEntry *local;
+	bool		found;
+
+	EnsureLocalAttachCache();
+	EnsureRowCacheDsa();
+
+	local = hash_search(LocalAttachCache, &relid, HASH_ENTER, &found);
+	if (found && local->tid_hash != NULL)
+		return local->tid_hash;
+
+	local->tid_hash = dshash_attach(LocalDsa, &tid_block_dsh_params,
+									entry->tid_hash_handle, NULL);
+	return local->tid_hash;
+}
+
+static void
+LocalAttachInvalidate(Oid relid)
+{
+	LocalRelAttachEntry *local;
+
+	if (LocalAttachCache == NULL)
+		return;
+
+	local = hash_search(LocalAttachCache, &relid, HASH_FIND, NULL);
+	if (local != NULL && local->tid_hash != NULL)
+	{
+		dshash_detach(local->tid_hash);
+		local->tid_hash = NULL;
+	}
+	hash_search(LocalAttachCache, &relid, HASH_REMOVE, NULL);
+}
+
+/* ----------------------------------------------------------------
+ * Block-level helpers
+ * ---------------------------------------------------------------- */
+
+static int
+TidRowBlockInitialCapacity(OffsetNumber off)
+{
+	int			cap = 16;
+
+	while (cap <= (int) off)
+		cap <<= 1;
+	return cap;
+}
+
+/* ----------------------------------------------------------------
+ * Store one tuple into the inner dshash
+ * ---------------------------------------------------------------- */
+
+static void
+RowCacheStoreTupleShared(dshash_table *tid_hash, TupleTableSlot *slot)
+{
+	BlockNumber blockno = ItemPointerGetBlockNumberNoCheck(&slot->tts_tid);
+	OffsetNumber off = ItemPointerGetOffsetNumberNoCheck(&slot->tts_tid);
+	TidBlockEntry *block;
+	dsa_pointer *entries_arr;
+	dsa_pointer flat_dp;
+	bool		found;
+
+	block = dshash_find_or_insert(tid_hash, &blockno, &found);
+
+	if (!found)
+	{
+		int			cap = TidRowBlockInitialCapacity(off);
+
+		block->capacity = cap;
+		block->entries_dp = dsa_allocate0(LocalDsa,
+										  sizeof(dsa_pointer) * cap);
+	}
+	else if ((int) off >= block->capacity)
+	{
+		int			oldcap = block->capacity;
+		int			newcap = oldcap;
+		dsa_pointer new_dp;
+		dsa_pointer *old_arr;
+		dsa_pointer *new_arr;
+
+		while (newcap <= (int) off)
+			newcap <<= 1;
+
+		new_dp = dsa_allocate0(LocalDsa, sizeof(dsa_pointer) * newcap);
+		old_arr = (dsa_pointer *) dsa_get_address(LocalDsa, block->entries_dp);
+		new_arr = (dsa_pointer *) dsa_get_address(LocalDsa, new_dp);
+		memcpy(new_arr, old_arr, sizeof(dsa_pointer) * oldcap);
+
+		dsa_free(LocalDsa, block->entries_dp);
+		block->entries_dp = new_dp;
+		block->capacity = newcap;
+	}
+
+	flat_dp = RowCacheFlattenTuple(LocalDsa, slot);
+
+	entries_arr = (dsa_pointer *) dsa_get_address(LocalDsa, block->entries_dp);
+	if (DsaPointerIsValid(entries_arr[off]))
+		dsa_free(LocalDsa, entries_arr[off]);
+	entries_arr[off] = flat_dp;
+
+	dshash_release_lock(tid_hash, block);
+}
+
+/* ----------------------------------------------------------------
+ * Destroy the inner dshash + all DSA allocations for a relation
+ * ---------------------------------------------------------------- */
+
+static void
+RowCacheDestroyTidHash(RowCacheRelEntry *entry)
+{
+	dshash_table *tid_hash;
+	TidBlockEntry *block;
+	dshash_seq_status seq;
+
+	EnsureRowCacheDsa();
+
+	tid_hash = dshash_attach(LocalDsa, &tid_block_dsh_params,
+							 entry->tid_hash_handle, NULL);
+
+	dshash_seq_init(&seq, tid_hash, true);
+	while ((block = dshash_seq_next(&seq)) != NULL)
+	{
+		dsa_pointer *arr = (dsa_pointer *)
+			dsa_get_address(LocalDsa, block->entries_dp);
+
+		for (int i = 0; i < block->capacity; i++)
+		{
+			if (DsaPointerIsValid(arr[i]))
+				dsa_free(LocalDsa, arr[i]);
+		}
+		dsa_free(LocalDsa, block->entries_dp);
+	}
+	dshash_seq_term(&seq);
+
+	dshash_destroy(tid_hash);
+}
+
+/* ----------------------------------------------------------------
+ * MVCC visibility (same logic as the old demo, pure in-memory check)
+ * ---------------------------------------------------------------- */
+
 static bool
-RelationRowCacheTupleVisibleMVCC(HeapTuple tuple, Snapshot snapshot)
+RowCacheTupleVisibleMVCC(HeapTuple tuple, Snapshot snapshot)
 {
 	uint16		infomask;
 	HeapTupleHeaderData *thdr;
@@ -248,6 +329,189 @@ RelationRowCacheTupleVisibleMVCC(HeapTuple tuple, Snapshot snapshot)
 	return false;
 }
 
+/* ----------------------------------------------------------------
+ * Internal lookup: find FlatCachedTuple by (relid, tid)
+ * Caller must hold rel_lock LW_SHARED.
+ * ---------------------------------------------------------------- */
+
+static FlatCachedTuple *
+RowCacheLookupFlat(RowCacheRelEntry *entry, ItemPointer tid)
+{
+	dshash_table *tid_hash;
+	TidBlockEntry *block;
+	dsa_pointer *entries_arr;
+	BlockNumber blockno;
+	OffsetNumber off;
+
+	tid_hash = LocalAttachGetOrCreate(entry->relid, entry);
+
+	blockno = ItemPointerGetBlockNumberNoCheck(tid);
+	off = ItemPointerGetOffsetNumberNoCheck(tid);
+
+	block = dshash_find(tid_hash, &blockno, false);
+	if (block == NULL)
+		return NULL;
+
+	if ((int) off >= block->capacity)
+	{
+		dshash_release_lock(tid_hash, block);
+		return NULL;
+	}
+
+	entries_arr = (dsa_pointer *) dsa_get_address(LocalDsa, block->entries_dp);
+	if (!DsaPointerIsValid(entries_arr[off]))
+	{
+		dshash_release_lock(tid_hash, block);
+		return NULL;
+	}
+
+	{
+		FlatCachedTuple *flat = (FlatCachedTuple *)
+			dsa_get_address(LocalDsa, entries_arr[off]);
+
+		dshash_release_lock(tid_hash, block);
+		return flat;
+	}
+}
+
+/* ----------------------------------------------------------------
+ * Public API: Load
+ * ---------------------------------------------------------------- */
+
+void
+RelationRowCacheLoadRelation(Relation rel)
+{
+	Oid			relid = RelationGetRelid(rel);
+	RowCacheRelEntry *entry;
+	dshash_table *tid_hash;
+	bool		found;
+
+	EnsureRowCacheDsa();
+
+	entry = hash_search(RowCacheRelHash, &relid, HASH_ENTER, &found);
+
+	if (!found)
+	{
+		LWLockInitialize(&entry->rel_lock, LWTRANCHE_ROW_CACHE_REL);
+		entry->tid_hash_handle = DSHASH_HANDLE_INVALID;
+		entry->loaded = false;
+		entry->natts = 0;
+	}
+
+	LWLockAcquire(&entry->rel_lock, LW_EXCLUSIVE);
+
+	if (entry->loaded && entry->tid_hash_handle != DSHASH_HANDLE_INVALID)
+		RowCacheDestroyTidHash(entry);
+
+	tid_hash = dshash_create(LocalDsa, &tid_block_dsh_params, NULL);
+	entry->tid_hash_handle = dshash_get_hash_table_handle(tid_hash);
+	entry->natts = RelationGetDescr(rel)->natts;
+
+	{
+		TableScanDesc scan;
+		TupleTableSlot *slot;
+		bool		pushed_snapshot = false;
+
+		if (!ActiveSnapshotSet())
+		{
+			PushActiveSnapshot(GetTransactionSnapshot());
+			pushed_snapshot = true;
+		}
+
+		scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL);
+		slot = table_slot_create(rel, NULL);
+
+		while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+			RowCacheStoreTupleShared(tid_hash, slot);
+
+		table_endscan(scan);
+		ExecDropSingleTupleTableSlot(slot);
+
+		if (pushed_snapshot)
+			PopActiveSnapshot();
+	}
+
+	entry->loaded = true;
+
+	dshash_detach(tid_hash);
+	LWLockRelease(&entry->rel_lock);
+
+	LocalAttachInvalidate(relid);
+}
+
+/* ----------------------------------------------------------------
+ * Public API: Drop
+ * ---------------------------------------------------------------- */
+
+void
+RelationRowCacheDropRelation(Oid relid)
+{
+	RowCacheRelEntry *entry;
+
+	entry = hash_search(RowCacheRelHash, &relid, HASH_FIND, NULL);
+	if (entry == NULL || !entry->loaded)
+		return;
+
+	LWLockAcquire(&entry->rel_lock, LW_EXCLUSIVE);
+
+	if (entry->loaded)
+	{
+		RowCacheDestroyTidHash(entry);
+		entry->loaded = false;
+		entry->tid_hash_handle = DSHASH_HANDLE_INVALID;
+	}
+
+	LWLockRelease(&entry->rel_lock);
+
+	hash_search(RowCacheRelHash, &relid, HASH_REMOVE, NULL);
+
+	LocalAttachInvalidate(relid);
+}
+
+/* ----------------------------------------------------------------
+ * Public API: FillSlot (simple cache lookup + slot fill)
+ * ---------------------------------------------------------------- */
+
+bool
+RelationRowCacheFillSlot(TupleTableSlot *slot)
+{
+	RowCacheRelEntry *entry;
+	FlatCachedTuple *flat;
+	bool		ok;
+
+	Assert(slot != NULL);
+	if (!OidIsValid(slot->tts_tableOid) || !ItemPointerIsValid(&slot->tts_tid))
+		return false;
+
+	entry = hash_search(RowCacheRelHash, &slot->tts_tableOid, HASH_FIND, NULL);
+	if (entry == NULL || !entry->loaded)
+		return false;
+
+	LWLockAcquire(&entry->rel_lock, LW_SHARED);
+
+	if (!entry->loaded)
+	{
+		LWLockRelease(&entry->rel_lock);
+		return false;
+	}
+
+	flat = RowCacheLookupFlat(entry, &slot->tts_tid);
+	if (flat == NULL)
+	{
+		LWLockRelease(&entry->rel_lock);
+		return false;
+	}
+
+	ok = RowCacheUnflattenToSlot(flat, slot->tts_tableOid,
+								 &slot->tts_tid, slot);
+	LWLockRelease(&entry->rel_lock);
+	return ok;
+}
+
+/* ----------------------------------------------------------------
+ * Public API: FetchWithVisibility (MVCC-aware cache lookup)
+ * ---------------------------------------------------------------- */
+
 bool
 RelationRowCacheFetchWithVisibility(Oid relid,
 									ItemPointer tid,
@@ -256,29 +520,35 @@ RelationRowCacheFetchWithVisibility(Oid relid,
 									bool *is_visible,
 									bool *has_hot_chain)
 {
-	RelationRowCacheEntry *rel_entry;
+	RowCacheRelEntry *entry;
 	FlatCachedTuple *flat;
 	HeapTupleData htup;
 
-	Assert(slot != NULL);
-	Assert(is_visible != NULL);
-	Assert(has_hot_chain != NULL);
-
+	Assert(slot != NULL && is_visible != NULL && has_hot_chain != NULL);
 	*is_visible = false;
 	*has_hot_chain = false;
 
 	if (!OidIsValid(relid) || !ItemPointerIsValid(tid))
 		return false;
 
-	RelationRowCacheBackendInit();
-
-	rel_entry = RelationRowCacheLookupRelEntry(relid);
-	if (rel_entry == NULL || rel_entry->tid_cache == NULL)
+	entry = hash_search(RowCacheRelHash, &relid, HASH_FIND, NULL);
+	if (entry == NULL || !entry->loaded)
 		return false;
 
-	flat = TidRowCacheLookupEntry(rel_entry->tid_cache, tid);
+	LWLockAcquire(&entry->rel_lock, LW_SHARED);
+
+	if (!entry->loaded)
+	{
+		LWLockRelease(&entry->rel_lock);
+		return false;
+	}
+
+	flat = RowCacheLookupFlat(entry, tid);
 	if (flat == NULL)
+	{
+		LWLockRelease(&entry->rel_lock);
 		return false;
+	}
 
 	htup.t_data = (HeapTupleHeader) FLAT_TUPLE_HTUP_DATA(flat);
 	htup.t_len = flat->htup_len;
@@ -286,10 +556,11 @@ RelationRowCacheFetchWithVisibility(Oid relid,
 	ItemPointerCopy(tid, &htup.t_self);
 
 	*has_hot_chain = HeapTupleIsHotUpdated(&htup);
-	*is_visible = RelationRowCacheTupleVisibleMVCC(&htup, snapshot);
+	*is_visible = RowCacheTupleVisibleMVCC(&htup, snapshot);
 
 	if (*is_visible)
-		return TidRowCacheFillSlot(flat, rel_entry->relid, tid, slot);
+		RowCacheUnflattenToSlot(flat, relid, tid, slot);
 
+	LWLockRelease(&entry->rel_lock);
 	return true;
 }
