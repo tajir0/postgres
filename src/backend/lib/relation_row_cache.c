@@ -119,8 +119,18 @@ RowCacheShmemInit(void)
 static void
 EnsureRowCacheDsa(void)
 {
+	MemoryContext old_ctx;
+
 	if (LocalDsa != NULL)
 		return;
+
+	/*
+	 * dsa_create() and dsa_attach() palloc the backend-local dsa_area struct
+	 * in CurrentMemoryContext.  LocalDsa is a backend-local global that must
+	 * outlive any single statement; allocate it in TopMemoryContext so it is
+	 * not freed when a query's es_query_cxt is deleted.
+	 */
+	old_ctx = MemoryContextSwitchTo(TopMemoryContext);
 
 	LWLockAcquire(&RowCacheCtl->control_lock, LW_EXCLUSIVE);
 
@@ -140,6 +150,8 @@ EnsureRowCacheDsa(void)
 	}
 
 	LWLockRelease(&RowCacheCtl->control_lock);
+
+	MemoryContextSwitchTo(old_ctx);
 }
 
 /* ----------------------------------------------------------------
@@ -207,8 +219,21 @@ LocalAttachGetOrCreate(Oid relid, RowCacheRelEntry *entry)
 	if (local->tid_hash != NULL)
 		return local->tid_hash;
 
-	local->tid_hash = dshash_attach(LocalDsa, &tid_block_dsh_params,
-									entry->tid_hash_handle, NULL);
+	{
+		/*
+		 * dshash_attach() pallocs the backend-local dshash_table struct in
+		 * CurrentMemoryContext.  Since local->tid_hash is stored in
+		 * LocalAttachCache (TopMemoryContext), the struct must also live in
+		 * TopMemoryContext; otherwise the query's es_query_cxt will be freed
+		 * at statement end, leaving a dangling pointer that trips
+		 * Assert(magic == DSHASH_MAGIC) on the next access.
+		 */
+		MemoryContext old_ctx = MemoryContextSwitchTo(TopMemoryContext);
+
+		local->tid_hash = dshash_attach(LocalDsa, &tid_block_dsh_params,
+										entry->tid_hash_handle, NULL);
+		MemoryContextSwitchTo(old_ctx);
+	}
 	local->attach_handle = entry->tid_hash_handle;
 	return local->tid_hash;
 }
