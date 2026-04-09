@@ -156,9 +156,16 @@ EnsureLocalAttachCache(void)
 
 	ctl.keysize = sizeof(Oid);
 	ctl.entrysize = sizeof(LocalRelAttachEntry);
+	/*
+	 * Must allocate in TopMemoryContext: this table outlives any single
+	 * statement/portal.  Otherwise CurrentMemoryContext may be freed between
+	 * calls (e.g. pg_drop after a prior query), leaving LocalAttachCache
+	 * dangling and causing segfaults in LocalAttachInvalidate.
+	 */
+	ctl.hcxt = TopMemoryContext;
 	LocalAttachCache = hash_create("Row Cache Local Attach",
 								   32, &ctl,
-								   HASH_ELEM | HASH_BLOBS);
+								   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 }
 
 static dshash_table *
