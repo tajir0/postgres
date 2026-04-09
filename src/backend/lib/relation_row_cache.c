@@ -44,6 +44,7 @@ typedef struct TidBlockEntry
 typedef struct LocalRelAttachEntry
 {
 	Oid			relid;			/* hash key */
+	dshash_table_handle attach_handle;	/* must match RowCacheRelEntry */
 	dshash_table *tid_hash;
 } LocalRelAttachEntry;
 
@@ -170,11 +171,38 @@ LocalAttachGetOrCreate(Oid relid, RowCacheRelEntry *entry)
 	EnsureRowCacheDsa();
 
 	local = hash_search(LocalAttachCache, &relid, HASH_ENTER, &found);
-	if (found && local->tid_hash != NULL)
+
+	/*
+	 * Another backend may have destroyed/replaced the inner dshash while we
+	 * still hold a stale dshash_table *.  dshash_attach/find Assert on magic
+	 * if we use the old pointer — treat handle mismatch like a cache miss.
+	 *
+	 * For HASH_ENTER on a brand-new key, value fields are uninitialized; do
+	 * not call dshash_detach on garbage tid_hash.
+	 */
+	if (found)
+	{
+		if (local->tid_hash != NULL &&
+			(entry->tid_hash_handle != local->attach_handle ||
+			 entry->tid_hash_handle == DSHASH_HANDLE_INVALID))
+		{
+			dshash_detach(local->tid_hash);
+			local->tid_hash = NULL;
+			local->attach_handle = DSHASH_HANDLE_INVALID;
+		}
+	}
+	else
+	{
+		local->tid_hash = NULL;
+		local->attach_handle = DSHASH_HANDLE_INVALID;
+	}
+
+	if (local->tid_hash != NULL)
 		return local->tid_hash;
 
 	local->tid_hash = dshash_attach(LocalDsa, &tid_block_dsh_params,
 									entry->tid_hash_handle, NULL);
+	local->attach_handle = entry->tid_hash_handle;
 	return local->tid_hash;
 }
 
@@ -191,6 +219,7 @@ LocalAttachInvalidate(Oid relid)
 	{
 		dshash_detach(local->tid_hash);
 		local->tid_hash = NULL;
+		local->attach_handle = DSHASH_HANDLE_INVALID;
 	}
 	hash_search(LocalAttachCache, &relid, HASH_REMOVE, NULL);
 }
@@ -403,6 +432,9 @@ RelationRowCacheLoadRelation(Relation rel)
 
 	LWLockAcquire(&entry->rel_lock, LW_EXCLUSIVE);
 
+	/* Drop stale backend-local dshash pointers before destroying shared hash. */
+	LocalAttachInvalidate(relid);
+
 	if (entry->loaded && entry->tid_hash_handle != DSHASH_HANDLE_INVALID)
 		RowCacheDestroyTidHash(entry);
 
@@ -461,6 +493,8 @@ RelationRowCacheDropRelation(Oid relid)
 		return;
 
 	LWLockAcquire(&entry->rel_lock, LW_EXCLUSIVE);
+
+	LocalAttachInvalidate(relid);
 
 	if (entry->loaded)
 	{
