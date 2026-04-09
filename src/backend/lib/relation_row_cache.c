@@ -56,12 +56,6 @@ static HTAB *RowCacheRelHash = NULL;
 static dsa_area *LocalDsa = NULL;
 static HTAB *LocalAttachCache = NULL;
 
-static inline bool
-row_cache_shmem_ready(void)
-{
-	return RowCacheCtl != NULL && RowCacheRelHash != NULL;
-}
-
 /* ----------------------------------------------------------------
  * dshash parameters for the inner (BlockNumber → TidBlockEntry) hash
  * ---------------------------------------------------------------- */
@@ -161,16 +155,9 @@ EnsureLocalAttachCache(void)
 
 	ctl.keysize = sizeof(Oid);
 	ctl.entrysize = sizeof(LocalRelAttachEntry);
-	/*
-	 * Must allocate in TopMemoryContext: this table outlives any single
-	 * statement/portal.  Otherwise CurrentMemoryContext may be freed between
-	 * calls (e.g. pg_drop after a prior query), leaving LocalAttachCache
-	 * dangling and causing segfaults in LocalAttachInvalidate.
-	 */
-	ctl.hcxt = TopMemoryContext;
 	LocalAttachCache = hash_create("Row Cache Local Attach",
 								   32, &ctl,
-								   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+								   HASH_ELEM | HASH_BLOBS);
 }
 
 static dshash_table *
@@ -399,8 +386,8 @@ RelationRowCacheLoadRelation(Relation rel)
 	dshash_table *tid_hash;
 	bool		found;
 
-	if (!row_cache_shmem_ready())
-		return;
+	if (RowCacheRelHash == NULL)
+		elog(ERROR, "row cache shared memory not initialized");
 
 	EnsureRowCacheDsa();
 
@@ -464,8 +451,10 @@ RelationRowCacheDropRelation(Oid relid)
 {
 	RowCacheRelEntry *entry;
 
-	if (!row_cache_shmem_ready())
+	if (RowCacheRelHash == NULL)
 		return;
+
+	EnsureRowCacheDsa();
 
 	entry = hash_search(RowCacheRelHash, &relid, HASH_FIND, NULL);
 	if (entry == NULL || !entry->loaded)
@@ -499,10 +488,9 @@ RelationRowCacheFillSlot(TupleTableSlot *slot)
 	bool		ok;
 
 	Assert(slot != NULL);
-	if (!OidIsValid(slot->tts_tableOid) || !ItemPointerIsValid(&slot->tts_tid))
+	if (RowCacheRelHash == NULL)
 		return false;
-
-	if (!row_cache_shmem_ready())
+	if (!OidIsValid(slot->tts_tableOid) || !ItemPointerIsValid(&slot->tts_tid))
 		return false;
 
 	entry = hash_search(RowCacheRelHash, &slot->tts_tableOid, HASH_FIND, NULL);
@@ -550,10 +538,9 @@ RelationRowCacheFetchWithVisibility(Oid relid,
 	*is_visible = false;
 	*has_hot_chain = false;
 
-	if (!OidIsValid(relid) || !ItemPointerIsValid(tid))
+	if (RowCacheRelHash == NULL)
 		return false;
-
-	if (!row_cache_shmem_ready())
+	if (!OidIsValid(relid) || !ItemPointerIsValid(tid))
 		return false;
 
 	entry = hash_search(RowCacheRelHash, &relid, HASH_FIND, NULL);
