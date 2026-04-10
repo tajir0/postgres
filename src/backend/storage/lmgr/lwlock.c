@@ -182,6 +182,7 @@ static const char *const BuiltinTrancheNames[] = {
 	[LWTRANCHE_ROW_CACHE_REL] = "RowCacheRel",
 	[LWTRANCHE_ROW_CACHE_DSA] = "RowCacheDSA",
 	[LWTRANCHE_ROW_CACHE_HASH] = "RowCacheHash",
+	[LWTRANCHE_ROW_CACHE_RELHASH] = "RowCacheRelHash",
 };
 
 StaticAssertDecl(lengthof(BuiltinTrancheNames) ==

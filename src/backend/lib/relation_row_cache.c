@@ -18,11 +18,13 @@
  * ---------------------------------------------------------------- */
 
 #define ROW_CACHE_MAX_RELATIONS 128
+#define ROW_CACHE_NUM_PARTITIONS 16
 
 typedef struct RowCacheShmemControl
 {
 	dsa_handle	global_dsa_handle;
 	LWLock		control_lock;
+	LWLock		rel_hash_locks[ROW_CACHE_NUM_PARTITIONS];
 } RowCacheShmemControl;
 
 typedef struct RowCacheRelEntry
@@ -71,6 +73,27 @@ static const dshash_parameters tid_block_dsh_params = {
 };
 
 /* ----------------------------------------------------------------
+ * Partition lock helpers for RowCacheRelHash
+ *
+ * ShmemInitHash with HASH_PARTITION does NOT manage partition locks
+ * internally — the caller must acquire the appropriate partition lock
+ * before every hash_search call.  This is the same pattern used by
+ * buf_table.c (BufMappingPartitionLock) and lock.c.
+ * ---------------------------------------------------------------- */
+
+static inline uint32
+RowCacheRelHashCode(const Oid *relid)
+{
+	return get_hash_value(RowCacheRelHash, relid);
+}
+
+static inline LWLock *
+RowCacheRelPartitionLock(uint32 hashcode)
+{
+	return &RowCacheCtl->rel_hash_locks[hashcode % ROW_CACHE_NUM_PARTITIONS];
+}
+
+/* ----------------------------------------------------------------
  * Shared-memory sizing and initialization
  * ---------------------------------------------------------------- */
 
@@ -99,11 +122,15 @@ RowCacheShmemInit(void)
 	{
 		RowCacheCtl->global_dsa_handle = DSA_HANDLE_INVALID;
 		LWLockInitialize(&RowCacheCtl->control_lock, LWTRANCHE_ROW_CACHE_CTL);
+
+		for (int i = 0; i < ROW_CACHE_NUM_PARTITIONS; i++)
+			LWLockInitialize(&RowCacheCtl->rel_hash_locks[i],
+							 LWTRANCHE_ROW_CACHE_RELHASH);
 	}
 
 	ctl.keysize = sizeof(Oid);
 	ctl.entrysize = sizeof(RowCacheRelEntry);
-	ctl.num_partitions = NUM_BUFFER_PARTITIONS < 16 ? NUM_BUFFER_PARTITIONS : 16;
+	ctl.num_partitions = ROW_CACHE_NUM_PARTITIONS;
 
 	RowCacheRelHash = ShmemInitHash("Row Cache Relation Hash",
 									ROW_CACHE_MAX_RELATIONS,
@@ -437,6 +464,11 @@ RowCacheLookupFlat(RowCacheRelEntry *entry, ItemPointer tid)
 
 /* ----------------------------------------------------------------
  * Public API: Load
+ *
+ * Lock order: partition_lock → rel_lock (never reverse).
+ * We hold the partition lock only long enough for HASH_ENTER +
+ * rel_lock acquisition, then release it so readers on the same
+ * partition are not blocked during the (potentially long) table scan.
  * ---------------------------------------------------------------- */
 
 void
@@ -446,14 +478,21 @@ RelationRowCacheLoadRelation(Relation rel)
 	RowCacheRelEntry *entry;
 	dshash_table *tid_hash;
 	bool		found;
+	uint32		hashcode;
+	LWLock	   *partlock;
 
 	if (RowCacheRelHash == NULL)
 		elog(ERROR, "row cache shared memory not initialized");
 
 	EnsureRowCacheDsa();
 
-	entry = hash_search(RowCacheRelHash, &relid, HASH_ENTER, &found);
+	hashcode = RowCacheRelHashCode(&relid);
+	partlock = RowCacheRelPartitionLock(hashcode);
 
+	LWLockAcquire(partlock, LW_EXCLUSIVE);
+
+	entry = hash_search_with_hash_value(RowCacheRelHash, &relid, hashcode,
+										HASH_ENTER, &found);
 	if (!found)
 	{
 		LWLockInitialize(&entry->rel_lock, LWTRANCHE_ROW_CACHE_REL);
@@ -462,7 +501,10 @@ RelationRowCacheLoadRelation(Relation rel)
 		entry->natts = 0;
 	}
 
+	/* Acquire rel_lock while still holding partition lock to prevent a
+	 * concurrent Drop from removing the entry before we pin it. */
 	LWLockAcquire(&entry->rel_lock, LW_EXCLUSIVE);
+	LWLockRelease(partlock);
 
 	/* Drop stale backend-local dshash pointers before destroying shared hash. */
 	LocalAttachInvalidate(relid);
@@ -508,22 +550,39 @@ RelationRowCacheLoadRelation(Relation rel)
 
 /* ----------------------------------------------------------------
  * Public API: Drop
+ *
+ * Hold partition_lock(EXCLUSIVE) for the entire operation so that
+ * HASH_FIND and HASH_REMOVE are atomic with respect to concurrent
+ * readers.  Drop is an administrative operation on read-only tables,
+ * so blocking one partition briefly is acceptable.
  * ---------------------------------------------------------------- */
 
 void
 RelationRowCacheDropRelation(Oid relid)
 {
 	RowCacheRelEntry *entry;
+	uint32		hashcode;
+	LWLock	   *partlock;
 
 	if (RowCacheRelHash == NULL)
 		return;
 
 	EnsureRowCacheDsa();
 
-	entry = hash_search(RowCacheRelHash, &relid, HASH_FIND, NULL);
-	if (entry == NULL || !entry->loaded)
-		return;
+	hashcode = RowCacheRelHashCode(&relid);
+	partlock = RowCacheRelPartitionLock(hashcode);
 
+	LWLockAcquire(partlock, LW_EXCLUSIVE);
+
+	entry = hash_search_with_hash_value(RowCacheRelHash, &relid, hashcode,
+										HASH_FIND, NULL);
+	if (entry == NULL || !entry->loaded)
+	{
+		LWLockRelease(partlock);
+		return;
+	}
+
+	/* Lock order: partition_lock → rel_lock. */
 	LWLockAcquire(&entry->rel_lock, LW_EXCLUSIVE);
 
 	LocalAttachInvalidate(relid);
@@ -537,13 +596,19 @@ RelationRowCacheDropRelation(Oid relid)
 
 	LWLockRelease(&entry->rel_lock);
 
-	hash_search(RowCacheRelHash, &relid, HASH_REMOVE, NULL);
+	hash_search_with_hash_value(RowCacheRelHash, &relid, hashcode,
+								HASH_REMOVE, NULL);
+
+	LWLockRelease(partlock);
 
 	LocalAttachInvalidate(relid);
 }
 
 /* ----------------------------------------------------------------
  * Public API: FillSlot (simple cache lookup + slot fill)
+ *
+ * Lock order: partition_lock(SHARED) → rel_lock(SHARED).
+ * Release partition_lock as soon as rel_lock is held.
  * ---------------------------------------------------------------- */
 
 bool
@@ -552,6 +617,8 @@ RelationRowCacheFillSlot(TupleTableSlot *slot)
 	RowCacheRelEntry *entry;
 	FlatCachedTuple *flat;
 	bool		ok;
+	uint32		hashcode;
+	LWLock	   *partlock;
 
 	Assert(slot != NULL);
 	if (RowCacheRelHash == NULL)
@@ -559,11 +626,21 @@ RelationRowCacheFillSlot(TupleTableSlot *slot)
 	if (!OidIsValid(slot->tts_tableOid) || !ItemPointerIsValid(&slot->tts_tid))
 		return false;
 
-	entry = hash_search(RowCacheRelHash, &slot->tts_tableOid, HASH_FIND, NULL);
+	hashcode = RowCacheRelHashCode(&slot->tts_tableOid);
+	partlock = RowCacheRelPartitionLock(hashcode);
+
+	LWLockAcquire(partlock, LW_SHARED);
+
+	entry = hash_search_with_hash_value(RowCacheRelHash, &slot->tts_tableOid,
+										hashcode, HASH_FIND, NULL);
 	if (entry == NULL || !entry->loaded)
+	{
+		LWLockRelease(partlock);
 		return false;
+	}
 
 	LWLockAcquire(&entry->rel_lock, LW_SHARED);
+	LWLockRelease(partlock);
 
 	if (!entry->loaded)
 	{
@@ -586,6 +663,8 @@ RelationRowCacheFillSlot(TupleTableSlot *slot)
 
 /* ----------------------------------------------------------------
  * Public API: FetchWithVisibility (MVCC-aware cache lookup)
+ *
+ * Same lock protocol as FillSlot.
  * ---------------------------------------------------------------- */
 
 bool
@@ -599,6 +678,8 @@ RelationRowCacheFetchWithVisibility(Oid relid,
 	RowCacheRelEntry *entry;
 	FlatCachedTuple *flat;
 	HeapTupleData htup;
+	uint32		hashcode;
+	LWLock	   *partlock;
 
 	Assert(slot != NULL && is_visible != NULL && has_hot_chain != NULL);
 	*is_visible = false;
@@ -609,11 +690,21 @@ RelationRowCacheFetchWithVisibility(Oid relid,
 	if (!OidIsValid(relid) || !ItemPointerIsValid(tid))
 		return false;
 
-	entry = hash_search(RowCacheRelHash, &relid, HASH_FIND, NULL);
+	hashcode = RowCacheRelHashCode(&relid);
+	partlock = RowCacheRelPartitionLock(hashcode);
+
+	LWLockAcquire(partlock, LW_SHARED);
+
+	entry = hash_search_with_hash_value(RowCacheRelHash, &relid, hashcode,
+										HASH_FIND, NULL);
 	if (entry == NULL || !entry->loaded)
+	{
+		LWLockRelease(partlock);
 		return false;
+	}
 
 	LWLockAcquire(&entry->rel_lock, LW_SHARED);
+	LWLockRelease(partlock);
 
 	if (!entry->loaded)
 	{
