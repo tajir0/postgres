@@ -1,4 +1,4 @@
-﻿\set ON_ERROR_STOP on
+\set ON_ERROR_STOP on
 \set loops 1000000
 \set rounds 20
 
@@ -8,12 +8,24 @@ SET jit = off;
 SET max_parallel_workers_per_gather = 0;
 SET enable_indexonlyscan = off;
 
+CREATE OR REPLACE FUNCTION monotonic_ms()
+RETURNS double precision
+LANGUAGE plpgsql
+AS $func$
+DECLARE
+    content text;
+BEGIN
+    content := pg_read_file('/proc/uptime');
+    RETURN split_part(content, ' ', 1)::double precision * 1000.0;
+END;
+$func$;
+
 DO $$
 DECLARE
-    t_prepare_start  timestamptz;
-    t_prepare_end    timestamptz;
+    ms_prepare_start double precision;
+    ms_prepare_end   double precision;
 BEGIN
-    t_prepare_start := clock_timestamp();
+    ms_prepare_start := monotonic_ms();
 
     IF to_regprocedure('pg_drop_relation_row_cache(text)') IS NOT NULL THEN
         PERFORM pg_drop_relation_row_cache('row_cache_perf.bench_tbl');
@@ -23,8 +35,8 @@ BEGIN
         RAISE EXCEPTION 'pg_drop_relation_row_cache(...) does not exist';
     END IF;
 
-    t_prepare_end := clock_timestamp();
-    RAISE NOTICE 'stage=nocache_prepare elapsed=%', (t_prepare_end - t_prepare_start);
+    ms_prepare_end := monotonic_ms();
+    RAISE NOTICE 'stage=nocache_prepare elapsed=% ms', (ms_prepare_end - ms_prepare_start);
 END
 $$;
 
@@ -32,11 +44,11 @@ CREATE OR REPLACE PROCEDURE row_cache_perf.bench_nocache_proc(p_loops int, p_rou
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    i                 int;
-    t_work_start      timestamptz;
-    t_work_end        timestamptz;
+    i            int;
+    ms_work_start double precision;
+    ms_work_end   double precision;
 BEGIN
-    t_work_start := clock_timestamp();
+    ms_work_start := monotonic_ms();
 
     FOR i IN 1..p_rounds LOOP
         PERFORM pg_column_size(q.r)
@@ -49,10 +61,10 @@ BEGIN
         ) AS q;
     END LOOP;
 
-    t_work_end := clock_timestamp();
+    ms_work_end := monotonic_ms();
 
-    RAISE NOTICE 'stage=nocache_workload rounds=% loops=% total_elapsed=%',
-        p_rounds, p_loops, (t_work_end - t_work_start);
+    RAISE NOTICE 'stage=nocache_workload rounds=% loops=% total_elapsed=% ms',
+        p_rounds, p_loops, (ms_work_end - ms_work_start);
 END
 $$;
 
