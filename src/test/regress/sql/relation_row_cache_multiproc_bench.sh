@@ -32,7 +32,14 @@ PGUSER="${PGUSER:-zhui}"
 PGDATABASE="${PGDATABASE:-postgres}"
 PGHOST="${PGHOST:-127.0.0.1}"
 PGPORT="${PGPORT:-5432}"
-export PGUSER PGDATABASE PGHOST PGPORT
+PGPASSWORD="${PGPASSWORD:-}"
+export PGUSER PGDATABASE PGHOST PGPORT PGPASSWORD
+
+if [[ -z "$PGPASSWORD" ]]; then
+  echo "提示: 未设置 PGPASSWORD，后台 psql 无法交互输入密码。"
+  echo "用法: PGPASSWORD=yourpass $0 $*"
+  exit 1
+fi
 
 OUT_DIR="${OUT_DIR:-$HOME/postgres/trace/multiproc}"
 mkdir -p "$OUT_DIR"
