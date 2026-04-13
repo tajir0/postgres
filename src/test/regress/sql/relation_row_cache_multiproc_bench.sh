@@ -61,6 +61,21 @@ psql_exec() {
   "$PSQL" -X -A -t -q -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -c "$1"
 }
 
+# 提前创建 monotonic_ms 函数，避免多 worker 并发 DDL 争锁
+psql_exec "
+CREATE OR REPLACE FUNCTION monotonic_ms()
+RETURNS double precision
+LANGUAGE plpgsql
+AS \$func\$
+DECLARE
+    content text;
+BEGIN
+    content := pg_read_file('/proc/uptime');
+    RETURN split_part(content, ' ', 1)::double precision * 1000.0;
+END;
+\$func\$;
+"
+
 # 生成每个 worker 要执行的 SQL 临时文件
 generate_worker_sql() {
   local mode="$1"   # cache / nocache
@@ -73,21 +88,9 @@ SET jit = off;
 SET max_parallel_workers_per_gather = 0;
 SET enable_indexonlyscan = off;
 
-CREATE OR REPLACE FUNCTION monotonic_ms()
-RETURNS double precision
-LANGUAGE plpgsql
-AS \$func\$
-DECLARE
-    content text;
-BEGIN
-    content := pg_read_file('/proc/uptime');
-    RETURN split_part(content, ' ', 1)::double precision * 1000.0;
-END;
-\$func\$;
-
--- 使用 advisory lock 做发令枪，让所有 worker 尽量同时开始
-SELECT pg_advisory_lock(999999);
-SELECT pg_advisory_unlock(999999);
+-- 使用 shared advisory lock 做发令枪，所有 worker 同时放行
+SELECT pg_advisory_lock_shared(999999);
+SELECT pg_advisory_unlock_shared(999999);
 
 DO \$\$
 DECLARE
