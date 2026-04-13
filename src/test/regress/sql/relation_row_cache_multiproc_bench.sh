@@ -133,10 +133,24 @@ run_phase() {
   echo ""
   echo "--- [$mode] 启动 $NPROCS 个并发进程 ---"
 
-  # 先获取 advisory lock，阻止所有 worker 开始执行负载
-  psql_exec "SELECT pg_advisory_lock(999999);" >/dev/null
+  # 用一个持续存活的后台 psql 会话持有 advisory lock 做"发令枪"。
+  # 通过命名管道向它发送 SQL，会话不断开，锁就一直有效。
+  local lock_pipe="$OUT_DIR/${mode}_lock_pipe"
+  rm -f "$lock_pipe"
+  mkfifo "$lock_pipe"
 
-  # 启动所有 worker
+  # 后台 psql 从管道读取 SQL，先获取锁后阻塞等待下一条命令
+  "$PSQL" -X -A -t -q \
+    -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" \
+    < "$lock_pipe" >"$OUT_DIR/${mode}_lock.log" 2>&1 &
+  local lock_psql_pid=$!
+
+  # 向管道写入加锁命令（写完不关闭 fd，保持会话存活）
+  exec 7>"$lock_pipe"
+  echo "SELECT pg_advisory_lock(999999);" >&7
+  sleep 0.5  # 等待锁获取完成
+
+  # 启动所有 worker — 每个 worker 会阻塞在 pg_advisory_lock(999999)
   for i in $(seq 1 "$NPROCS"); do
     local logfile="$OUT_DIR/${mode}_worker_${i}.log"
     "$PSQL" -X -A -t \
@@ -145,15 +159,18 @@ run_phase() {
     pids+=($!)
   done
 
-  # 等一小会儿让所有 worker 都连上并阻塞在 advisory lock
-  sleep 1.5
+  # 等所有 worker 都连上并阻塞在 advisory lock
+  sleep 2
 
   # 记录墙钟起点
   local wall_start
   wall_start=$(date +%s%3N)
 
-  # 释放发令枪
-  psql_exec "SELECT pg_advisory_unlock(999999);" >/dev/null
+  # 释放发令枪：在同一个持锁会话中 unlock，然后关闭管道让会话退出
+  echo "SELECT pg_advisory_unlock(999999);" >&7
+  exec 7>&-  # 关闭写端，持锁 psql 会话随之退出
+  wait "$lock_psql_pid" 2>/dev/null || true
+  rm -f "$lock_pipe"
 
   # 等待所有 worker 完成
   local fail=0
