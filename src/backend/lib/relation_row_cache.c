@@ -59,6 +59,23 @@ static HTAB *RowCacheRelHash = NULL;
 static dsa_area *LocalDsa = NULL;
 static HTAB *LocalAttachCache = NULL;
 
+/*
+ * Backend-local pointer cache: relid → RowCacheRelEntry *
+ *
+ * RowCacheRelEntry slots in ShmemInitHash are pre-allocated and never
+ * physically moved, so the pointer is stable as long as the entry exists
+ * in the hash table.  On the hot path we skip partition_lock entirely
+ * and jump straight to rel_lock.  A stale entry is detected under
+ * rel_lock by re-checking entry->relid and entry->loaded.
+ */
+typedef struct LocalRelPtrEntry
+{
+	Oid				 relid;		/* hash key */
+	RowCacheRelEntry *entry;	/* pointer into ShmemInitHash (stable) */
+} LocalRelPtrEntry;
+
+static HTAB *LocalRelPtrCache = NULL;
+
 /* ----------------------------------------------------------------
  * dshash parameters for the inner (BlockNumber → TidBlockEntry) hash
  * ---------------------------------------------------------------- */
@@ -281,6 +298,56 @@ LocalAttachInvalidate(Oid relid)
 		local->attach_handle = DSHASH_HANDLE_INVALID;
 	}
 	hash_search(LocalAttachCache, &relid, HASH_REMOVE, NULL);
+}
+
+/* ----------------------------------------------------------------
+ * Backend-local rel-pointer cache helpers
+ * ---------------------------------------------------------------- */
+
+static void
+EnsureLocalRelPtrCache(void)
+{
+	HASHCTL		ctl;
+
+	if (LocalRelPtrCache != NULL)
+		return;
+
+	ctl.keysize = sizeof(Oid);
+	ctl.entrysize = sizeof(LocalRelPtrEntry);
+	ctl.hcxt = TopMemoryContext;
+	LocalRelPtrCache = hash_create("Row Cache Local Rel Ptr",
+								   32, &ctl,
+								   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+static RowCacheRelEntry *
+LocalRelPtrLookup(Oid relid)
+{
+	LocalRelPtrEntry *local;
+
+	if (LocalRelPtrCache == NULL)
+		return NULL;
+	local = hash_search(LocalRelPtrCache, &relid, HASH_FIND, NULL);
+	return local ? local->entry : NULL;
+}
+
+static void
+LocalRelPtrInsert(Oid relid, RowCacheRelEntry *entry)
+{
+	LocalRelPtrEntry *local;
+	bool		found;
+
+	EnsureLocalRelPtrCache();
+	local = hash_search(LocalRelPtrCache, &relid, HASH_ENTER, &found);
+	local->entry = entry;
+}
+
+static void
+LocalRelPtrInvalidate(Oid relid)
+{
+	if (LocalRelPtrCache == NULL)
+		return;
+	hash_search(LocalRelPtrCache, &relid, HASH_REMOVE, NULL);
 }
 
 /* ----------------------------------------------------------------
@@ -551,10 +618,12 @@ RelationRowCacheLoadRelation(Relation rel)
 /* ----------------------------------------------------------------
  * Public API: Drop
  *
- * Hold partition_lock(EXCLUSIVE) for the entire operation so that
- * HASH_FIND and HASH_REMOVE are atomic with respect to concurrent
- * readers.  Drop is an administrative operation on read-only tables,
- * so blocking one partition briefly is acceptable.
+ * Lock order: partition_lock(EXCLUSIVE) → rel_lock(EXCLUSIVE).
+ * partition_lock is released after rel_lock is acquired (same pattern
+ * as Load).  The entry is NOT removed from RowCacheRelHash: keeping the
+ * slot alive ensures its embedded rel_lock is never re-initialized via
+ * LWLockInitialize while another backend may hold a stale pointer to it
+ * from LocalRelPtrCache.  The entry simply stays with loaded=false.
  * ---------------------------------------------------------------- */
 
 void
@@ -585,6 +654,20 @@ RelationRowCacheDropRelation(Oid relid)
 	/* Lock order: partition_lock → rel_lock. */
 	LWLockAcquire(&entry->rel_lock, LW_EXCLUSIVE);
 
+	/*
+	 * Release partition_lock before the (potentially expensive) DSA teardown.
+	 * We intentionally do NOT HASH_REMOVE the entry: leaving it in the table
+	 * with loaded=false means the rel_lock slot is never recycled and
+	 * LWLockInitialize is never called again for this slot.  That eliminates
+	 * the race between a backend holding a stale LocalRelPtrCache pointer
+	 * (and about to call LWLockAcquire) and a concurrent Load that would
+	 * re-initialize the same lock via LWLockInitialize.
+	 *
+	 * The table is bounded by ROW_CACHE_MAX_RELATIONS entries, so leaving
+	 * entries in place is acceptable.
+	 */
+	LWLockRelease(partlock);
+
 	LocalAttachInvalidate(relid);
 
 	if (entry->loaded)
@@ -596,12 +679,7 @@ RelationRowCacheDropRelation(Oid relid)
 
 	LWLockRelease(&entry->rel_lock);
 
-	hash_search_with_hash_value(RowCacheRelHash, &relid, hashcode,
-								HASH_REMOVE, NULL);
-
-	LWLockRelease(partlock);
-
-	LocalAttachInvalidate(relid);
+	LocalRelPtrInvalidate(relid);
 }
 
 /* ----------------------------------------------------------------
@@ -617,8 +695,7 @@ RelationRowCacheFillSlot(TupleTableSlot *slot)
 	RowCacheRelEntry *entry;
 	FlatCachedTuple *flat;
 	bool		ok;
-	uint32		hashcode;
-	LWLock	   *partlock;
+	Oid			relid;
 
 	Assert(slot != NULL);
 	if (RowCacheRelHash == NULL)
@@ -626,26 +703,56 @@ RelationRowCacheFillSlot(TupleTableSlot *slot)
 	if (!OidIsValid(slot->tts_tableOid) || !ItemPointerIsValid(&slot->tts_tid))
 		return false;
 
-	hashcode = RowCacheRelHashCode(&slot->tts_tableOid);
-	partlock = RowCacheRelPartitionLock(hashcode);
+	relid = slot->tts_tableOid;
 
-	LWLockAcquire(partlock, LW_SHARED);
-
-	entry = hash_search_with_hash_value(RowCacheRelHash, &slot->tts_tableOid,
-										hashcode, HASH_FIND, NULL);
-	if (entry == NULL || !entry->loaded)
+	/*
+	 * Hot path: backend-local pointer cache hit → skip partition_lock.
+	 *
+	 * ShmemInitHash slots are pre-allocated and never physically moved, so
+	 * the cached pointer remains valid as a memory address.  We validate it
+	 * under rel_lock by re-checking entry->relid and entry->loaded; if the
+	 * slot was reused for a different relation or dropped, we evict the cache
+	 * entry and fall through to the cold path.
+	 */
+	entry = LocalRelPtrLookup(relid);
+	if (entry != NULL)
 	{
-		LWLockRelease(partlock);
-		return false;
+		LWLockAcquire(&entry->rel_lock, LW_SHARED);
+		if (entry->relid != relid || !entry->loaded)
+		{
+			LWLockRelease(&entry->rel_lock);
+			LocalRelPtrInvalidate(relid);
+			entry = NULL;		/* fall through to cold path */
+		}
 	}
 
-	LWLockAcquire(&entry->rel_lock, LW_SHARED);
-	LWLockRelease(partlock);
-
-	if (!entry->loaded)
+	/*
+	 * Cold path: acquire partition_lock, look up the shared hash table, then
+	 * cache the entry pointer for subsequent hot-path lookups.
+	 */
+	if (entry == NULL)
 	{
-		LWLockRelease(&entry->rel_lock);
-		return false;
+		uint32		hashcode = RowCacheRelHashCode(&relid);
+		LWLock	   *partlock = RowCacheRelPartitionLock(hashcode);
+
+		LWLockAcquire(partlock, LW_SHARED);
+		entry = hash_search_with_hash_value(RowCacheRelHash, &relid,
+											hashcode, HASH_FIND, NULL);
+		if (entry == NULL || !entry->loaded)
+		{
+			LWLockRelease(partlock);
+			return false;
+		}
+		LWLockAcquire(&entry->rel_lock, LW_SHARED);
+		LWLockRelease(partlock);
+
+		if (!entry->loaded)
+		{
+			LWLockRelease(&entry->rel_lock);
+			return false;
+		}
+
+		LocalRelPtrInsert(relid, entry);
 	}
 
 	flat = RowCacheLookupFlat(entry, &slot->tts_tid);
@@ -678,8 +785,6 @@ RelationRowCacheFetchWithVisibility(Oid relid,
 	RowCacheRelEntry *entry;
 	FlatCachedTuple *flat;
 	HeapTupleData htup;
-	uint32		hashcode;
-	LWLock	   *partlock;
 
 	Assert(slot != NULL && is_visible != NULL && has_hot_chain != NULL);
 	*is_visible = false;
@@ -690,26 +795,43 @@ RelationRowCacheFetchWithVisibility(Oid relid,
 	if (!OidIsValid(relid) || !ItemPointerIsValid(tid))
 		return false;
 
-	hashcode = RowCacheRelHashCode(&relid);
-	partlock = RowCacheRelPartitionLock(hashcode);
-
-	LWLockAcquire(partlock, LW_SHARED);
-
-	entry = hash_search_with_hash_value(RowCacheRelHash, &relid, hashcode,
-										HASH_FIND, NULL);
-	if (entry == NULL || !entry->loaded)
+	/* Hot path: backend-local pointer cache hit → skip partition_lock */
+	entry = LocalRelPtrLookup(relid);
+	if (entry != NULL)
 	{
-		LWLockRelease(partlock);
-		return false;
+		LWLockAcquire(&entry->rel_lock, LW_SHARED);
+		if (entry->relid != relid || !entry->loaded)
+		{
+			LWLockRelease(&entry->rel_lock);
+			LocalRelPtrInvalidate(relid);
+			entry = NULL;
+		}
 	}
 
-	LWLockAcquire(&entry->rel_lock, LW_SHARED);
-	LWLockRelease(partlock);
-
-	if (!entry->loaded)
+	/* Cold path: acquire partition_lock, look up, cache for next time */
+	if (entry == NULL)
 	{
-		LWLockRelease(&entry->rel_lock);
-		return false;
+		uint32		hashcode = RowCacheRelHashCode(&relid);
+		LWLock	   *partlock = RowCacheRelPartitionLock(hashcode);
+
+		LWLockAcquire(partlock, LW_SHARED);
+		entry = hash_search_with_hash_value(RowCacheRelHash, &relid, hashcode,
+											HASH_FIND, NULL);
+		if (entry == NULL || !entry->loaded)
+		{
+			LWLockRelease(partlock);
+			return false;
+		}
+		LWLockAcquire(&entry->rel_lock, LW_SHARED);
+		LWLockRelease(partlock);
+
+		if (!entry->loaded)
+		{
+			LWLockRelease(&entry->rel_lock);
+			return false;
+		}
+
+		LocalRelPtrInsert(relid, entry);
 	}
 
 	flat = RowCacheLookupFlat(entry, tid);
