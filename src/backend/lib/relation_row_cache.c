@@ -57,9 +57,8 @@ typedef struct RowCacheShmemControl
  *
  * Once an entry is inserted into RowCacheRelHash its memory address
  * (and the embedded rel_lock) is stable for the lifetime of the
- * postmaster: Drop never HASH_REMOVEs.  Readers may therefore cache
- * the pointer in a backend-local map (LocalRelPtrCache) without risk
- * of lock re-initialization races.
+ * postmaster: Drop never HASH_REMOVEs.  Entry addresses remain valid
+ * for the lifetime of the postmaster (no dangling pointers after Drop).
  */
 typedef struct RowCacheRelEntry
 {
@@ -89,33 +88,6 @@ typedef struct TidBlockEntry
 static RowCacheShmemControl *RowCacheCtl = NULL;
 static HTAB *RowCacheRelHash = NULL;
 static dsa_area *LocalDsa = NULL;
-
-/*
- * Backend-local pointer cache: relid → RowCacheRelEntry *
- *
- * RowCacheRelEntry slots in ShmemInitHash are pre-allocated and never
- * physically moved, and Drop never HASH_REMOVEs them, so the cached
- * pointer is stable for the lifetime of the postmaster.  On the hot
- * path we skip partition_lock entirely and go straight to pin+state.
- * A mismatched relid (reserved for a future recycling scheme) or
- * state != LOADED is detected by RowCachePinEntry and causes fall-back
- * to the cold path via LocalRelPtrInvalidate.
- */
-typedef struct LocalRelPtrEntry
-{
-	Oid				 relid;		/* hash key */
-	RowCacheRelEntry *entry;	/* pointer into ShmemInitHash (stable) */
-} LocalRelPtrEntry;
-
-static HTAB *LocalRelPtrCache = NULL;
-
-/*
- * Single-slot bypass for repeated lookups of the same relation (tight loops
- * on one table).  Avoids LocalRelPtrLookup's hash_search when relid matches.
- * Cleared in LocalRelPtrInvalidate() together with the HTAB entry.
- */
-static Oid			LastRelPtrRelid = InvalidOid;
-static RowCacheRelEntry *LastRelPtrEntry = NULL;
 
 /* ----------------------------------------------------------------
  * Partition lock helpers for RowCacheRelHash
@@ -260,62 +232,6 @@ EnsureRowCacheDsa(void)
 	LWLockRelease(&RowCacheCtl->control_lock);
 
 	MemoryContextSwitchTo(old_ctx);
-}
-
-/* ----------------------------------------------------------------
- * Backend-local rel-pointer cache helpers
- * ---------------------------------------------------------------- */
-
-static void
-EnsureLocalRelPtrCache(void)
-{
-	HASHCTL		ctl;
-
-	if (LocalRelPtrCache != NULL)
-		return;
-
-	ctl.keysize = sizeof(Oid);
-	ctl.entrysize = sizeof(LocalRelPtrEntry);
-	ctl.hcxt = TopMemoryContext;
-	LocalRelPtrCache = hash_create("Row Cache Local Rel Ptr",
-								   32, &ctl,
-								   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-}
-
-static RowCacheRelEntry *
-LocalRelPtrLookup(Oid relid)
-{
-	LocalRelPtrEntry *local;
-
-	if (LocalRelPtrCache == NULL)
-		return NULL;
-	local = hash_search(LocalRelPtrCache, &relid, HASH_FIND, NULL);
-	return local ? local->entry : NULL;
-}
-
-static void
-LocalRelPtrInsert(Oid relid, RowCacheRelEntry *entry)
-{
-	LocalRelPtrEntry *local;
-	bool		found;
-
-	EnsureLocalRelPtrCache();
-	local = hash_search(LocalRelPtrCache, &relid, HASH_ENTER, &found);
-	local->entry = entry;
-}
-
-static void
-LocalRelPtrInvalidate(Oid relid)
-{
-	/* Clear single-slot even when LocalRelPtrCache is still NULL. */
-	if (LocalRelPtrCache != NULL)
-		hash_search(LocalRelPtrCache, &relid, HASH_REMOVE, NULL);
-
-	if (relid == LastRelPtrRelid)
-	{
-		LastRelPtrRelid = InvalidOid;
-		LastRelPtrEntry = NULL;
-	}
 }
 
 /* ----------------------------------------------------------------
@@ -629,8 +545,7 @@ RelationRowCacheLoadRelation(Relation rel)
  * partition_lock is released after rel_lock is acquired (same pattern
  * as Load).  The entry is NOT removed from RowCacheRelHash: the slot
  * (and its embedded rel_lock) stays alive for the lifetime of the
- * postmaster.  This lets readers cache RowCacheRelEntry pointers in
- * LocalRelPtrCache and know the pointer will never dangle.
+ * postmaster.  Read paths take partition_lock(SHARED) on each lookup.
  *
  * Concurrency with readers:
  *   1. Acquire rel_lock EXCLUSIVE (serialises with Load / other Drop).
@@ -690,16 +605,13 @@ RelationRowCacheDropRelation(Oid relid)
 	}
 
 	LWLockRelease(&entry->rel_lock);
-
-	LocalRelPtrInvalidate(relid);
 }
 
 /* ----------------------------------------------------------------
  * Public API: FillSlot (simple cache lookup + slot fill)
  *
  * Read-path concurrency (no rel_lock!):
- *   1. Locate the entry (via LocalRelPtrCache hot path or partition_lock
- *      cold path).
+ *   1. Locate the entry under partition_lock(SHARED) + HASH_FIND.
  *   2. Bump this backend's pin slot (MyProcNumber) to pin the entry.
  *   3. Read state.  If not LOADED, unpin and bail.  (fetch_add on the slot
  *      is a full barrier, so the state read is ordered after the pin.)
@@ -707,13 +619,8 @@ RelationRowCacheDropRelation(Oid relid)
  *      while any pin slot is non-zero.
  *   5. Unpin (decrement this backend's slot).
  *
- * Since the entry slot is never recycled, pointers cached in
- * LocalRelPtrCache (and the single-slot below) are stable: we only need
- * to re-check entry->relid to protect against the (currently impossible)
- * future case where an entry might be reused for a different relation.
- *
- * Hot path order: single-slot compare → LocalRelPtrLookup hash →
- * partition_lock + shared hash find.
+ * Hash slots are never recycled for a given relid; RowCachePinEntry still
+ * re-checks entry->relid against a hypothetical future reuse scheme.
  * ---------------------------------------------------------------- */
 
 static RowCacheRelEntry *
@@ -723,20 +630,6 @@ RowCacheLookupRelEntry(Oid relid)
 	uint32		hashcode;
 	LWLock	   *partlock;
 
-	/* Fastest: last relation in this backend (no hash_search). */
-	if (relid == LastRelPtrRelid && LastRelPtrEntry != NULL)
-		entry = LastRelPtrEntry;
-	else
-	{
-		entry = LocalRelPtrLookup(relid);
-		LastRelPtrRelid = relid;
-		LastRelPtrEntry = entry;
-	}
-
-	if (entry != NULL)
-		return entry;
-
-	/* Cold path: partition_lock SHARED + HASH_FIND, then cache pointer. */
 	hashcode = RowCacheRelHashCode(&relid);
 	partlock = RowCacheRelPartitionLock(hashcode);
 
@@ -744,13 +637,6 @@ RowCacheLookupRelEntry(Oid relid)
 	entry = hash_search_with_hash_value(RowCacheRelHash, &relid,
 										hashcode, HASH_FIND, NULL);
 	LWLockRelease(partlock);
-
-	if (entry != NULL)
-	{
-		LocalRelPtrInsert(relid, entry);
-		LastRelPtrRelid = relid;
-		LastRelPtrEntry = entry;
-	}
 
 	return entry;
 }
@@ -809,15 +695,7 @@ RelationRowCacheFillSlot(TupleTableSlot *slot)
 		return false;
 
 	if (!RowCachePinEntry(entry, relid))
-	{
-		/*
-		 * Entry is not loaded (or relid mismatch from a future recycling
-		 * scheme).  Drop our stale local pointer so we don't hammer the
-		 * same dead entry again.
-		 */
-		LocalRelPtrInvalidate(relid);
 		return false;
-	}
 
 	flat = RowCacheLookupFlat(entry, &slot->tts_tid);
 	if (flat == NULL)
@@ -864,10 +742,7 @@ RelationRowCacheFetchWithVisibility(Oid relid,
 		return false;
 
 	if (!RowCachePinEntry(entry, relid))
-	{
-		LocalRelPtrInvalidate(relid);
 		return false;
-	}
 
 	flat = RowCacheLookupFlat(entry, tid);
 	if (flat == NULL)
