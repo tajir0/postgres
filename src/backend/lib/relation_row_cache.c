@@ -6,6 +6,7 @@
 #include "lib/dshash.h"
 #include "lib/relation_row_cache.h"
 #include "lib/tid_row_cache.h"
+#include "port/atomics.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/dsa.h"
@@ -20,6 +21,16 @@
 #define ROW_CACHE_MAX_RELATIONS 128
 #define ROW_CACHE_NUM_PARTITIONS 16
 
+/*
+ * Per-relation state values for RowCacheRelEntry.state.
+ *
+ * State transitions are only performed by Load / Drop while holding
+ * rel_lock(EXCLUSIVE).  Readers only ever read this field atomically,
+ * never write it.
+ */
+#define ROW_CACHE_STATE_UNLOADED	0
+#define ROW_CACHE_STATE_LOADED		1
+
 typedef struct RowCacheShmemControl
 {
 	dsa_handle	global_dsa_handle;
@@ -27,13 +38,36 @@ typedef struct RowCacheShmemControl
 	LWLock		rel_hash_locks[ROW_CACHE_NUM_PARTITIONS];
 } RowCacheShmemControl;
 
+/*
+ * RowCacheRelEntry: per-relation slot in the shared hash table.
+ *
+ * Concurrency protocol (atomic state + pin count, lock-free read path):
+ *
+ *   - state: LOADED / UNLOADED.  Readers only read atomically.  Load and
+ *     Drop write it while holding rel_lock(EXCLUSIVE).
+ *   - pins:  active-reader counter.  Readers atomically bump it before
+ *     touching tid_hash_handle / natts / dshash contents, and decrement
+ *     it when done.  Drop / Load wait for pins to reach zero before
+ *     tearing down the DSA-backed dshash — guarantees no reader is
+ *     inside the dshash when dshash_destroy() runs.
+ *   - rel_lock: EXCLUSIVE-only, serializes Load ↔ Drop ↔ Load.  The read
+ *     path never acquires it, eliminating cache-line bouncing on the
+ *     hot path under high concurrency.
+ *
+ * Once an entry is inserted into RowCacheRelHash its memory address
+ * (and the embedded rel_lock) is stable for the lifetime of the
+ * postmaster: Drop never HASH_REMOVEs.  Readers may therefore cache
+ * the pointer in a backend-local map (LocalRelPtrCache) without risk
+ * of lock re-initialization races.
+ */
 typedef struct RowCacheRelEntry
 {
 	Oid			relid;			/* hash key */
 	dshash_table_handle tid_hash_handle;
-	LWLock		rel_lock;
+	LWLock		rel_lock;		/* serializes Load ↔ Drop; readers don't take it */
+	pg_atomic_uint32 state;		/* ROW_CACHE_STATE_{UNLOADED,LOADED} */
+	pg_atomic_uint32 pins;		/* # active readers */
 	int			natts;
-	bool		loaded;
 } RowCacheRelEntry;
 
 typedef struct TidBlockEntry
@@ -63,10 +97,12 @@ static HTAB *LocalAttachCache = NULL;
  * Backend-local pointer cache: relid → RowCacheRelEntry *
  *
  * RowCacheRelEntry slots in ShmemInitHash are pre-allocated and never
- * physically moved, so the pointer is stable as long as the entry exists
- * in the hash table.  On the hot path we skip partition_lock entirely
- * and jump straight to rel_lock.  A stale entry is detected under
- * rel_lock by re-checking entry->relid and entry->loaded.
+ * physically moved, and Drop never HASH_REMOVEs them, so the cached
+ * pointer is stable for the lifetime of the postmaster.  On the hot
+ * path we skip partition_lock entirely and go straight to pin+state.
+ * A mismatched relid (reserved for a future recycling scheme) or
+ * state != LOADED is detected by RowCachePinEntry and causes fall-back
+ * to the cold path via LocalRelPtrInvalidate.
  */
 typedef struct LocalRelPtrEntry
 {
@@ -533,9 +569,13 @@ RowCacheLookupFlat(RowCacheRelEntry *entry, ItemPointer tid)
  * Public API: Load
  *
  * Lock order: partition_lock → rel_lock (never reverse).
- * We hold the partition lock only long enough for HASH_ENTER +
- * rel_lock acquisition, then release it so readers on the same
- * partition are not blocked during the (potentially long) table scan.
+ *
+ * Concurrency: state=UNLOADED is written first (via pg_atomic_write_u32)
+ * so any reader that samples state afterwards bails out.  We then spin
+ * until the pin count drains to zero, which guarantees no reader is
+ * inside the old dshash when dshash_destroy() runs.  Once rebuilding
+ * finishes, a write barrier is issued before state=LOADED to publish
+ * tid_hash_handle and natts to readers that see the new state.
  * ---------------------------------------------------------------- */
 
 void
@@ -563,21 +603,37 @@ RelationRowCacheLoadRelation(Relation rel)
 	if (!found)
 	{
 		LWLockInitialize(&entry->rel_lock, LWTRANCHE_ROW_CACHE_REL);
+		pg_atomic_init_u32(&entry->state, ROW_CACHE_STATE_UNLOADED);
+		pg_atomic_init_u32(&entry->pins, 0);
 		entry->tid_hash_handle = DSHASH_HANDLE_INVALID;
-		entry->loaded = false;
 		entry->natts = 0;
 	}
 
 	/* Acquire rel_lock while still holding partition lock to prevent a
-	 * concurrent Drop from removing the entry before we pin it. */
+	 * concurrent Drop from sneaking in before we pin the entry. */
 	LWLockAcquire(&entry->rel_lock, LW_EXCLUSIVE);
 	LWLockRelease(partlock);
 
 	/* Drop stale backend-local dshash pointers before destroying shared hash. */
 	LocalAttachInvalidate(relid);
 
-	if (entry->loaded && entry->tid_hash_handle != DSHASH_HANDLE_INVALID)
-		RowCacheDestroyTidHash(entry);
+	/*
+	 * If a previous load exists, tear it down safely:
+	 *   1. Flip state=UNLOADED so new readers bail out.
+	 *   2. Wait for in-flight readers (pins > 0) to drain.
+	 *   3. Destroy the old dshash — no reader can be inside it anymore.
+	 */
+	if (pg_atomic_read_u32(&entry->state) == ROW_CACHE_STATE_LOADED)
+	{
+		pg_atomic_write_u32(&entry->state, ROW_CACHE_STATE_UNLOADED);
+		pg_memory_barrier();
+
+		while (pg_atomic_read_u32(&entry->pins) > 0)
+			pg_usleep(1);
+
+		if (entry->tid_hash_handle != DSHASH_HANDLE_INVALID)
+			RowCacheDestroyTidHash(entry);
+	}
 
 	tid_hash = dshash_create(LocalDsa, &tid_block_dsh_params, NULL);
 	entry->tid_hash_handle = dshash_get_hash_table_handle(tid_hash);
@@ -607,7 +663,12 @@ RelationRowCacheLoadRelation(Relation rel)
 			PopActiveSnapshot();
 	}
 
-	entry->loaded = true;
+	/*
+	 * Publish: write barrier ensures tid_hash_handle / natts are visible
+	 * to any reader that observes state=LOADED.
+	 */
+	pg_write_barrier();
+	pg_atomic_write_u32(&entry->state, ROW_CACHE_STATE_LOADED);
 
 	dshash_detach(tid_hash);
 	LWLockRelease(&entry->rel_lock);
@@ -620,10 +681,18 @@ RelationRowCacheLoadRelation(Relation rel)
  *
  * Lock order: partition_lock(EXCLUSIVE) → rel_lock(EXCLUSIVE).
  * partition_lock is released after rel_lock is acquired (same pattern
- * as Load).  The entry is NOT removed from RowCacheRelHash: keeping the
- * slot alive ensures its embedded rel_lock is never re-initialized via
- * LWLockInitialize while another backend may hold a stale pointer to it
- * from LocalRelPtrCache.  The entry simply stays with loaded=false.
+ * as Load).  The entry is NOT removed from RowCacheRelHash: the slot
+ * (and its embedded rel_lock) stays alive for the lifetime of the
+ * postmaster.  This lets readers cache RowCacheRelEntry pointers in
+ * LocalRelPtrCache and know the pointer will never dangle.
+ *
+ * Concurrency with readers:
+ *   1. Acquire rel_lock EXCLUSIVE (serialises with Load / other Drop).
+ *   2. Flip state to UNLOADED — readers that sample state afterwards
+ *      bail out before touching dshash.
+ *   3. Spin until pins drain to zero — no reader is inside dshash.
+ *   4. Destroy the dshash; future readers will see state=UNLOADED and
+ *      never observe the freed handle.
  * ---------------------------------------------------------------- */
 
 void
@@ -645,7 +714,8 @@ RelationRowCacheDropRelation(Oid relid)
 
 	entry = hash_search_with_hash_value(RowCacheRelHash, &relid, hashcode,
 										HASH_FIND, NULL);
-	if (entry == NULL || !entry->loaded)
+	if (entry == NULL ||
+		pg_atomic_read_u32(&entry->state) != ROW_CACHE_STATE_LOADED)
 	{
 		LWLockRelease(partlock);
 		return;
@@ -653,28 +723,29 @@ RelationRowCacheDropRelation(Oid relid)
 
 	/* Lock order: partition_lock → rel_lock. */
 	LWLockAcquire(&entry->rel_lock, LW_EXCLUSIVE);
-
-	/*
-	 * Release partition_lock before the (potentially expensive) DSA teardown.
-	 * We intentionally do NOT HASH_REMOVE the entry: leaving it in the table
-	 * with loaded=false means the rel_lock slot is never recycled and
-	 * LWLockInitialize is never called again for this slot.  That eliminates
-	 * the race between a backend holding a stale LocalRelPtrCache pointer
-	 * (and about to call LWLockAcquire) and a concurrent Load that would
-	 * re-initialize the same lock via LWLockInitialize.
-	 *
-	 * The table is bounded by ROW_CACHE_MAX_RELATIONS entries, so leaving
-	 * entries in place is acceptable.
-	 */
 	LWLockRelease(partlock);
 
 	LocalAttachInvalidate(relid);
 
-	if (entry->loaded)
+	/*
+	 * Double-check state under rel_lock: another Drop may have raced with
+	 * us and already torn the cache down.
+	 */
+	if (pg_atomic_read_u32(&entry->state) == ROW_CACHE_STATE_LOADED)
 	{
-		RowCacheDestroyTidHash(entry);
-		entry->loaded = false;
-		entry->tid_hash_handle = DSHASH_HANDLE_INVALID;
+		/* Publish UNLOADED before inspecting pins. */
+		pg_atomic_write_u32(&entry->state, ROW_CACHE_STATE_UNLOADED);
+		pg_memory_barrier();
+
+		/* Wait for readers that pinned before our state flip to finish. */
+		while (pg_atomic_read_u32(&entry->pins) > 0)
+			pg_usleep(1);
+
+		if (entry->tid_hash_handle != DSHASH_HANDLE_INVALID)
+		{
+			RowCacheDestroyTidHash(entry);
+			entry->tid_hash_handle = DSHASH_HANDLE_INVALID;
+		}
 	}
 
 	LWLockRelease(&entry->rel_lock);
@@ -685,9 +756,78 @@ RelationRowCacheDropRelation(Oid relid)
 /* ----------------------------------------------------------------
  * Public API: FillSlot (simple cache lookup + slot fill)
  *
- * Lock order: partition_lock(SHARED) → rel_lock(SHARED).
- * Release partition_lock as soon as rel_lock is held.
+ * Read-path concurrency (no rel_lock!):
+ *   1. Locate the entry (via LocalRelPtrCache hot path or partition_lock
+ *      cold path).
+ *   2. Atomically bump entry->pins to pin the entry.
+ *   3. Memory barrier, then read state.  If not LOADED, unpin and bail.
+ *   4. Access dshash / flat tuple.  Drop cannot destroy the dshash
+ *      because our pin is held and Drop waits for pins == 0.
+ *   5. Unpin.
+ *
+ * Since the entry slot is never recycled, pointers cached in
+ * LocalRelPtrCache are stable: we only need to re-check entry->relid
+ * to protect against the (currently impossible) future case where an
+ * entry might be reused for a different relation.
  * ---------------------------------------------------------------- */
+
+static RowCacheRelEntry *
+RowCacheLookupRelEntry(Oid relid)
+{
+	RowCacheRelEntry *entry;
+	uint32		hashcode;
+	LWLock	   *partlock;
+
+	/* Hot path: backend-local pointer cache → no shared locks at all. */
+	entry = LocalRelPtrLookup(relid);
+	if (entry != NULL)
+		return entry;
+
+	/* Cold path: partition_lock SHARED + HASH_FIND, then cache pointer. */
+	hashcode = RowCacheRelHashCode(&relid);
+	partlock = RowCacheRelPartitionLock(hashcode);
+
+	LWLockAcquire(partlock, LW_SHARED);
+	entry = hash_search_with_hash_value(RowCacheRelHash, &relid,
+										hashcode, HASH_FIND, NULL);
+	LWLockRelease(partlock);
+
+	if (entry != NULL)
+		LocalRelPtrInsert(relid, entry);
+
+	return entry;
+}
+
+/*
+ * Pin an entry for the read path.  On success (returns true) the caller
+ * must pair this with a RowCachePinReleaseEntry() before returning.
+ * On failure the entry is not pinned and the caller must not access its
+ * dshash / handle / natts fields.
+ */
+static inline bool
+RowCachePinEntry(RowCacheRelEntry *entry, Oid relid)
+{
+	pg_atomic_fetch_add_u32(&entry->pins, 1);
+	/* pin must be visible before we read state */
+	pg_memory_barrier();
+
+	if (entry->relid != relid ||
+		pg_atomic_read_u32(&entry->state) != ROW_CACHE_STATE_LOADED)
+	{
+		pg_atomic_fetch_sub_u32(&entry->pins, 1);
+		return false;
+	}
+
+	/* Ensure tid_hash_handle / natts reads are ordered after state. */
+	pg_read_barrier();
+	return true;
+}
+
+static inline void
+RowCachePinReleaseEntry(RowCacheRelEntry *entry)
+{
+	pg_atomic_fetch_sub_u32(&entry->pins, 1);
+}
 
 bool
 RelationRowCacheFillSlot(TupleTableSlot *slot)
@@ -705,66 +845,31 @@ RelationRowCacheFillSlot(TupleTableSlot *slot)
 
 	relid = slot->tts_tableOid;
 
-	/*
-	 * Hot path: backend-local pointer cache hit → skip partition_lock.
-	 *
-	 * ShmemInitHash slots are pre-allocated and never physically moved, so
-	 * the cached pointer remains valid as a memory address.  We validate it
-	 * under rel_lock by re-checking entry->relid and entry->loaded; if the
-	 * slot was reused for a different relation or dropped, we evict the cache
-	 * entry and fall through to the cold path.
-	 */
-	entry = LocalRelPtrLookup(relid);
-	if (entry != NULL)
-	{
-		LWLockAcquire(&entry->rel_lock, LW_SHARED);
-		if (entry->relid != relid || !entry->loaded)
-		{
-			LWLockRelease(&entry->rel_lock);
-			LocalRelPtrInvalidate(relid);
-			entry = NULL;		/* fall through to cold path */
-		}
-	}
-
-	/*
-	 * Cold path: acquire partition_lock, look up the shared hash table, then
-	 * cache the entry pointer for subsequent hot-path lookups.
-	 */
+	entry = RowCacheLookupRelEntry(relid);
 	if (entry == NULL)
+		return false;
+
+	if (!RowCachePinEntry(entry, relid))
 	{
-		uint32		hashcode = RowCacheRelHashCode(&relid);
-		LWLock	   *partlock = RowCacheRelPartitionLock(hashcode);
-
-		LWLockAcquire(partlock, LW_SHARED);
-		entry = hash_search_with_hash_value(RowCacheRelHash, &relid,
-											hashcode, HASH_FIND, NULL);
-		if (entry == NULL || !entry->loaded)
-		{
-			LWLockRelease(partlock);
-			return false;
-		}
-		LWLockAcquire(&entry->rel_lock, LW_SHARED);
-		LWLockRelease(partlock);
-
-		if (!entry->loaded)
-		{
-			LWLockRelease(&entry->rel_lock);
-			return false;
-		}
-
-		LocalRelPtrInsert(relid, entry);
+		/*
+		 * Entry is not loaded (or relid mismatch from a future recycling
+		 * scheme).  Drop our stale local pointer so we don't hammer the
+		 * same dead entry again.
+		 */
+		LocalRelPtrInvalidate(relid);
+		return false;
 	}
 
 	flat = RowCacheLookupFlat(entry, &slot->tts_tid);
 	if (flat == NULL)
 	{
-		LWLockRelease(&entry->rel_lock);
+		RowCachePinReleaseEntry(entry);
 		return false;
 	}
 
 	ok = RowCacheUnflattenToSlot(flat, slot->tts_tableOid,
 								 &slot->tts_tid, slot);
-	LWLockRelease(&entry->rel_lock);
+	RowCachePinReleaseEntry(entry);
 	return ok;
 }
 
@@ -795,49 +900,20 @@ RelationRowCacheFetchWithVisibility(Oid relid,
 	if (!OidIsValid(relid) || !ItemPointerIsValid(tid))
 		return false;
 
-	/* Hot path: backend-local pointer cache hit → skip partition_lock */
-	entry = LocalRelPtrLookup(relid);
-	if (entry != NULL)
-	{
-		LWLockAcquire(&entry->rel_lock, LW_SHARED);
-		if (entry->relid != relid || !entry->loaded)
-		{
-			LWLockRelease(&entry->rel_lock);
-			LocalRelPtrInvalidate(relid);
-			entry = NULL;
-		}
-	}
-
-	/* Cold path: acquire partition_lock, look up, cache for next time */
+	entry = RowCacheLookupRelEntry(relid);
 	if (entry == NULL)
+		return false;
+
+	if (!RowCachePinEntry(entry, relid))
 	{
-		uint32		hashcode = RowCacheRelHashCode(&relid);
-		LWLock	   *partlock = RowCacheRelPartitionLock(hashcode);
-
-		LWLockAcquire(partlock, LW_SHARED);
-		entry = hash_search_with_hash_value(RowCacheRelHash, &relid, hashcode,
-											HASH_FIND, NULL);
-		if (entry == NULL || !entry->loaded)
-		{
-			LWLockRelease(partlock);
-			return false;
-		}
-		LWLockAcquire(&entry->rel_lock, LW_SHARED);
-		LWLockRelease(partlock);
-
-		if (!entry->loaded)
-		{
-			LWLockRelease(&entry->rel_lock);
-			return false;
-		}
-
-		LocalRelPtrInsert(relid, entry);
+		LocalRelPtrInvalidate(relid);
+		return false;
 	}
 
 	flat = RowCacheLookupFlat(entry, tid);
 	if (flat == NULL)
 	{
-		LWLockRelease(&entry->rel_lock);
+		RowCachePinReleaseEntry(entry);
 		return false;
 	}
 
@@ -852,6 +928,6 @@ RelationRowCacheFetchWithVisibility(Oid relid,
 	if (*is_visible)
 		RowCacheUnflattenToSlot(flat, relid, tid, slot);
 
-	LWLockRelease(&entry->rel_lock);
+	RowCachePinReleaseEntry(entry);
 	return true;
 }
