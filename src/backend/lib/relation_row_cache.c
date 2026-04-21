@@ -89,6 +89,22 @@ static RowCacheShmemControl *RowCacheCtl = NULL;
 static HTAB *RowCacheRelHash = NULL;
 static dsa_area *LocalDsa = NULL;
 
+/*
+ * Per-backend last-used relation cache.
+ *
+ * Avoids the partition lock (LW_SHARED hash lookup) on repeated accesses to
+ * the same relation within one backend.  Both variables are backend-local and
+ * require no synchronisation.  They are invalidated whenever Load or Drop
+ * change the entry (set LastCachedEntry = NULL).
+ *
+ * Safety: RowCacheRelHash entries are never HASH_REMOVE'd, so the pointer
+ * remains valid for the lifetime of the postmaster even after a Drop.
+ * RowCachePinEntry() re-checks state atomically, so a stale cached pointer
+ * after a Drop + Load still yields a safe "not loaded" outcome.
+ */
+static Oid				LastCachedRelid = InvalidOid;
+static RowCacheRelEntry *LastCachedEntry = NULL;
+
 /* ----------------------------------------------------------------
  * Partition lock helpers for RowCacheRelHash
  *
@@ -111,38 +127,61 @@ RowCacheRelPartitionLock(uint32 hashcode)
 }
 
 /*
- * Hash entry allocation includes RowCacheRelEntry header plus MaxBackends
- * atomic pin slots (one cache line per backend index in the hot path).
+ * Per-backend pin slot, padded to one CPU cache line to prevent false sharing
+ * between adjacent backend indices writing their own slots concurrently.
+ *
+ * PG_CACHE_LINE_SIZE is defined in pg_config_manual.h (typically 64).  We
+ * assert that the pad is non-negative so a misconfigured build fails visibly
+ * at compile time.
+ */
+#define ROW_CACHE_PIN_SLOT_SIZE		PG_CACHE_LINE_SIZE
+
+typedef union RowCachePinSlot
+{
+	pg_atomic_uint32 pinned;
+	char		pad[ROW_CACHE_PIN_SLOT_SIZE];
+} RowCachePinSlot;
+
+StaticAssertDecl(sizeof(RowCachePinSlot) == ROW_CACHE_PIN_SLOT_SIZE,
+				 "RowCachePinSlot must be exactly one cache line");
+StaticAssertDecl(sizeof(pg_atomic_uint32) <= ROW_CACHE_PIN_SLOT_SIZE,
+				 "pg_atomic_uint32 does not fit in one cache line");
+
+/*
+ * Hash entry allocation: RowCacheRelEntry header followed by MaxBackends
+ * cache-line-padded pin slots.  Each backend writes only slots[MyProcNumber],
+ * so different backends land on different cache lines, eliminating the
+ * false-sharing bottleneck of a plain pg_atomic_uint32 array.
  */
 static Size
 RowCacheRelEntryAllocSize(void)
 {
 	return add_size(MAXALIGN(sizeof(RowCacheRelEntry)),
-					mul_size((Size) MaxBackends, sizeof(pg_atomic_uint32)));
+					mul_size((Size) MaxBackends, sizeof(RowCachePinSlot)));
 }
 
-static inline pg_atomic_uint32 *
+static inline RowCachePinSlot *
 RowCacheRelPinSlots(const RowCacheRelEntry *entry)
 {
-	return (pg_atomic_uint32 *) ((char *) entry + MAXALIGN(sizeof(RowCacheRelEntry)));
+	return (RowCachePinSlot *) ((char *) entry + MAXALIGN(sizeof(RowCacheRelEntry)));
 }
 
 static void
 RowCacheInitEntryPins(RowCacheRelEntry *entry)
 {
-	pg_atomic_uint32 *slots = RowCacheRelPinSlots(entry);
+	RowCachePinSlot *slots = RowCacheRelPinSlots(entry);
 
 	for (int i = 0; i < MaxBackends; i++)
-		pg_atomic_init_u32(&slots[i], 0);
+		pg_atomic_init_u32(&slots[i].pinned, 0);
 }
 
 static void
 RowCacheWaitPinsDrained(RowCacheRelEntry *entry)
 {
-	pg_atomic_uint32 *slots = RowCacheRelPinSlots(entry);
+	RowCachePinSlot *slots = RowCacheRelPinSlots(entry);
 
 	for (int i = 0; i < MaxBackends; i++)
-		while (pg_atomic_read_u32(&slots[i]) != 0)
+		while (pg_atomic_read_u32(&slots[i].pinned) != 0)
 			pg_usleep(1);
 }
 
@@ -535,6 +574,16 @@ RelationRowCacheLoadRelation(Relation rel)
 	pg_write_barrier();
 	pg_atomic_write_u32(&entry->state, ROW_CACHE_STATE_LOADED);
 
+	/*
+	 * Invalidate this backend's last-used cache.  If we just reloaded the
+	 * same relation the stale pointer is still valid (entries never move),
+	 * but forcing a fresh lookup on the next read ensures LastCachedEntry
+	 * is always set via the slow path after a Load, which also re-populates
+	 * it correctly for callers that call Load then immediately Read.
+	 */
+	LastCachedEntry = NULL;
+	LastCachedRelid = InvalidOid;
+
 	LWLockRelease(&entry->rel_lock);
 }
 
@@ -604,6 +653,13 @@ RelationRowCacheDropRelation(Oid relid)
 			RowCacheDestroyBlocks(entry);
 	}
 
+	/*
+	 * Invalidate this backend's last-used cache so the next read goes
+	 * through the slow path and gets the correct (unloaded) state.
+	 */
+	LastCachedEntry = NULL;
+	LastCachedRelid = InvalidOid;
+
 	LWLockRelease(&entry->rel_lock);
 }
 
@@ -623,6 +679,15 @@ RelationRowCacheDropRelation(Oid relid)
  * re-checks entry->relid against a hypothetical future reuse scheme.
  * ---------------------------------------------------------------- */
 
+/*
+ * RowCacheLookupRelEntry -- locate the hash entry for a relation.
+ *
+ * Hot path: if this backend already looked up the same relid in a prior call
+ * the entry pointer is cached in LastCachedEntry, bypassing the partition lock
+ * entirely.  The cached pointer is valid for the lifetime of the postmaster
+ * (entries are never HASH_REMOVE'd), so no additional lifetime check is needed
+ * here; RowCachePinEntry() will validate state atomically before use.
+ */
 static RowCacheRelEntry *
 RowCacheLookupRelEntry(Oid relid)
 {
@@ -630,6 +695,11 @@ RowCacheLookupRelEntry(Oid relid)
 	uint32		hashcode;
 	LWLock	   *partlock;
 
+	/* Fast path: same relation as last lookup — skip partition lock. */
+	if (relid == LastCachedRelid && LastCachedEntry != NULL)
+		return LastCachedEntry;
+
+	/* Slow path: partition-locked hash lookup. */
 	hashcode = RowCacheRelHashCode(&relid);
 	partlock = RowCacheRelPartitionLock(hashcode);
 
@@ -637,6 +707,13 @@ RowCacheLookupRelEntry(Oid relid)
 	entry = hash_search_with_hash_value(RowCacheRelHash, &relid,
 										hashcode, HASH_FIND, NULL);
 	LWLockRelease(partlock);
+
+	/* Cache the result (even NULL, but only if OidIsValid to avoid confusion). */
+	if (entry != NULL)
+	{
+		LastCachedRelid = relid;
+		LastCachedEntry = entry;
+	}
 
 	return entry;
 }
@@ -653,7 +730,7 @@ RowCachePinEntry(RowCacheRelEntry *entry, Oid relid)
 	pg_atomic_uint32 *pinslot;
 
 	Assert(MyProcNumber >= 0 && MyProcNumber < MaxBackends);
-	pinslot = &RowCacheRelPinSlots(entry)[MyProcNumber];
+	pinslot = &RowCacheRelPinSlots(entry)[MyProcNumber].pinned;
 
 	pg_atomic_fetch_add_u32(pinslot, 1);
 
@@ -671,7 +748,7 @@ static inline void
 RowCachePinReleaseEntry(RowCacheRelEntry *entry)
 {
 	Assert(MyProcNumber >= 0 && MyProcNumber < MaxBackends);
-	pg_atomic_fetch_sub_u32(&RowCacheRelPinSlots(entry)[MyProcNumber], 1);
+	pg_atomic_fetch_sub_u32(&RowCacheRelPinSlots(entry)[MyProcNumber].pinned, 1);
 }
 
 bool
