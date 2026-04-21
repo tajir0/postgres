@@ -3,11 +3,13 @@
 #include "access/htup_details.h"
 #include "access/tableam.h"
 #include "executor/tuptable.h"
-#include "lib/dshash.h"
 #include "lib/relation_row_cache.h"
 #include "lib/tid_row_cache.h"
+#include "miscadmin.h"
 #include "port/atomics.h"
+#include "storage/bufmgr.h"
 #include "storage/lwlock.h"
+#include "storage/procnumber.h"
 #include "storage/shmem.h"
 #include "utils/dsa.h"
 #include "utils/hsearch.h"
@@ -45,11 +47,10 @@ typedef struct RowCacheShmemControl
  *
  *   - state: LOADED / UNLOADED.  Readers only read atomically.  Load and
  *     Drop write it while holding rel_lock(EXCLUSIVE).
- *   - pins:  active-reader counter.  Readers atomically bump it before
- *     touching tid_hash_handle / natts / dshash contents, and decrement
- *     it when done.  Drop / Load wait for pins to reach zero before
- *     tearing down the DSA-backed dshash — guarantees no reader is
- *     inside the dshash when dshash_destroy() runs.
+ *   - pin_slots[MaxBackends]: per-backend pin depth.  Each reader only
+ *     RMWs its own slot (MyProcNumber), avoiding cache-line bouncing on
+ *     a global counter under multi-process load.  Drop / Load spin until
+ *     every slot is zero before tearing down the DSA block array.
  *   - rel_lock: EXCLUSIVE-only, serializes Load ↔ Drop ↔ Load.  The read
  *     path never acquires it, eliminating cache-line bouncing on the
  *     hot path under high concurrency.
@@ -63,26 +64,23 @@ typedef struct RowCacheShmemControl
 typedef struct RowCacheRelEntry
 {
 	Oid			relid;			/* hash key */
-	dshash_table_handle tid_hash_handle;
+	dsa_pointer blocks_dp;		/* DSA: TidBlockEntry[nblocks], Invalid if none */
+	BlockNumber nblocks;		/* length of blocks_dp; 0 if empty relation */
 	LWLock		rel_lock;		/* serializes Load ↔ Drop; readers don't take it */
 	pg_atomic_uint32 state;		/* ROW_CACHE_STATE_{UNLOADED,LOADED} */
-	pg_atomic_uint32 pins;		/* # active readers */
 	int			natts;
+	/* Per-backend pin slots follow in allocated tail; see RowCacheRelPinSlots. */
 } RowCacheRelEntry;
 
+/*
+ * Per-heap-block cached tuple pointers.  Indexed by block number in the flat
+ * blocks array (RelationGetNumberOfBlocks snapshot at load time).
+ */
 typedef struct TidBlockEntry
 {
-	BlockNumber blockno;		/* hash key */
 	int			capacity;
 	dsa_pointer entries_dp;		/* → dsa_pointer[capacity] array */
 } TidBlockEntry;
-
-typedef struct LocalRelAttachEntry
-{
-	Oid			relid;			/* hash key */
-	dshash_table_handle attach_handle;	/* must match RowCacheRelEntry */
-	dshash_table *tid_hash;
-} LocalRelAttachEntry;
 
 /* ----------------------------------------------------------------
  * Global / backend-local state
@@ -91,7 +89,6 @@ typedef struct LocalRelAttachEntry
 static RowCacheShmemControl *RowCacheCtl = NULL;
 static HTAB *RowCacheRelHash = NULL;
 static dsa_area *LocalDsa = NULL;
-static HTAB *LocalAttachCache = NULL;
 
 /*
  * Backend-local pointer cache: relid → RowCacheRelEntry *
@@ -112,18 +109,13 @@ typedef struct LocalRelPtrEntry
 
 static HTAB *LocalRelPtrCache = NULL;
 
-/* ----------------------------------------------------------------
- * dshash parameters for the inner (BlockNumber → TidBlockEntry) hash
- * ---------------------------------------------------------------- */
-
-static const dshash_parameters tid_block_dsh_params = {
-	.key_size = sizeof(BlockNumber),
-	.entry_size = sizeof(TidBlockEntry),
-	.compare_function = dshash_memcmp,
-	.hash_function = dshash_memhash,
-	.copy_function = dshash_memcpy,
-	.tranche_id = LWTRANCHE_ROW_CACHE_HASH
-};
+/*
+ * Single-slot bypass for repeated lookups of the same relation (tight loops
+ * on one table).  Avoids LocalRelPtrLookup's hash_search when relid matches.
+ * Cleared in LocalRelPtrInvalidate() together with the HTAB entry.
+ */
+static Oid			LastRelPtrRelid = InvalidOid;
+static RowCacheRelEntry *LastRelPtrEntry = NULL;
 
 /* ----------------------------------------------------------------
  * Partition lock helpers for RowCacheRelHash
@@ -146,6 +138,42 @@ RowCacheRelPartitionLock(uint32 hashcode)
 	return &RowCacheCtl->rel_hash_locks[hashcode % ROW_CACHE_NUM_PARTITIONS];
 }
 
+/*
+ * Hash entry allocation includes RowCacheRelEntry header plus MaxBackends
+ * atomic pin slots (one cache line per backend index in the hot path).
+ */
+static Size
+RowCacheRelEntryAllocSize(void)
+{
+	return add_size(MAXALIGN(sizeof(RowCacheRelEntry)),
+					mul_size((Size) MaxBackends, sizeof(pg_atomic_uint32)));
+}
+
+static inline pg_atomic_uint32 *
+RowCacheRelPinSlots(const RowCacheRelEntry *entry)
+{
+	return (pg_atomic_uint32 *) ((char *) entry + MAXALIGN(sizeof(RowCacheRelEntry)));
+}
+
+static void
+RowCacheInitEntryPins(RowCacheRelEntry *entry)
+{
+	pg_atomic_uint32 *slots = RowCacheRelPinSlots(entry);
+
+	for (int i = 0; i < MaxBackends; i++)
+		pg_atomic_init_u32(&slots[i], 0);
+}
+
+static void
+RowCacheWaitPinsDrained(RowCacheRelEntry *entry)
+{
+	pg_atomic_uint32 *slots = RowCacheRelPinSlots(entry);
+
+	for (int i = 0; i < MaxBackends; i++)
+		while (pg_atomic_read_u32(&slots[i]) != 0)
+			pg_usleep(1);
+}
+
 /* ----------------------------------------------------------------
  * Shared-memory sizing and initialization
  * ---------------------------------------------------------------- */
@@ -157,7 +185,7 @@ RowCacheShmemSize(void)
 
 	size = add_size(size, MAXALIGN(sizeof(RowCacheShmemControl)));
 	size = add_size(size, hash_estimate_size(ROW_CACHE_MAX_RELATIONS,
-											 sizeof(RowCacheRelEntry)));
+											 RowCacheRelEntryAllocSize()));
 	return size;
 }
 
@@ -182,7 +210,7 @@ RowCacheShmemInit(void)
 	}
 
 	ctl.keysize = sizeof(Oid);
-	ctl.entrysize = sizeof(RowCacheRelEntry);
+	ctl.entrysize = RowCacheRelEntryAllocSize();
 	ctl.num_partitions = ROW_CACHE_NUM_PARTITIONS;
 
 	RowCacheRelHash = ShmemInitHash("Row Cache Relation Hash",
@@ -235,108 +263,6 @@ EnsureRowCacheDsa(void)
 }
 
 /* ----------------------------------------------------------------
- * Backend-local attach cache (avoids repeated dshash_attach)
- * ---------------------------------------------------------------- */
-
-static void
-EnsureLocalAttachCache(void)
-{
-	HASHCTL		ctl;
-
-	if (LocalAttachCache != NULL)
-		return;
-
-	ctl.keysize = sizeof(Oid);
-	ctl.entrysize = sizeof(LocalRelAttachEntry);
-	/*
-	 * Must allocate in TopMemoryContext: this table outlives any single
-	 * statement/portal.  Otherwise CurrentMemoryContext may be freed between
-	 * calls (e.g. pg_drop after a prior query), leaving LocalAttachCache
-	 * dangling and causing segfaults in LocalAttachInvalidate.
-	 */
-	ctl.hcxt = TopMemoryContext;
-	LocalAttachCache = hash_create("Row Cache Local Attach",
-								   32, &ctl,
-								   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-}
-
-static dshash_table *
-LocalAttachGetOrCreate(Oid relid, RowCacheRelEntry *entry)
-{
-	LocalRelAttachEntry *local;
-	bool		found;
-
-	EnsureLocalAttachCache();
-	EnsureRowCacheDsa();
-
-	local = hash_search(LocalAttachCache, &relid, HASH_ENTER, &found);
-
-	/*
-	 * Another backend may have destroyed/replaced the inner dshash while we
-	 * still hold a stale dshash_table *.  dshash_attach/find Assert on magic
-	 * if we use the old pointer — treat handle mismatch like a cache miss.
-	 *
-	 * For HASH_ENTER on a brand-new key, value fields are uninitialized; do
-	 * not call dshash_detach on garbage tid_hash.
-	 */
-	if (found)
-	{
-		if (local->tid_hash != NULL &&
-			(entry->tid_hash_handle != local->attach_handle ||
-			 entry->tid_hash_handle == DSHASH_HANDLE_INVALID))
-		{
-			dshash_detach(local->tid_hash);
-			local->tid_hash = NULL;
-			local->attach_handle = DSHASH_HANDLE_INVALID;
-		}
-	}
-	else
-	{
-		local->tid_hash = NULL;
-		local->attach_handle = DSHASH_HANDLE_INVALID;
-	}
-
-	if (local->tid_hash != NULL)
-		return local->tid_hash;
-
-	{
-		/*
-		 * dshash_attach() pallocs the backend-local dshash_table struct in
-		 * CurrentMemoryContext.  Since local->tid_hash is stored in
-		 * LocalAttachCache (TopMemoryContext), the struct must also live in
-		 * TopMemoryContext; otherwise the query's es_query_cxt will be freed
-		 * at statement end, leaving a dangling pointer that trips
-		 * Assert(magic == DSHASH_MAGIC) on the next access.
-		 */
-		MemoryContext old_ctx = MemoryContextSwitchTo(TopMemoryContext);
-
-		local->tid_hash = dshash_attach(LocalDsa, &tid_block_dsh_params,
-										entry->tid_hash_handle, NULL);
-		MemoryContextSwitchTo(old_ctx);
-	}
-	local->attach_handle = entry->tid_hash_handle;
-	return local->tid_hash;
-}
-
-static void
-LocalAttachInvalidate(Oid relid)
-{
-	LocalRelAttachEntry *local;
-
-	if (LocalAttachCache == NULL)
-		return;
-
-	local = hash_search(LocalAttachCache, &relid, HASH_FIND, NULL);
-	if (local != NULL && local->tid_hash != NULL)
-	{
-		dshash_detach(local->tid_hash);
-		local->tid_hash = NULL;
-		local->attach_handle = DSHASH_HANDLE_INVALID;
-	}
-	hash_search(LocalAttachCache, &relid, HASH_REMOVE, NULL);
-}
-
-/* ----------------------------------------------------------------
  * Backend-local rel-pointer cache helpers
  * ---------------------------------------------------------------- */
 
@@ -381,9 +307,15 @@ LocalRelPtrInsert(Oid relid, RowCacheRelEntry *entry)
 static void
 LocalRelPtrInvalidate(Oid relid)
 {
-	if (LocalRelPtrCache == NULL)
-		return;
-	hash_search(LocalRelPtrCache, &relid, HASH_REMOVE, NULL);
+	/* Clear single-slot even when LocalRelPtrCache is still NULL. */
+	if (LocalRelPtrCache != NULL)
+		hash_search(LocalRelPtrCache, &relid, HASH_REMOVE, NULL);
+
+	if (relid == LastRelPtrRelid)
+	{
+		LastRelPtrRelid = InvalidOid;
+		LastRelPtrEntry = NULL;
+	}
 }
 
 /* ----------------------------------------------------------------
@@ -401,22 +333,25 @@ TidRowBlockInitialCapacity(OffsetNumber off)
 }
 
 /* ----------------------------------------------------------------
- * Store one tuple into the inner dshash
+ * Store one tuple into the flat per-block arrays (Load only).
  * ---------------------------------------------------------------- */
 
 static void
-RowCacheStoreTupleShared(dshash_table *tid_hash, TupleTableSlot *slot)
+RowCacheStoreTupleShared(TidBlockEntry *blocks, BlockNumber nblocks,
+						 TupleTableSlot *slot)
 {
 	BlockNumber blockno = ItemPointerGetBlockNumberNoCheck(&slot->tts_tid);
 	OffsetNumber off = ItemPointerGetOffsetNumberNoCheck(&slot->tts_tid);
 	TidBlockEntry *block;
 	dsa_pointer *entries_arr;
 	dsa_pointer flat_dp;
-	bool		found;
 
-	block = dshash_find_or_insert(tid_hash, &blockno, &found);
+	if (blockno >= nblocks)
+		return;
 
-	if (!found)
+	block = &blocks[blockno];
+
+	if (block->capacity == 0)
 	{
 		int			cap = TidRowBlockInitialCapacity(off);
 
@@ -451,42 +386,48 @@ RowCacheStoreTupleShared(dshash_table *tid_hash, TupleTableSlot *slot)
 	if (DsaPointerIsValid(entries_arr[off]))
 		dsa_free(LocalDsa, entries_arr[off]);
 	entries_arr[off] = flat_dp;
-
-	dshash_release_lock(tid_hash, block);
 }
 
 /* ----------------------------------------------------------------
- * Destroy the inner dshash + all DSA allocations for a relation
+ * Destroy the flat block array + all DSA allocations for a relation
  * ---------------------------------------------------------------- */
 
 static void
-RowCacheDestroyTidHash(RowCacheRelEntry *entry)
+RowCacheDestroyBlocks(RowCacheRelEntry *entry)
 {
-	dshash_table *tid_hash;
-	TidBlockEntry *block;
-	dshash_seq_status seq;
+	TidBlockEntry *blocks;
+	BlockNumber blk;
 
 	EnsureRowCacheDsa();
 
-	tid_hash = dshash_attach(LocalDsa, &tid_block_dsh_params,
-							 entry->tid_hash_handle, NULL);
+	if (!DsaPointerIsValid(entry->blocks_dp))
+		return;
 
-	dshash_seq_init(&seq, tid_hash, true);
-	while ((block = dshash_seq_next(&seq)) != NULL)
+	blocks = (TidBlockEntry *) dsa_get_address(LocalDsa, entry->blocks_dp);
+
+	for (blk = 0; blk < entry->nblocks; blk++)
 	{
-		dsa_pointer *arr = (dsa_pointer *)
-			dsa_get_address(LocalDsa, block->entries_dp);
+		TidBlockEntry *block = &blocks[blk];
 
-		for (int i = 0; i < block->capacity; i++)
+		if (DsaPointerIsValid(block->entries_dp))
 		{
-			if (DsaPointerIsValid(arr[i]))
-				dsa_free(LocalDsa, arr[i]);
-		}
-		dsa_free(LocalDsa, block->entries_dp);
-	}
-	dshash_seq_term(&seq);
+			dsa_pointer *arr = (dsa_pointer *)
+				dsa_get_address(LocalDsa, block->entries_dp);
 
-	dshash_destroy(tid_hash);
+			for (int i = 0; i < block->capacity; i++)
+			{
+				if (DsaPointerIsValid(arr[i]))
+					dsa_free(LocalDsa, arr[i]);
+			}
+			dsa_free(LocalDsa, block->entries_dp);
+			block->entries_dp = InvalidDsaPointer;
+			block->capacity = 0;
+		}
+	}
+
+	dsa_free(LocalDsa, entry->blocks_dp);
+	entry->blocks_dp = InvalidDsaPointer;
+	entry->nblocks = 0;
 }
 
 /* ----------------------------------------------------------------
@@ -522,47 +463,36 @@ RowCacheTupleVisibleMVCC(HeapTuple tuple, Snapshot snapshot)
 
 /* ----------------------------------------------------------------
  * Internal lookup: find FlatCachedTuple by (relid, tid)
- * Caller must hold rel_lock LW_SHARED.
  * ---------------------------------------------------------------- */
 
 static FlatCachedTuple *
 RowCacheLookupFlat(RowCacheRelEntry *entry, ItemPointer tid)
 {
-	dshash_table *tid_hash;
+	TidBlockEntry *blocks;
 	TidBlockEntry *block;
 	dsa_pointer *entries_arr;
 	BlockNumber blockno;
 	OffsetNumber off;
 
-	tid_hash = LocalAttachGetOrCreate(entry->relid, entry);
+	EnsureRowCacheDsa();
 
 	blockno = ItemPointerGetBlockNumberNoCheck(tid);
 	off = ItemPointerGetOffsetNumberNoCheck(tid);
 
-	block = dshash_find(tid_hash, &blockno, false);
-	if (block == NULL)
+	if (!DsaPointerIsValid(entry->blocks_dp) || blockno >= entry->nblocks)
 		return NULL;
 
-	if ((int) off >= block->capacity)
-	{
-		dshash_release_lock(tid_hash, block);
+	blocks = (TidBlockEntry *) dsa_get_address(LocalDsa, entry->blocks_dp);
+	block = &blocks[blockno];
+
+	if ((int) off >= block->capacity || !DsaPointerIsValid(block->entries_dp))
 		return NULL;
-	}
 
 	entries_arr = (dsa_pointer *) dsa_get_address(LocalDsa, block->entries_dp);
 	if (!DsaPointerIsValid(entries_arr[off]))
-	{
-		dshash_release_lock(tid_hash, block);
 		return NULL;
-	}
 
-	{
-		FlatCachedTuple *flat = (FlatCachedTuple *)
-			dsa_get_address(LocalDsa, entries_arr[off]);
-
-		dshash_release_lock(tid_hash, block);
-		return flat;
-	}
+	return (FlatCachedTuple *) dsa_get_address(LocalDsa, entries_arr[off]);
 }
 
 /* ----------------------------------------------------------------
@@ -572,10 +502,10 @@ RowCacheLookupFlat(RowCacheRelEntry *entry, ItemPointer tid)
  *
  * Concurrency: state=UNLOADED is written first (via pg_atomic_write_u32)
  * so any reader that samples state afterwards bails out.  We then spin
- * until the pin count drains to zero, which guarantees no reader is
- * inside the old dshash when dshash_destroy() runs.  Once rebuilding
- * finishes, a write barrier is issued before state=LOADED to publish
- * tid_hash_handle and natts to readers that see the new state.
+ * until every per-backend pin slot is zero, which guarantees no reader is
+ * inside the old block array when it is freed.  Once rebuilding finishes,
+ * a write barrier is issued before state=LOADED to publish blocks_dp,
+ * nblocks, and natts to readers that see the new state.
  * ---------------------------------------------------------------- */
 
 void
@@ -583,10 +513,12 @@ RelationRowCacheLoadRelation(Relation rel)
 {
 	Oid			relid = RelationGetRelid(rel);
 	RowCacheRelEntry *entry;
-	dshash_table *tid_hash;
 	bool		found;
 	uint32		hashcode;
 	LWLock	   *partlock;
+	BlockNumber nblocks;
+	TidBlockEntry *blocks;
+	dsa_pointer blocks_dp;
 
 	if (RowCacheRelHash == NULL)
 		elog(ERROR, "row cache shared memory not initialized");
@@ -604,8 +536,9 @@ RelationRowCacheLoadRelation(Relation rel)
 	{
 		LWLockInitialize(&entry->rel_lock, LWTRANCHE_ROW_CACHE_REL);
 		pg_atomic_init_u32(&entry->state, ROW_CACHE_STATE_UNLOADED);
-		pg_atomic_init_u32(&entry->pins, 0);
-		entry->tid_hash_handle = DSHASH_HANDLE_INVALID;
+		RowCacheInitEntryPins(entry);
+		entry->blocks_dp = InvalidDsaPointer;
+		entry->nblocks = 0;
 		entry->natts = 0;
 	}
 
@@ -614,29 +547,43 @@ RelationRowCacheLoadRelation(Relation rel)
 	LWLockAcquire(&entry->rel_lock, LW_EXCLUSIVE);
 	LWLockRelease(partlock);
 
-	/* Drop stale backend-local dshash pointers before destroying shared hash. */
-	LocalAttachInvalidate(relid);
-
 	/*
 	 * If a previous load exists, tear it down safely:
 	 *   1. Flip state=UNLOADED so new readers bail out.
-	 *   2. Wait for in-flight readers (pins > 0) to drain.
-	 *   3. Destroy the old dshash — no reader can be inside it anymore.
+	 *   2. Wait for in-flight readers (all per-backend pin slots zero).
+	 *   3. Destroy the old flat block array — no reader can use it anymore.
 	 */
 	if (pg_atomic_read_u32(&entry->state) == ROW_CACHE_STATE_LOADED)
 	{
 		pg_atomic_write_u32(&entry->state, ROW_CACHE_STATE_UNLOADED);
 		pg_memory_barrier();
 
-		while (pg_atomic_read_u32(&entry->pins) > 0)
-			pg_usleep(1);
+		RowCacheWaitPinsDrained(entry);
 
-		if (entry->tid_hash_handle != DSHASH_HANDLE_INVALID)
-			RowCacheDestroyTidHash(entry);
+		if (DsaPointerIsValid(entry->blocks_dp))
+			RowCacheDestroyBlocks(entry);
 	}
 
-	tid_hash = dshash_create(LocalDsa, &tid_block_dsh_params, NULL);
-	entry->tid_hash_handle = dshash_get_hash_table_handle(tid_hash);
+	nblocks = RelationGetNumberOfBlocks(rel);
+
+	if (nblocks > 0)
+	{
+		Size		bytes = mul_size(sizeof(TidBlockEntry), (Size) nblocks);
+
+		blocks_dp = dsa_allocate0(LocalDsa, bytes);
+		if (!DsaPointerIsValid(blocks_dp))
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("out of memory"),
+					 errdetail_internal("row cache: cannot allocate TidBlockEntry array.")));
+		blocks = (TidBlockEntry *) dsa_get_address(LocalDsa, blocks_dp);
+	}
+	else
+	{
+		blocks_dp = InvalidDsaPointer;
+		blocks = NULL;
+	}
+
 	entry->natts = RelationGetDescr(rel)->natts;
 
 	{
@@ -654,7 +601,7 @@ RelationRowCacheLoadRelation(Relation rel)
 		slot = table_slot_create(rel, NULL);
 
 		while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
-			RowCacheStoreTupleShared(tid_hash, slot);
+			RowCacheStoreTupleShared(blocks, nblocks, slot);
 
 		table_endscan(scan);
 		ExecDropSingleTupleTableSlot(slot);
@@ -664,16 +611,15 @@ RelationRowCacheLoadRelation(Relation rel)
 	}
 
 	/*
-	 * Publish: write barrier ensures tid_hash_handle / natts are visible
+	 * Publish: write barrier ensures blocks_dp / nblocks / natts are visible
 	 * to any reader that observes state=LOADED.
 	 */
+	entry->blocks_dp = blocks_dp;
+	entry->nblocks = nblocks;
 	pg_write_barrier();
 	pg_atomic_write_u32(&entry->state, ROW_CACHE_STATE_LOADED);
 
-	dshash_detach(tid_hash);
 	LWLockRelease(&entry->rel_lock);
-
-	LocalAttachInvalidate(relid);
 }
 
 /* ----------------------------------------------------------------
@@ -689,10 +635,11 @@ RelationRowCacheLoadRelation(Relation rel)
  * Concurrency with readers:
  *   1. Acquire rel_lock EXCLUSIVE (serialises with Load / other Drop).
  *   2. Flip state to UNLOADED — readers that sample state afterwards
- *      bail out before touching dshash.
- *   3. Spin until pins drain to zero — no reader is inside dshash.
- *   4. Destroy the dshash; future readers will see state=UNLOADED and
- *      never observe the freed handle.
+ *      bail out before touching the block array.
+ *   3. Spin until every per-backend pin slot is zero — no reader is inside
+ *      the cached data.
+ *   4. Destroy the block array; future readers will see state=UNLOADED and
+ *      never observe the freed DSA data.
  * ---------------------------------------------------------------- */
 
 void
@@ -725,8 +672,6 @@ RelationRowCacheDropRelation(Oid relid)
 	LWLockAcquire(&entry->rel_lock, LW_EXCLUSIVE);
 	LWLockRelease(partlock);
 
-	LocalAttachInvalidate(relid);
-
 	/*
 	 * Double-check state under rel_lock: another Drop may have raced with
 	 * us and already torn the cache down.
@@ -738,14 +683,10 @@ RelationRowCacheDropRelation(Oid relid)
 		pg_memory_barrier();
 
 		/* Wait for readers that pinned before our state flip to finish. */
-		while (pg_atomic_read_u32(&entry->pins) > 0)
-			pg_usleep(1);
+		RowCacheWaitPinsDrained(entry);
 
-		if (entry->tid_hash_handle != DSHASH_HANDLE_INVALID)
-		{
-			RowCacheDestroyTidHash(entry);
-			entry->tid_hash_handle = DSHASH_HANDLE_INVALID;
-		}
+		if (DsaPointerIsValid(entry->blocks_dp))
+			RowCacheDestroyBlocks(entry);
 	}
 
 	LWLockRelease(&entry->rel_lock);
@@ -759,16 +700,20 @@ RelationRowCacheDropRelation(Oid relid)
  * Read-path concurrency (no rel_lock!):
  *   1. Locate the entry (via LocalRelPtrCache hot path or partition_lock
  *      cold path).
- *   2. Atomically bump entry->pins to pin the entry.
- *   3. Memory barrier, then read state.  If not LOADED, unpin and bail.
- *   4. Access dshash / flat tuple.  Drop cannot destroy the dshash
- *      because our pin is held and Drop waits for pins == 0.
- *   5. Unpin.
+ *   2. Bump this backend's pin slot (MyProcNumber) to pin the entry.
+ *   3. Read state.  If not LOADED, unpin and bail.  (fetch_add on the slot
+ *      is a full barrier, so the state read is ordered after the pin.)
+ *   4. Access the flat block array / flat tuple.  Drop cannot free blocks
+ *      while any pin slot is non-zero.
+ *   5. Unpin (decrement this backend's slot).
  *
  * Since the entry slot is never recycled, pointers cached in
- * LocalRelPtrCache are stable: we only need to re-check entry->relid
- * to protect against the (currently impossible) future case where an
- * entry might be reused for a different relation.
+ * LocalRelPtrCache (and the single-slot below) are stable: we only need
+ * to re-check entry->relid to protect against the (currently impossible)
+ * future case where an entry might be reused for a different relation.
+ *
+ * Hot path order: single-slot compare → LocalRelPtrLookup hash →
+ * partition_lock + shared hash find.
  * ---------------------------------------------------------------- */
 
 static RowCacheRelEntry *
@@ -778,8 +723,16 @@ RowCacheLookupRelEntry(Oid relid)
 	uint32		hashcode;
 	LWLock	   *partlock;
 
-	/* Hot path: backend-local pointer cache → no shared locks at all. */
-	entry = LocalRelPtrLookup(relid);
+	/* Fastest: last relation in this backend (no hash_search). */
+	if (relid == LastRelPtrRelid && LastRelPtrEntry != NULL)
+		entry = LastRelPtrEntry;
+	else
+	{
+		entry = LocalRelPtrLookup(relid);
+		LastRelPtrRelid = relid;
+		LastRelPtrEntry = entry;
+	}
+
 	if (entry != NULL)
 		return entry;
 
@@ -793,7 +746,11 @@ RowCacheLookupRelEntry(Oid relid)
 	LWLockRelease(partlock);
 
 	if (entry != NULL)
+	{
 		LocalRelPtrInsert(relid, entry);
+		LastRelPtrRelid = relid;
+		LastRelPtrEntry = entry;
+	}
 
 	return entry;
 }
@@ -802,31 +759,33 @@ RowCacheLookupRelEntry(Oid relid)
  * Pin an entry for the read path.  On success (returns true) the caller
  * must pair this with a RowCachePinReleaseEntry() before returning.
  * On failure the entry is not pinned and the caller must not access its
- * dshash / handle / natts fields.
+ * blocks_dp / nblocks / natts fields.
  */
 static inline bool
 RowCachePinEntry(RowCacheRelEntry *entry, Oid relid)
 {
-	pg_atomic_fetch_add_u32(&entry->pins, 1);
-	/* pin must be visible before we read state */
-	pg_memory_barrier();
+	pg_atomic_uint32 *pinslot;
+
+	Assert(MyProcNumber >= 0 && MyProcNumber < MaxBackends);
+	pinslot = &RowCacheRelPinSlots(entry)[MyProcNumber];
+
+	pg_atomic_fetch_add_u32(pinslot, 1);
 
 	if (entry->relid != relid ||
 		pg_atomic_read_u32(&entry->state) != ROW_CACHE_STATE_LOADED)
 	{
-		pg_atomic_fetch_sub_u32(&entry->pins, 1);
+		pg_atomic_fetch_sub_u32(pinslot, 1);
 		return false;
 	}
 
-	/* Ensure tid_hash_handle / natts reads are ordered after state. */
-	pg_read_barrier();
 	return true;
 }
 
 static inline void
 RowCachePinReleaseEntry(RowCacheRelEntry *entry)
 {
-	pg_atomic_fetch_sub_u32(&entry->pins, 1);
+	Assert(MyProcNumber >= 0 && MyProcNumber < MaxBackends);
+	pg_atomic_fetch_sub_u32(&RowCacheRelPinSlots(entry)[MyProcNumber], 1);
 }
 
 bool
