@@ -149,13 +149,18 @@ RowCacheUnflattenToSlot(const FlatCachedTuple *flat,
 	tmp.t_tableOid = relid;
 	ItemPointerCopy(tid, &tmp.t_self);
 
-	copy = heap_copytuple(&tmp);	/* palloc'd; owned by caller's mcxt */
+	copy = heap_copytuple(&tmp);	/* palloc'd; independent of DSA block */
 
 	/*
-	 * ExecStoreHeapTuple with shouldFree=true: the slot takes ownership and
-	 * will pfree copy when the slot is cleared or replaced.
+	 * ExecForceStoreHeapTupleNoCopy with shouldFree=true: works with any slot
+	 * ops type (including TTSOpsBufferHeapTuple used by index scans), stores
+	 * the pointer without an extra copy, and lets the slot pfree it on clear.
+	 *
+	 * Unlike the previous code that passed a stack-local HeapTupleData, here
+	 * we pass a palloc'd copy so the pointer remains valid after this function
+	 * returns, regardless of when the executor actually consumes the slot.
 	 */
-	ExecStoreHeapTuple(copy, slot, true);
+	ExecForceStoreHeapTupleNoCopy(copy, slot, true);
 
 	return true;
 }
