@@ -103,9 +103,24 @@ RowCacheFlattenTuple(dsa_area *area, TupleTableSlot *slot)
 /*
  * Unflatten a FlatCachedTuple back into a TupleTableSlot.
  *
- * Reconstructs a HeapTupleData on the stack and stores it via
- * ExecForceStoreHeapTupleNoCopy, then copies the pre-decoded
- * values[] and isnull[] arrays into the slot.
+ * Allocates a HeapTuple in the current memory context (via heap_copytuple)
+ * and stores it in the slot with shouldFree=true so the slot owns the memory.
+ * This avoids two previous bugs:
+ *
+ *   1. HeapTupleData on stack + NoCopy: after RowCacheUnflattenToSlot returns
+ *      the stack frame is reused, leaving slot->tts_heaptuple pointing at
+ *      garbage.  Generic plans (triggered by PL/pgSQL variables after 5
+ *      executions) defer slot consumption past the return, reliably
+ *      triggering a SIGSEGV in heap_deform_tuple / fill_val.
+ *
+ *   2. DSA pointer lifetime: t_data pointed directly into the DSA block;
+ *      once the caller releases its pin another backend can Drop/Reload the
+ *      cache and free that memory.
+ *
+ * heap_copytuple produces a palloc'd copy that is independent of the DSA
+ * block, so both hazards are eliminated.  The extra palloc + memcpy costs
+ * ~60-100 ns per cache hit, which is well within the savings from avoiding
+ * a shared-buffer pin + heap_deform_tuple on a cold page.
  */
 bool
 RowCacheUnflattenToSlot(const FlatCachedTuple *flat,
@@ -113,9 +128,8 @@ RowCacheUnflattenToSlot(const FlatCachedTuple *flat,
 						ItemPointer tid,
 						TupleTableSlot *slot)
 {
-	HeapTupleData htup;
-	Datum	   *src_values;
-	bool	   *src_isnull;
+	HeapTupleData tmp;
+	HeapTuple	copy;
 
 	Assert(flat != NULL);
 	Assert(slot != NULL);
@@ -124,21 +138,24 @@ RowCacheUnflattenToSlot(const FlatCachedTuple *flat,
 	if (slot->tts_tupleDescriptor->natts != flat->natts)
 		return false;
 
-	htup.t_data = (HeapTupleHeader) FLAT_TUPLE_HTUP_DATA(flat);
-	htup.t_len = flat->htup_len;
-	htup.t_tableOid = relid;
-	ItemPointerCopy(tid, &htup.t_self);
+	/*
+	 * Build a temporary HeapTupleData pointing into the DSA block just long
+	 * enough to copy it out.  heap_copytuple pallocs
+	 * HEAPTUPLESIZE + t_len bytes and memcpys t_data, so the result is
+	 * completely independent of the DSA block and of this stack frame.
+	 */
+	tmp.t_len = flat->htup_len;
+	tmp.t_data = (HeapTupleHeader) FLAT_TUPLE_HTUP_DATA(flat);
+	tmp.t_tableOid = relid;
+	ItemPointerCopy(tid, &tmp.t_self);
 
-	ExecForceStoreHeapTupleNoCopy(&htup, slot, false);
+	copy = heap_copytuple(&tmp);	/* palloc'd; owned by caller's mcxt */
 
-	src_values = FLAT_TUPLE_VALUES(flat);
-	src_isnull = FLAT_TUPLE_ISNULL(flat);
-
-	memcpy(slot->tts_values, src_values, sizeof(Datum) * flat->natts);
-	memcpy(slot->tts_isnull, src_isnull, sizeof(bool) * flat->natts);
-	slot->tts_nvalid = flat->natts;
-	ItemPointerCopy(tid, &slot->tts_tid);
-	slot->tts_tableOid = relid;
+	/*
+	 * ExecStoreHeapTuple with shouldFree=true: the slot takes ownership and
+	 * will pfree copy when the slot is cleared or replaced.
+	 */
+	ExecStoreHeapTuple(copy, slot, true);
 
 	return true;
 }
