@@ -43,17 +43,22 @@ typedef struct RowCacheShmemControl
 /*
  * RowCacheRelEntry: per-relation slot in the shared hash table.
  *
- * Concurrency protocol (atomic state + pin count, lock-free read path):
+ * Concurrency protocol (atomic state, lock-free read path):
  *
  *   - state: LOADED / UNLOADED.  Readers only read atomically.  Load and
  *     Drop write it while holding rel_lock(EXCLUSIVE).
- *   - pin_slots[MaxBackends]: per-backend pin depth.  Each reader only
- *     RMWs its own slot (MyProcNumber), avoiding cache-line bouncing on
- *     a global counter under multi-process load.  Drop / Load spin until
- *     every slot is zero before tearing down the DSA block array.
  *   - rel_lock: EXCLUSIVE-only, serializes Load ↔ Drop ↔ Load.  The read
  *     path never acquires it, eliminating cache-line bouncing on the
  *     hot path under high concurrency.
+ *
+ * IMPORTANT LIFETIME CONTRACT:
+ *   The caller MUST guarantee that no concurrent readers exist while
+ *   Load or Drop runs.  This matches the intended use case (read-only
+ *   tables such as TPC-C ITEM: load once before the workload, drop only
+ *   after every worker has finished).  Enforcing this at the application
+ *   level lets us omit the per-backend pin/unpin RCU-style protocol on
+ *   the hot read path — which materially improved multi-process
+ *   throughput.
  *
  * Once an entry is inserted into RowCacheRelHash its memory address
  * (and the embedded rel_lock) is stable for the lifetime of the
@@ -68,7 +73,6 @@ typedef struct RowCacheRelEntry
 	LWLock		rel_lock;		/* serializes Load ↔ Drop; readers don't take it */
 	pg_atomic_uint32 state;		/* ROW_CACHE_STATE_{UNLOADED,LOADED} */
 	int			natts;
-	/* Per-backend pin slots follow in allocated tail; see RowCacheRelPinSlots. */
 } RowCacheRelEntry;
 
 /*
@@ -99,8 +103,9 @@ static dsa_area *LocalDsa = NULL;
  *
  * Safety: RowCacheRelHash entries are never HASH_REMOVE'd, so the pointer
  * remains valid for the lifetime of the postmaster even after a Drop.
- * RowCachePinEntry() re-checks state atomically, so a stale cached pointer
- * after a Drop + Load still yields a safe "not loaded" outcome.
+ * The read path re-checks entry->relid and entry->state atomically, so a
+ * stale cached pointer after a Drop + Load still yields a safe "not loaded"
+ * outcome.
  */
 static Oid				LastCachedRelid = InvalidOid;
 static RowCacheRelEntry *LastCachedEntry = NULL;
@@ -126,63 +131,10 @@ RowCacheRelPartitionLock(uint32 hashcode)
 	return &RowCacheCtl->rel_hash_locks[hashcode % ROW_CACHE_NUM_PARTITIONS];
 }
 
-/*
- * Per-backend pin slot, padded to one CPU cache line to prevent false sharing
- * between adjacent backend indices writing their own slots concurrently.
- *
- * PG_CACHE_LINE_SIZE is defined in pg_config_manual.h (typically 64).  We
- * assert that the pad is non-negative so a misconfigured build fails visibly
- * at compile time.
- */
-#define ROW_CACHE_PIN_SLOT_SIZE		PG_CACHE_LINE_SIZE
-
-typedef union RowCachePinSlot
-{
-	pg_atomic_uint32 pinned;
-	char		pad[ROW_CACHE_PIN_SLOT_SIZE];
-} RowCachePinSlot;
-
-StaticAssertDecl(sizeof(RowCachePinSlot) == ROW_CACHE_PIN_SLOT_SIZE,
-				 "RowCachePinSlot must be exactly one cache line");
-StaticAssertDecl(sizeof(pg_atomic_uint32) <= ROW_CACHE_PIN_SLOT_SIZE,
-				 "pg_atomic_uint32 does not fit in one cache line");
-
-/*
- * Hash entry allocation: RowCacheRelEntry header followed by MaxBackends
- * cache-line-padded pin slots.  Each backend writes only slots[MyProcNumber],
- * so different backends land on different cache lines, eliminating the
- * false-sharing bottleneck of a plain pg_atomic_uint32 array.
- */
 static Size
 RowCacheRelEntryAllocSize(void)
 {
-	return add_size(MAXALIGN(sizeof(RowCacheRelEntry)),
-					mul_size((Size) MaxBackends, sizeof(RowCachePinSlot)));
-}
-
-static inline RowCachePinSlot *
-RowCacheRelPinSlots(const RowCacheRelEntry *entry)
-{
-	return (RowCachePinSlot *) ((char *) entry + MAXALIGN(sizeof(RowCacheRelEntry)));
-}
-
-static void
-RowCacheInitEntryPins(RowCacheRelEntry *entry)
-{
-	RowCachePinSlot *slots = RowCacheRelPinSlots(entry);
-
-	for (int i = 0; i < MaxBackends; i++)
-		pg_atomic_init_u32(&slots[i].pinned, 0);
-}
-
-static void
-RowCacheWaitPinsDrained(RowCacheRelEntry *entry)
-{
-	RowCachePinSlot *slots = RowCacheRelPinSlots(entry);
-
-	for (int i = 0; i < MaxBackends; i++)
-		while (pg_atomic_read_u32(&slots[i].pinned) != 0)
-			pg_usleep(1);
+	return MAXALIGN(sizeof(RowCacheRelEntry));
 }
 
 /* ----------------------------------------------------------------
@@ -456,11 +408,12 @@ RowCacheLookupFlat(RowCacheRelEntry *entry, ItemPointer tid)
  * Lock order: partition_lock → rel_lock (never reverse).
  *
  * Concurrency: state=UNLOADED is written first (via pg_atomic_write_u32)
- * so any reader that samples state afterwards bails out.  We then spin
- * until every per-backend pin slot is zero, which guarantees no reader is
- * inside the old block array when it is freed.  Once rebuilding finishes,
- * a write barrier is issued before state=LOADED to publish blocks_dp,
- * nblocks, and natts to readers that see the new state.
+ * so any reader that samples state afterwards bails out.  Once rebuilding
+ * finishes, a write barrier is issued before state=LOADED to publish
+ * blocks_dp, nblocks, and natts to readers that see the new state.
+ *
+ * Caller contract: no readers may be executing concurrently with Load.
+ * (See RowCacheRelEntry for the full lifetime contract.)
  * ---------------------------------------------------------------- */
 
 void
@@ -491,29 +444,31 @@ RelationRowCacheLoadRelation(Relation rel)
 	{
 		LWLockInitialize(&entry->rel_lock, LWTRANCHE_ROW_CACHE_REL);
 		pg_atomic_init_u32(&entry->state, ROW_CACHE_STATE_UNLOADED);
-		RowCacheInitEntryPins(entry);
 		entry->blocks_dp = InvalidDsaPointer;
 		entry->nblocks = 0;
 		entry->natts = 0;
 	}
 
 	/* Acquire rel_lock while still holding partition lock to prevent a
-	 * concurrent Drop from sneaking in before we pin the entry. */
+	 * concurrent Drop from sneaking in between the hash lookup and our
+	 * serialisation lock. */
 	LWLockAcquire(&entry->rel_lock, LW_EXCLUSIVE);
 	LWLockRelease(partlock);
 
 	/*
-	 * If a previous load exists, tear it down safely:
-	 *   1. Flip state=UNLOADED so new readers bail out.
-	 *   2. Wait for in-flight readers (all per-backend pin slots zero).
-	 *   3. Destroy the old flat block array — no reader can use it anymore.
+	 * If a previous load exists, tear it down.  The caller contract
+	 * guarantees no readers are inside the old block array, so we do not
+	 * need to drain pin counts.
+	 *
+	 *   1. Flip state=UNLOADED so any late reader bails out on the
+	 *      atomic state check.
+	 *   2. Publish the state change with a memory barrier before freeing.
+	 *   3. Destroy the old flat block array.
 	 */
 	if (pg_atomic_read_u32(&entry->state) == ROW_CACHE_STATE_LOADED)
 	{
 		pg_atomic_write_u32(&entry->state, ROW_CACHE_STATE_UNLOADED);
 		pg_memory_barrier();
-
-		RowCacheWaitPinsDrained(entry);
 
 		if (DsaPointerIsValid(entry->blocks_dp))
 			RowCacheDestroyBlocks(entry);
@@ -596,14 +551,15 @@ RelationRowCacheLoadRelation(Relation rel)
  * (and its embedded rel_lock) stays alive for the lifetime of the
  * postmaster.  Read paths take partition_lock(SHARED) on each lookup.
  *
- * Concurrency with readers:
+ * Caller contract: no readers may be executing concurrently with Drop.
+ * (See RowCacheRelEntry for the full lifetime contract.)
+ *
+ * Concurrency:
  *   1. Acquire rel_lock EXCLUSIVE (serialises with Load / other Drop).
- *   2. Flip state to UNLOADED — readers that sample state afterwards
- *      bail out before touching the block array.
- *   3. Spin until every per-backend pin slot is zero — no reader is inside
- *      the cached data.
- *   4. Destroy the block array; future readers will see state=UNLOADED and
- *      never observe the freed DSA data.
+ *   2. Flip state to UNLOADED — any late reader that samples state
+ *      afterwards bails out before touching the block array.
+ *   3. Publish the state change with a memory barrier before freeing.
+ *   4. Destroy the block array.
  * ---------------------------------------------------------------- */
 
 void
@@ -642,12 +598,9 @@ RelationRowCacheDropRelation(Oid relid)
 	 */
 	if (pg_atomic_read_u32(&entry->state) == ROW_CACHE_STATE_LOADED)
 	{
-		/* Publish UNLOADED before inspecting pins. */
+		/* Publish UNLOADED before freeing. */
 		pg_atomic_write_u32(&entry->state, ROW_CACHE_STATE_UNLOADED);
 		pg_memory_barrier();
-
-		/* Wait for readers that pinned before our state flip to finish. */
-		RowCacheWaitPinsDrained(entry);
 
 		if (DsaPointerIsValid(entry->blocks_dp))
 			RowCacheDestroyBlocks(entry);
@@ -666,17 +619,16 @@ RelationRowCacheDropRelation(Oid relid)
 /* ----------------------------------------------------------------
  * Public API: FillSlot (simple cache lookup + slot fill)
  *
- * Read-path concurrency (no rel_lock!):
- *   1. Locate the entry under partition_lock(SHARED) + HASH_FIND.
- *   2. Bump this backend's pin slot (MyProcNumber) to pin the entry.
- *   3. Read state.  If not LOADED, unpin and bail.  (fetch_add on the slot
- *      is a full barrier, so the state read is ordered after the pin.)
- *   4. Access the flat block array / flat tuple.  Drop cannot free blocks
- *      while any pin slot is non-zero.
- *   5. Unpin (decrement this backend's slot).
+ * Read-path concurrency (no rel_lock, no pin!):
+ *   1. Locate the entry (backend-local fast path, or partition_lock(SHARED)
+ *      + HASH_FIND on miss).
+ *   2. Verify entry->relid matches and state == LOADED.  Both checks are
+ *      atomic scalar reads — no RMWs, no locks.
+ *   3. Access the flat block array / flat tuple.
  *
- * Hash slots are never recycled for a given relid; RowCachePinEntry still
- * re-checks entry->relid against a hypothetical future reuse scheme.
+ * Safety relies on the caller contract (see RowCacheRelEntry): Load and
+ * Drop never run concurrently with readers, so the block array cannot be
+ * freed under our feet.
  * ---------------------------------------------------------------- */
 
 /*
@@ -686,7 +638,7 @@ RelationRowCacheDropRelation(Oid relid)
  * the entry pointer is cached in LastCachedEntry, bypassing the partition lock
  * entirely.  The cached pointer is valid for the lifetime of the postmaster
  * (entries are never HASH_REMOVE'd), so no additional lifetime check is needed
- * here; RowCachePinEntry() will validate state atomically before use.
+ * here; callers validate entry->relid and entry->state atomically before use.
  */
 static RowCacheRelEntry *
 RowCacheLookupRelEntry(Oid relid)
@@ -719,36 +671,15 @@ RowCacheLookupRelEntry(Oid relid)
 }
 
 /*
- * Pin an entry for the read path.  On success (returns true) the caller
- * must pair this with a RowCachePinReleaseEntry() before returning.
- * On failure the entry is not pinned and the caller must not access its
- * blocks_dp / nblocks / natts fields.
+ * Validate a looked-up entry for the read path.  Returns true if the
+ * entry is loaded for the requested relid.  Both checks are plain
+ * atomic/scalar reads — no RMWs, no locks.
  */
 static inline bool
-RowCachePinEntry(RowCacheRelEntry *entry, Oid relid)
+RowCacheEntryIsLoadedFor(RowCacheRelEntry *entry, Oid relid)
 {
-	pg_atomic_uint32 *pinslot;
-
-	Assert(MyProcNumber >= 0 && MyProcNumber < MaxBackends);
-	pinslot = &RowCacheRelPinSlots(entry)[MyProcNumber].pinned;
-
-	pg_atomic_fetch_add_u32(pinslot, 1);
-
-	if (entry->relid != relid ||
-		pg_atomic_read_u32(&entry->state) != ROW_CACHE_STATE_LOADED)
-	{
-		pg_atomic_fetch_sub_u32(pinslot, 1);
-		return false;
-	}
-
-	return true;
-}
-
-static inline void
-RowCachePinReleaseEntry(RowCacheRelEntry *entry)
-{
-	Assert(MyProcNumber >= 0 && MyProcNumber < MaxBackends);
-	pg_atomic_fetch_sub_u32(&RowCacheRelPinSlots(entry)[MyProcNumber].pinned, 1);
+	return entry->relid == relid &&
+		pg_atomic_read_u32(&entry->state) == ROW_CACHE_STATE_LOADED;
 }
 
 bool
@@ -756,7 +687,6 @@ RelationRowCacheFillSlot(TupleTableSlot *slot)
 {
 	RowCacheRelEntry *entry;
 	FlatCachedTuple *flat;
-	bool		ok;
 	Oid			relid;
 
 	Assert(slot != NULL);
@@ -768,23 +698,15 @@ RelationRowCacheFillSlot(TupleTableSlot *slot)
 	relid = slot->tts_tableOid;
 
 	entry = RowCacheLookupRelEntry(relid);
-	if (entry == NULL)
-		return false;
-
-	if (!RowCachePinEntry(entry, relid))
+	if (entry == NULL || !RowCacheEntryIsLoadedFor(entry, relid))
 		return false;
 
 	flat = RowCacheLookupFlat(entry, &slot->tts_tid);
 	if (flat == NULL)
-	{
-		RowCachePinReleaseEntry(entry);
 		return false;
-	}
 
-	ok = RowCacheUnflattenToSlot(flat, slot->tts_tableOid,
-								 &slot->tts_tid, slot);
-	RowCachePinReleaseEntry(entry);
-	return ok;
+	return RowCacheUnflattenToSlot(flat, slot->tts_tableOid,
+								   &slot->tts_tid, slot);
 }
 
 /* ----------------------------------------------------------------
@@ -815,18 +737,12 @@ RelationRowCacheFetchWithVisibility(Oid relid,
 		return false;
 
 	entry = RowCacheLookupRelEntry(relid);
-	if (entry == NULL)
-		return false;
-
-	if (!RowCachePinEntry(entry, relid))
+	if (entry == NULL || !RowCacheEntryIsLoadedFor(entry, relid))
 		return false;
 
 	flat = RowCacheLookupFlat(entry, tid);
 	if (flat == NULL)
-	{
-		RowCachePinReleaseEntry(entry);
 		return false;
-	}
 
 	htup.t_data = (HeapTupleHeader) FLAT_TUPLE_HTUP_DATA(flat);
 	htup.t_len = flat->htup_len;
@@ -839,6 +755,5 @@ RelationRowCacheFetchWithVisibility(Oid relid,
 	if (*is_visible)
 		RowCacheUnflattenToSlot(flat, relid, tid, slot);
 
-	RowCachePinReleaseEntry(entry);
 	return true;
 }
