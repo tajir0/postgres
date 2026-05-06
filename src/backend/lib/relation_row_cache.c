@@ -3,6 +3,7 @@
 #include "access/htup_details.h"
 #include "access/tableam.h"
 #include "executor/tuptable.h"
+#include "lib/pkey_row_cache.h"
 #include "lib/relation_row_cache.h"
 #include "lib/tid_row_cache.h"
 #include "miscadmin.h"
@@ -73,6 +74,13 @@ typedef struct RowCacheRelEntry
 	LWLock		rel_lock;		/* serializes Load ↔ Drop; readers don't take it */
 	pg_atomic_uint32 state;		/* ROW_CACHE_STATE_{UNLOADED,LOADED} */
 	int			natts;
+	/*
+	 * Pkey-driven secondary index.  Valid only when pkey_attno > 0.
+	 * Both fields are set under rel_lock together with blocks_dp and
+	 * published with the same write barrier before state=LOADED.
+	 */
+	dsa_pointer pkey_idx_dp;	/* DSA: PkeyIndex, Invalid if not built */
+	AttrNumber	pkey_attno;		/* 1-based attno of pkey column, 0 if none */
 } RowCacheRelEntry;
 
 /*
@@ -447,6 +455,8 @@ RelationRowCacheLoadRelation(Relation rel)
 		entry->blocks_dp = InvalidDsaPointer;
 		entry->nblocks = 0;
 		entry->natts = 0;
+		entry->pkey_idx_dp = InvalidDsaPointer;
+		entry->pkey_attno = 0;
 	}
 
 	/* Acquire rel_lock while still holding partition lock to prevent a
@@ -472,6 +482,12 @@ RelationRowCacheLoadRelation(Relation rel)
 
 		if (DsaPointerIsValid(entry->blocks_dp))
 			RowCacheDestroyBlocks(entry);
+		if (DsaPointerIsValid(entry->pkey_idx_dp))
+		{
+			RowCachePkeyIndexFree(LocalDsa, entry->pkey_idx_dp);
+			entry->pkey_idx_dp = InvalidDsaPointer;
+			entry->pkey_attno = 0;
+		}
 	}
 
 	nblocks = RelationGetNumberOfBlocks(rel);
@@ -500,6 +516,9 @@ RelationRowCacheLoadRelation(Relation rel)
 		TableScanDesc scan;
 		TupleTableSlot *slot;
 		bool		pushed_snapshot = false;
+		dsa_pointer pkey_idx_dp = InvalidDsaPointer;
+		AttrNumber	pkey_attno = 0;
+		uint64		row_estimate;
 
 		if (!ActiveSnapshotSet())
 		{
@@ -507,17 +526,52 @@ RelationRowCacheLoadRelation(Relation rel)
 			pushed_snapshot = true;
 		}
 
+		/*
+		 * Sizing the pkey index.  Prefer rel->rd_rel->reltuples when
+		 * positive (post-ANALYZE estimate); otherwise fall back to a
+		 * crude upper bound from the heap-page count (best-effort).
+		 * Over-sizing is harmless; under-sizing degrades to long probe
+		 * chains but never fails (we cap at PKEY_MAX_BUCKETS internally).
+		 */
+		row_estimate = (rel->rd_rel->reltuples > 0)
+			? (uint64) rel->rd_rel->reltuples
+			: (uint64) nblocks * 100;
+
+		pkey_idx_dp = RowCachePkeyIndexAlloc(rel, LocalDsa,
+											 row_estimate, &pkey_attno);
+
 		scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL);
 		slot = table_slot_create(rel, NULL);
 
 		while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+		{
 			RowCacheStoreTupleShared(blocks, nblocks, slot);
+
+			/*
+			 * Build the pkey -> TID mapping.  Pkey columns are NOT NULL
+			 * by definition; we still defensively check tts_isnull[]
+			 * before treating the Datum as a valid key.
+			 */
+			if (DsaPointerIsValid(pkey_idx_dp))
+			{
+				int			zb_attno = pkey_attno - 1;
+
+				/* slot_getallattrs already invoked inside Flatten */
+				if (!slot->tts_isnull[zb_attno])
+					RowCachePkeyIndexInsert(LocalDsa, pkey_idx_dp,
+											slot->tts_values[zb_attno],
+											&slot->tts_tid);
+			}
+		}
 
 		table_endscan(scan);
 		ExecDropSingleTupleTableSlot(slot);
 
 		if (pushed_snapshot)
 			PopActiveSnapshot();
+
+		entry->pkey_idx_dp = pkey_idx_dp;
+		entry->pkey_attno = pkey_attno;
 	}
 
 	/*
@@ -604,6 +658,12 @@ RelationRowCacheDropRelation(Oid relid)
 
 		if (DsaPointerIsValid(entry->blocks_dp))
 			RowCacheDestroyBlocks(entry);
+		if (DsaPointerIsValid(entry->pkey_idx_dp))
+		{
+			RowCachePkeyIndexFree(LocalDsa, entry->pkey_idx_dp);
+			entry->pkey_idx_dp = InvalidDsaPointer;
+			entry->pkey_attno = 0;
+		}
 	}
 
 	/*
@@ -756,4 +816,102 @@ RelationRowCacheFetchWithVisibility(Oid relid,
 		RowCacheUnflattenToSlot(flat, relid, tid, slot);
 
 	return true;
+}
+
+/* ----------------------------------------------------------------
+ * Public API: PkeyFetch -- pkey-driven fast path
+ *
+ * Looks up `pkey_val` in the relation's PkeyIndex (if any) to obtain a
+ * TID, then performs the same MVCC visibility + unflatten dance as
+ * FetchWithVisibility.
+ *
+ * Returns true if a matching cache entry exists (regardless of
+ * visibility); the caller must inspect *is_visible to decide whether
+ * to use `slot`.  Returns false when:
+ *   - The relation has no cache entry / not loaded
+ *   - The relation has no pkey index built (composite, non-byval, etc.)
+ *   - The pkey value is not present in the index
+ * In all "false" cases the caller should fall back to the regular
+ * IndexScan path (which still benefits from the TID-cache hook in
+ * table_index_fetch_tuple).
+ *
+ * Concurrency: identical to FetchWithVisibility — pure reads, no
+ * locks.  Caller contract requires that no concurrent Load/Drop runs.
+ * ---------------------------------------------------------------- */
+bool
+RelationRowCachePkeyFetch(Oid relid,
+						  Datum pkey_val,
+						  Snapshot snapshot,
+						  TupleTableSlot *slot,
+						  bool *is_visible,
+						  bool *has_hot_chain)
+{
+	RowCacheRelEntry *entry;
+	ItemPointerData tid;
+	FlatCachedTuple *flat;
+	HeapTupleData htup;
+
+	Assert(slot != NULL && is_visible != NULL && has_hot_chain != NULL);
+	*is_visible = false;
+	*has_hot_chain = false;
+
+	if (RowCacheRelHash == NULL)
+		return false;
+	if (!OidIsValid(relid))
+		return false;
+	if (!IsMVCCSnapshot(snapshot))
+		return false;
+
+	entry = RowCacheLookupRelEntry(relid);
+	if (entry == NULL || !RowCacheEntryIsLoadedFor(entry, relid))
+		return false;
+	if (!DsaPointerIsValid(entry->pkey_idx_dp))
+		return false;
+
+	if (!RowCachePkeyIndexLookup(LocalDsa, entry->pkey_idx_dp,
+								 pkey_val, &tid))
+		return false;
+
+	flat = RowCacheLookupFlat(entry, &tid);
+	if (flat == NULL)
+		return false;
+
+	htup.t_data = (HeapTupleHeader) FLAT_TUPLE_HTUP_DATA(flat);
+	htup.t_len = flat->htup_len;
+	htup.t_tableOid = relid;
+	ItemPointerCopy(&tid, &htup.t_self);
+
+	*has_hot_chain = HeapTupleIsHotUpdated(&htup);
+	*is_visible = RowCacheTupleVisibleMVCC(&htup, snapshot);
+
+	if (*is_visible)
+	{
+		slot->tts_tableOid = relid;
+		ItemPointerCopy(&tid, &slot->tts_tid);
+		RowCacheUnflattenToSlot(flat, relid, &tid, slot);
+	}
+
+	return true;
+}
+
+/*
+ * Return the 1-based pkey attno if a pkey index is currently loaded for
+ * the given relation, or 0 otherwise.  Cheap read-only check intended
+ * for executor plan-init to decide whether to wire up the fast path.
+ */
+AttrNumber
+RelationRowCachePkeyAttno(Oid relid)
+{
+	RowCacheRelEntry *entry;
+
+	if (RowCacheRelHash == NULL || !OidIsValid(relid))
+		return 0;
+
+	entry = RowCacheLookupRelEntry(relid);
+	if (entry == NULL || !RowCacheEntryIsLoadedFor(entry, relid))
+		return 0;
+	if (!DsaPointerIsValid(entry->pkey_idx_dp))
+		return 0;
+
+	return entry->pkey_attno;
 }
