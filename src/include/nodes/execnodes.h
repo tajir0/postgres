@@ -1722,6 +1722,21 @@ typedef struct IndexScanState
 	bool	   *iss_OrderByTypByVals;
 	int16	   *iss_OrderByTypLens;
 	Size		iss_PscanLen;
+
+	/*
+	 * Row-cache pkey fast-path state.
+	 *
+	 * iss_UseRowCachePkey: set once at ExecInitIndexScan if this IndexScan's
+	 *   shape matches a single-column equality on the pkey of a relation that
+	 *   has a row cache loaded with a pkey index.  Never changes during exec.
+	 *
+	 * iss_PkeyAttempted:   per-scan flag, true after the first IndexNext call
+	 *   has consulted the cache for this scan instance.  Reset on rescan so
+	 *   that NestedLoop inner scans re-consult the cache for each new outer
+	 *   tuple.  Used to ensure cache is checked at most once per scan.
+	 */
+	bool		iss_UseRowCachePkey;
+	bool		iss_PkeyAttempted;
 } IndexScanState;
 
 /* ----------------
