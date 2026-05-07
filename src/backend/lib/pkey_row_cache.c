@@ -23,10 +23,15 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
+#include "access/relation.h"
+#include "catalog/pg_index.h"
 #include "lib/pkey_row_cache.h"
 #include "storage/itemptr.h"
+#include "storage/lockdefs.h"
 #include "utils/dsa.h"
 #include "utils/rel.h"
+#include "utils/relcache.h"
 
 /* Min/max bucket count to keep the index sane. */
 #define PKEY_MIN_BUCKETS	16
@@ -87,24 +92,37 @@ pkey_eligible_attno(Relation rel)
 	if (!OidIsValid(pkindex_oid))
 		return 0;
 
-	pkindex = relation_open(pkindex_oid, AccessShareLock);
+	pkindex = index_open(pkindex_oid, AccessShareLock);
+
+	/*
+	 * Defensive: index_open should never return NULL (it errors on
+	 * invalid relations), but guard the dereference anyway.
+	 */
+	if (pkindex == NULL)
+		return 0;
+
 	ind = pkindex->rd_index;
+	if (ind == NULL)
+	{
+		index_close(pkindex, AccessShareLock);
+		return 0;
+	}
 
 	/* V1: single-column primary key only. */
 	if (ind->indnkeyatts != 1)
 	{
-		relation_close(pkindex, AccessShareLock);
+		index_close(pkindex, AccessShareLock);
 		return 0;
 	}
 
 	attno = ind->indkey.values[0];
 	if (attno <= 0)				/* defensive: system or expression key */
 	{
-		relation_close(pkindex, AccessShareLock);
+		index_close(pkindex, AccessShareLock);
 		return 0;
 	}
 
-	relation_close(pkindex, AccessShareLock);
+	index_close(pkindex, AccessShareLock);
 
 	/* V1: pass-by-value attribute only. */
 	attr = TupleDescAttr(RelationGetDescr(rel), attno - 1);
