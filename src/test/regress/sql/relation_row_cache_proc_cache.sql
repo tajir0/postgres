@@ -7,6 +7,12 @@ SET search_path = row_cache_perf, public;
 SET jit = off;
 SET max_parallel_workers_per_gather = 0;
 SET enable_indexonlyscan = off;
+-- 防止 LATERAL + generate_series 被 planner 重写为 HashJoin + SeqScan，
+-- 那样会完全绕过 table_index_fetch_tuple，行缓存代码路径根本不被触发。
+SET enable_seqscan       = off;
+SET enable_hashjoin      = off;
+SET enable_mergejoin     = off;
+SET enable_bitmapscan    = off;
 
 CREATE OR REPLACE FUNCTION monotonic_ms()
 RETURNS double precision

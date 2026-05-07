@@ -96,40 +96,50 @@ IndexNext(IndexScanState *node)
 	/*
 	 * Row-cache pkey fast path.
 	 *
-	 * Try this before any btree work.  The cache lookup is O(1) and lock-free;
-	 * on hit + visible we emit exactly one tuple and mark the scan exhausted
-	 * so the next IndexNext call returns an empty slot (mimicking unique
-	 * btree equality semantics).  On miss / not-visible / HOT chain we fall
-	 * through to the regular btree path; the iss_PkeyAttempted flag ensures
-	 * we don't re-consult the cache after falling through within the same
-	 * scan instance.
+	 * Static shape eligibility is decided at ExecInit; whether the cache
+	 * actually has a pkey index loaded is queried dynamically here so a
+	 * Load that happens after ExecInit (but before query execution) takes
+	 * effect immediately.
+	 *
+	 * On hit + visible we emit exactly one tuple and mark the scan
+	 * exhausted, mimicking unique btree equality semantics.  On miss /
+	 * not-visible / HOT chain we fall through to the regular btree path;
+	 * iss_PkeyAttempted ensures we don't re-consult the cache after
+	 * falling through within the same scan instance.
 	 */
-	if (node->iss_UseRowCachePkey && !node->iss_PkeyAttempted)
+	if (node->iss_RowCachePkeyShapeOk && !node->iss_PkeyAttempted)
 	{
 		ScanKey		sk;
 		bool		visible = false;
 		bool		has_hot_chain = false;
+		Oid			relid;
+		AttrNumber	cache_pkey_attno;
 
 		node->iss_PkeyAttempted = true;
 
 		/*
-		 * Make sure runtime-key sk_argument is current.  ExecIndexScan
-		 * already kicks ExecReScan when iss_RuntimeKeysReady is false, but
-		 * we double-check here defensively for the parameterless case (where
-		 * RuntimeKeysReady is harmlessly already true).
+		 * Dynamic gate: the cache must currently hold a pkey index for
+		 * this relation, AND its pkey column must match the index column
+		 * we statically locked onto in ExecInit.  Both conditions can
+		 * fail benignly (no cache loaded; cache loaded but composite PK)
+		 * — fall through to btree.
 		 */
-		if (node->iss_NumRuntimeKeys == 0 || node->iss_RuntimeKeysReady)
+		relid = RelationGetRelid(node->ss.ss_currentRelation);
+		cache_pkey_attno = RelationRowCachePkeyAttno(relid);
+
+		if (cache_pkey_attno > 0 &&
+			cache_pkey_attno == node->iss_RowCachePkeyHeapAttno &&
+			(node->iss_NumRuntimeKeys == 0 || node->iss_RuntimeKeysReady))
 		{
 			sk = &node->iss_ScanKeys[0];
 
 			if ((sk->sk_flags & SK_ISNULL) == 0 &&
-				RelationRowCachePkeyFetch(
-					RelationGetRelid(node->ss.ss_currentRelation),
-					sk->sk_argument,
-					estate->es_snapshot,
-					slot,
-					&visible,
-					&has_hot_chain))
+				RelationRowCachePkeyFetch(relid,
+										  sk->sk_argument,
+										  estate->es_snapshot,
+										  slot,
+										  &visible,
+										  &has_hot_chain))
 			{
 				if (visible && !has_hot_chain)
 				{
@@ -1157,20 +1167,20 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
 	}
 
 	/*
-	 * Decide whether this IndexScan can use the row cache pkey fast path.
-	 *
-	 * Match shape:
+	 * Decide whether this IndexScan's STATIC shape is eligible for the
+	 * row-cache pkey fast path.  We only check plan-tree-derived
+	 * properties here:
 	 *   - exactly one ScanKey, equality strategy on index column 1
 	 *   - no static disqualifying flags (array, row compare, NULL test, etc.)
 	 *   - no ORDER BY clauses
-	 *   - the index's first heap attno equals the pkey attno recorded in the
-	 *     row cache for the heap relation
+	 *   - index has exactly one key column with a real heap attno
 	 *
-	 * Dynamic conditions (SK_ISNULL, parallel scan, etc.) are still
-	 * re-checked in IndexNext; this is just an opt-in screen at plan-init
-	 * time so the hot path can branch on a single bool.
+	 * Whether the cache is actually loaded (and has a pkey index) is
+	 * checked dynamically in IndexNext via RelationRowCachePkeyAttno,
+	 * so a Load that happens after ExecInit still takes effect.
 	 */
-	indexstate->iss_UseRowCachePkey = false;
+	indexstate->iss_RowCachePkeyShapeOk = false;
+	indexstate->iss_RowCachePkeyHeapAttno = 0;
 	indexstate->iss_PkeyAttempted = false;
 
 	if (indexstate->iss_NumScanKeys == 1 &&
@@ -1191,12 +1201,11 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
 			if (indexRel->rd_index->indnkeyatts == 1)
 			{
 				AttrNumber	heap_attno = indexRel->rd_index->indkey.values[0];
-				Oid			relid = RelationGetRelid(currentRelation);
 
-				if (heap_attno > 0 &&
-					RelationRowCachePkeyAttno(relid) == heap_attno)
+				if (heap_attno > 0)
 				{
-					indexstate->iss_UseRowCachePkey = true;
+					indexstate->iss_RowCachePkeyShapeOk = true;
+					indexstate->iss_RowCachePkeyHeapAttno = heap_attno;
 				}
 			}
 		}
