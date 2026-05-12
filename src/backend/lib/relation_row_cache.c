@@ -868,6 +868,20 @@ RelationRowCachePkeyFetch(Oid relid,
 	if (!DsaPointerIsValid(entry->pkey_idx_dp))
 		return false;
 
+	/*
+	 * Attach this backend to the global row-cache DSA segment if it has
+	 * not done so yet.  LocalDsa is backend-local and starts NULL in every
+	 * fresh connection; the first cache touch must initialise it before
+	 * any dsa_get_address() call, otherwise dsa_get_address(NULL, ...)
+	 * dereferences a null area pointer and segfaults.
+	 *
+	 * Old read paths (FillSlot / FetchWithVisibility) call
+	 * RowCacheLookupFlat() first, which calls EnsureRowCacheDsa() on
+	 * entry, so they were implicitly safe.  PkeyFetch performs the
+	 * pkey-index lookup BEFORE LookupFlat, so we must ensure DSA here.
+	 */
+	EnsureRowCacheDsa();
+
 	if (!RowCachePkeyIndexLookup(LocalDsa, entry->pkey_idx_dp,
 								 pkey_val, &tid))
 		return false;
