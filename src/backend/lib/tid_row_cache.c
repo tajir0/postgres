@@ -13,8 +13,11 @@
  *
  * Pass-by-val Datums are stored inline in the values[] array.
  * Pass-by-ref Datums have their payloads copied to the varlen area at
- * the end of the block; values[] stores a pointer into that area
- * (valid in the current process's DSA mapping).
+ * the end of the block; values[] stores the byte offset from the start
+ * of the FlatCachedTuple block to that payload (NOT a pointer).
+ * Storing offsets rather than pointers makes the block valid across
+ * processes, because DSA segments are mapped at different virtual
+ * addresses in each backend.
  *
  * Returns a dsa_pointer to the allocated FlatCachedTuple block.
  */
@@ -89,7 +92,8 @@ RowCacheFlattenTuple(dsa_area *area, TupleTableSlot *slot)
 			memcpy(varlen_cursor,
 				   DatumGetPointer(slot->tts_values[i]),
 				   datum_size);
-			dst_values[i] = PointerGetDatum(varlen_cursor);
+			/* Store offset from ft base, not a process-local pointer */
+			dst_values[i] = (Datum) (varlen_cursor - (char *) ft);
 			varlen_cursor += MAXALIGN(datum_size);
 		}
 	}
@@ -103,9 +107,36 @@ RowCacheFlattenTuple(dsa_area *area, TupleTableSlot *slot)
 /*
  * Unflatten a FlatCachedTuple back into a TupleTableSlot.
  *
- * Reconstructs a HeapTupleData on the stack and stores it via
- * ExecForceStoreHeapTupleNoCopy, then copies the pre-decoded
- * values[] and isnull[] arrays into the slot.
+ * Fast-path design: single palloc + single bulk memcpy for the physical
+ * tuple payload (htup_data + varlen), bulk memcpy for values[]/isnull[],
+ * and O(natts) pointer arithmetic to fix up pass-by-ref Datums.  No
+ * per-column palloc or datumCopy.
+ *
+ * Memory layout of the palloc'd block:
+ *
+ *   [ HeapTupleData (HEAPTUPLESIZE bytes) ]
+ *   [ htup_data  (flat->htup_len bytes)   ]  ← copy->t_data points here
+ *   [ pad to MAXALIGN                     ]
+ *   [ varlen payloads                     ]
+ *
+ * Because the (htup_data + varlen) region has identical internal layout
+ * in the FlatCachedTuple block and in the local copy, any byte offset
+ * that was relative to htup_data in the DSA block is still the same
+ * relative offset in the local copy.  So fixing up tts_values[i] for a
+ * pass-by-ref column is just:
+ *
+ *     tts_values[i] = copy->t_data + (src_values[i] - flat->htup_offset)
+ *
+ * Lifetime safety:
+ *   - The slot owns the palloc'd block (shouldFree=true) and pfrees it on
+ *     ExecClearTuple.  All tts_values[] pointers point into that block, so
+ *     they remain valid for the lifetime of the slot, completely decoupled
+ *     from the DSA pin window.
+ *
+ * This replaces earlier buggy implementations:
+ *   1. HeapTupleData on the C stack + ExecForceStoreHeapTupleNoCopy left a
+ *      dangling pointer; generic plans triggered SIGSEGV in heap_deform.
+ *   2. values[] stored process-local DSA pointers, invalid cross-process.
  */
 bool
 RowCacheUnflattenToSlot(const FlatCachedTuple *flat,
@@ -113,7 +144,10 @@ RowCacheUnflattenToSlot(const FlatCachedTuple *flat,
 						ItemPointer tid,
 						TupleTableSlot *slot)
 {
-	HeapTupleData htup;
+	TupleDesc	desc = slot->tts_tupleDescriptor;
+	HeapTuple	copy;
+	Size		payload_len;
+	char	   *local_htup;
 	Datum	   *src_values;
 	bool	   *src_isnull;
 
@@ -121,24 +155,70 @@ RowCacheUnflattenToSlot(const FlatCachedTuple *flat,
 	Assert(slot != NULL);
 	Assert(tid != NULL);
 
-	if (slot->tts_tupleDescriptor->natts != flat->natts)
+	if (desc->natts != flat->natts)
 		return false;
 
-	htup.t_data = (HeapTupleHeader) FLAT_TUPLE_HTUP_DATA(flat);
-	htup.t_len = flat->htup_len;
-	htup.t_tableOid = relid;
-	ItemPointerCopy(tid, &htup.t_self);
+	/*
+	 * 1. Single palloc: HeapTupleData header + (htup_data + varlen) region.
+	 *
+	 * payload_len covers all bytes from htup_offset to the end of the flat
+	 * block, i.e. both the raw HeapTuple data and any trailing varlen
+	 * payloads.  One palloc + one memcpy replaces heap_copytuple + N
+	 * per-column datumCopy's.
+	 */
+	payload_len = flat->total_size - flat->htup_offset;
+	copy = (HeapTuple) palloc(HEAPTUPLESIZE + payload_len);
 
-	ExecForceStoreHeapTupleNoCopy(&htup, slot, false);
+	copy->t_len = flat->htup_len;
+	copy->t_tableOid = relid;
+	ItemPointerCopy(tid, &copy->t_self);
+	copy->t_data = (HeapTupleHeader) ((char *) copy + HEAPTUPLESIZE);
 
+	memcpy((char *) copy + HEAPTUPLESIZE,
+		   (char *) flat + flat->htup_offset,
+		   payload_len);
+
+	/*
+	 * ExecForceStoreHeapTupleNoCopy accepts any slot ops type (including
+	 * TTSOpsBufferHeapTuple used by index scans).  shouldFree=true lets the
+	 * slot pfree the tuple when cleared.  Note: this resets tts_nvalid to 0
+	 * internally; we set it to natts below after filling tts_values[].
+	 */
+	ExecForceStoreHeapTupleNoCopy(copy, slot, true);
+
+	/*
+	 * 2. Bulk-copy pre-decoded values[]/isnull[] in one memcpy each.
+	 *
+	 * Pass-by-val Datums are already correct.  Pass-by-ref Datums still
+	 * contain the DSA-relative offsets stored by RowCacheFlattenTuple; we
+	 * fix those up in step 3.
+	 */
 	src_values = FLAT_TUPLE_VALUES(flat);
 	src_isnull = FLAT_TUPLE_ISNULL(flat);
 
 	memcpy(slot->tts_values, src_values, sizeof(Datum) * flat->natts);
 	memcpy(slot->tts_isnull, src_isnull, sizeof(bool) * flat->natts);
+
+	/*
+	 * 3. Fix up pass-by-ref Datum pointers.
+	 *
+	 * For each non-null pass-by-ref column, src_values[i] is a byte offset
+	 * relative to the flat block's base.  The corresponding payload in the
+	 * local copy sits at (local_htup + (offset - htup_offset)), because we
+	 * copied the entire htup_data+varlen region verbatim starting from
+	 * local_htup.  Only arithmetic, no allocations.
+	 */
+	local_htup = (char *) copy->t_data;
+	for (int i = 0; i < flat->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(desc, i);
+
+		if (!src_isnull[i] && !attr->attbyval)
+			slot->tts_values[i] = PointerGetDatum(
+				local_htup + (Size) src_values[i] - flat->htup_offset);
+	}
+
 	slot->tts_nvalid = flat->natts;
-	ItemPointerCopy(tid, &slot->tts_tid);
-	slot->tts_tableOid = relid;
 
 	return true;
 }
