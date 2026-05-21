@@ -21,7 +21,6 @@ OBJS = \
 	integerset.o \
 	knapsack.o \
 	pairingheap.o \
-	pkey_row_cache.o \
 	relation_row_cache.o \
 	rbtree.o \
 	tid_row_cache.o \

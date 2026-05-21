@@ -179,9 +179,9 @@ static const char *const BuiltinTrancheNames[] = {
 	[LWTRANCHE_PARALLEL_VACUUM_DSA] = "ParallelVacuumDSA",
 	[LWTRANCHE_AIO_URING_COMPLETION] = "AioUringCompletion",
 	[LWTRANCHE_ROW_CACHE_CTL] = "RowCacheCtl",
-	[LWTRANCHE_ROW_CACHE_REL] = "RowCacheRel",
 	[LWTRANCHE_ROW_CACHE_DSA] = "RowCacheDSA",
-	[LWTRANCHE_ROW_CACHE_RELHASH] = "RowCacheRelHash",
+	[LWTRANCHE_ROW_CACHE_PART] = "RowCachePart",
+	[LWTRANCHE_ROW_CACHE_RELMETA] = "RowCacheRelMeta",
 };
 
 StaticAssertDecl(lengthof(BuiltinTrancheNames) ==

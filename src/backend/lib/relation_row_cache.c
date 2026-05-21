@@ -1,198 +1,221 @@
+/*-------------------------------------------------------------------------
+ *
+ * relation_row_cache.c
+ *	  V4 Phase 1 implementation of the shared row cache.
+ *
+ * Architecture (see V4设计文档 sections 2-5):
+ *
+ *   GlobalCache: a single DSA-resident chained hash table keyed by
+ *                (relid, pkey).  Bucket heads live in a flat
+ *                dsa_pointer[ROW_CACHE_HASH_BUCKETS] array; each chain
+ *                element is a GlobalEntry holding the pkey, hash, payload
+ *                pointer and a `next_dp` to the next entry in the bucket.
+ *
+ *   RelMeta[64]: fixed shmem array indexing per-relation metadata
+ *                (state machine + pkey descriptor + rel_gen + build_lock).
+ *
+ *   Concurrency:
+ *     - Write side (Load / Drop) takes the per-relation build_lock and
+ *       the per-bucket partition lock as needed.
+ *     - Read side takes NO locks; it relies on the V3 caller contract
+ *       (no concurrent Load/Drop with readers).  Phase 2 will introduce
+ *       EBR; until then, callers must serialize externally.
+ *
+ *   Phase 1 limits: single-column byval pk (int2/int4/int8/oid).  Tables
+ *   with composite or pass-by-reference pks are silently skipped by
+ *   RelationRowCacheLoadRelation (no error, no entries created).
+ *
+ *-------------------------------------------------------------------------
+ */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/htup_details.h"
+#include "access/relation.h"
 #include "access/tableam.h"
+#include "catalog/pg_index.h"
 #include "executor/tuptable.h"
-#include "lib/pkey_row_cache.h"
 #include "lib/relation_row_cache.h"
 #include "lib/tid_row_cache.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/bufmgr.h"
+#include "storage/itemptr.h"
+#include "storage/lockdefs.h"
 #include "storage/lwlock.h"
-#include "storage/procnumber.h"
 #include "storage/shmem.h"
 #include "utils/dsa.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
+#include "utils/relcache.h"
 #include "utils/snapmgr.h"
+
+/* ----------------------------------------------------------------
+ * Constants
+ * ---------------------------------------------------------------- */
+
+#define ROW_CACHE_MAX_RELATIONS	64
+#define ROW_CACHE_NUM_PARTITIONS	128
+#define ROW_CACHE_HASH_BUCKETS	8192	/* must be a power of two */
+#define ROW_CACHE_BUCKET_MASK	(ROW_CACHE_HASH_BUCKETS - 1)
+
+StaticAssertDecl((ROW_CACHE_HASH_BUCKETS & ROW_CACHE_BUCKET_MASK) == 0,
+				 "ROW_CACHE_HASH_BUCKETS must be a power of two");
+
+/* RelMeta.state values. */
+#define RELMETA_DISABLED	0
+#define RELMETA_LOADING		1
+#define RELMETA_ENABLED		2
+
+/* GlobalEntry.state values.  Phase 1 only ever sets FRESH. */
+#define ROW_CACHE_ENTRY_FRESH	0
+#define ROW_CACHE_ENTRY_STALE	1
+#define ROW_CACHE_ENTRY_DELETED	2
 
 /* ----------------------------------------------------------------
  * Data structures
  * ---------------------------------------------------------------- */
 
-#define ROW_CACHE_MAX_RELATIONS 128
-#define ROW_CACHE_NUM_PARTITIONS 16
+/*
+ * RelMeta: per-relation metadata, lives in shmem (fixed array).
+ *
+ * Lookup is a linear scan of up to ROW_CACHE_MAX_RELATIONS slots; a sticky
+ * per-backend cache short-circuits repeated lookups for the same relid.
+ */
+typedef struct RelMeta
+{
+	Oid				relid;			/* InvalidOid = unused slot */
+	pg_atomic_uint32 state;			/* RELMETA_{DISABLED,LOADING,ENABLED} */
+	pg_atomic_uint64 rel_gen;		/* bumped on Drop / DDL invalidation */
+	LWLock			build_lock;		/* serializes Load / Drop; not on read path */
+
+	/* Pkey descriptor.  Phase 1: single-col byval only. */
+	AttrNumber		pkey_attno;		/* 1-based heap attno of pkey column */
+	int16			pkey_typlen;
+	bool			pkey_byval;
+} RelMeta;
 
 /*
- * Per-relation state values for RowCacheRelEntry.state.
+ * GlobalEntry: one element of the chained global hash.  Lives in DSA.
  *
- * State transitions are only performed by Load / Drop while holding
- * rel_lock(EXCLUSIVE).  Readers only ever read this field atomically,
- * never write it.
+ * For Phase 1 the pkey is always a single-col byval Datum which fits in
+ * 64 bits; pkey_val stores it directly (no separate dsa_pointer needed).
+ * Phase 4 will widen this when composite/byref support lands.
  */
-#define ROW_CACHE_STATE_UNLOADED	0
-#define ROW_CACHE_STATE_LOADED		1
-
-typedef struct RowCacheShmemControl
+typedef struct GlobalEntry
 {
-	dsa_handle	global_dsa_handle;
-	LWLock		control_lock;
-	LWLock		rel_hash_locks[ROW_CACHE_NUM_PARTITIONS];
-} RowCacheShmemControl;
+	Oid				relid;
+	uint32			pkey_hash;
+	uint64			pkey_val;		/* packed byval Datum */
+	uint64			rel_gen_at_load;
+	pg_atomic_uint32 state;			/* ROW_CACHE_ENTRY_{FRESH,STALE,DELETED} */
+	ItemPointerData	tid;			/* heap TID at load time (for slot fill) */
+	dsa_pointer		payload_dp;		/* FlatCachedTuple */
+	dsa_pointer		next_dp;		/* next GlobalEntry in this bucket */
+} GlobalEntry;
 
 /*
- * RowCacheRelEntry: per-relation slot in the shared hash table.
- *
- * Concurrency protocol (atomic state, lock-free read path):
- *
- *   - state: LOADED / UNLOADED.  Readers only read atomically.  Load and
- *     Drop write it while holding rel_lock(EXCLUSIVE).
- *   - rel_lock: EXCLUSIVE-only, serializes Load ↔ Drop ↔ Load.  The read
- *     path never acquires it, eliminating cache-line bouncing on the
- *     hot path under high concurrency.
- *
- * IMPORTANT LIFETIME CONTRACT:
- *   The caller MUST guarantee that no concurrent readers exist while
- *   Load or Drop runs.  This matches the intended use case (read-only
- *   tables such as TPC-C ITEM: load once before the workload, drop only
- *   after every worker has finished).  Enforcing this at the application
- *   level lets us omit the per-backend pin/unpin RCU-style protocol on
- *   the hot read path — which materially improved multi-process
- *   throughput.
- *
- * Once an entry is inserted into RowCacheRelHash its memory address
- * (and the embedded rel_lock) is stable for the lifetime of the
- * postmaster: Drop never HASH_REMOVEs.  Entry addresses remain valid
- * for the lifetime of the postmaster (no dangling pointers after Drop).
+ * RowCacheControl: top-level shmem segment.
  */
-typedef struct RowCacheRelEntry
+typedef struct RowCacheControl
 {
-	Oid			relid;			/* hash key */
-	dsa_pointer blocks_dp;		/* DSA: TidBlockEntry[nblocks], Invalid if none */
-	BlockNumber nblocks;		/* length of blocks_dp; 0 if empty relation */
-	LWLock		rel_lock;		/* serializes Load ↔ Drop; readers don't take it */
-	pg_atomic_uint32 state;		/* ROW_CACHE_STATE_{UNLOADED,LOADED} */
-	int			natts;
+	dsa_handle		global_dsa_handle;
+	LWLock			control_lock;			/* protects DSA init */
+	LWLock			relmeta_alloc_lock;		/* protects RelMeta slot allocation */
+	LWLock			partition_locks[ROW_CACHE_NUM_PARTITIONS];
+
 	/*
-	 * Pkey-driven secondary index.  Valid only when pkey_attno > 0.
-	 * Both fields are set under rel_lock together with blocks_dp and
-	 * published with the same write barrier before state=LOADED.
+	 * Bucket-head array (length ROW_CACHE_HASH_BUCKETS) lives in DSA;
+	 * pointer below is published after dsa_create.
 	 */
-	dsa_pointer pkey_idx_dp;	/* DSA: PkeyIndex, Invalid if not built */
-	AttrNumber	pkey_attno;		/* 1-based attno of pkey column, 0 if none */
-} RowCacheRelEntry;
+	dsa_pointer		hash_buckets_dp;
 
-/*
- * Per-heap-block cached tuple pointers.  Indexed by block number in the flat
- * blocks array (RelationGetNumberOfBlocks snapshot at load time).
- */
-typedef struct TidBlockEntry
-{
-	int			capacity;
-	dsa_pointer entries_dp;		/* → dsa_pointer[capacity] array */
-} TidBlockEntry;
+	RelMeta			relmetas[ROW_CACHE_MAX_RELATIONS];
+} RowCacheControl;
 
 /* ----------------------------------------------------------------
- * Global / backend-local state
+ * Globals
  * ---------------------------------------------------------------- */
 
-static RowCacheShmemControl *RowCacheCtl = NULL;
-static HTAB *RowCacheRelHash = NULL;
+static RowCacheControl *RowCacheCtl = NULL;
 static dsa_area *LocalDsa = NULL;
 
 /*
- * Per-backend last-used relation cache.
- *
- * Avoids the partition lock (LW_SHARED hash lookup) on repeated accesses to
- * the same relation within one backend.  Both variables are backend-local and
- * require no synchronisation.  They are invalidated whenever Load or Drop
- * change the entry (set LastCachedEntry = NULL).
- *
- * Safety: RowCacheRelHash entries are never HASH_REMOVE'd, so the pointer
- * remains valid for the lifetime of the postmaster even after a Drop.
- * The read path re-checks entry->relid and entry->state atomically, so a
- * stale cached pointer after a Drop + Load still yields a safe "not loaded"
- * outcome.
+ * Sticky per-backend cache for relmeta lookup.  Invalidated by Load/Drop
+ * on the same backend (LastCachedRelMeta=NULL) so a subsequent call
+ * re-walks the array.  Cross-backend Load/Drop is not invalidated here;
+ * the read path re-checks relmeta->state and rel_gen on every fetch, so
+ * a stale sticky pointer still produces a safe "miss" outcome.
  */
-static Oid				LastCachedRelid = InvalidOid;
-static RowCacheRelEntry *LastCachedEntry = NULL;
+static Oid			LastLookupRelid = InvalidOid;
+static RelMeta	   *LastLookupRelMeta = NULL;
 
 /* ----------------------------------------------------------------
- * Partition lock helpers for RowCacheRelHash
- *
- * ShmemInitHash with HASH_PARTITION does NOT manage partition locks
- * internally — the caller must acquire the appropriate partition lock
- * before every hash_search call.  This is the same pattern used by
- * buf_table.c (BufMappingPartitionLock) and lock.c.
+ * Forward declarations
  * ---------------------------------------------------------------- */
 
-static inline uint32
-RowCacheRelHashCode(const Oid *relid)
-{
-	return get_hash_value(RowCacheRelHash, relid);
-}
-
-static inline LWLock *
-RowCacheRelPartitionLock(uint32 hashcode)
-{
-	return &RowCacheCtl->rel_hash_locks[hashcode % ROW_CACHE_NUM_PARTITIONS];
-}
-
-static Size
-RowCacheRelEntryAllocSize(void)
-{
-	return MAXALIGN(sizeof(RowCacheRelEntry));
-}
+static void EnsureRowCacheDsa(void);
+static RelMeta *FindRelMeta(Oid relid);
+static RelMeta *AllocateOrFindRelMeta(Oid relid);
+static AttrNumber CheckEligibleByvalPkey(Relation rel,
+										 int16 *out_typlen,
+										 bool *out_byval);
+static inline uint64 PackPkeyDatum(Datum d, int16 typlen);
+static inline uint32 ComputePkeyHash(uint64 pkey_val);
+static void DropAllEntriesForRelid(Oid relid);
 
 /* ----------------------------------------------------------------
- * Shared-memory sizing and initialization
+ * Shared-memory sizing and init
  * ---------------------------------------------------------------- */
 
 Size
 RowCacheShmemSize(void)
 {
-	Size		size = 0;
-
-	size = add_size(size, MAXALIGN(sizeof(RowCacheShmemControl)));
-	size = add_size(size, hash_estimate_size(ROW_CACHE_MAX_RELATIONS,
-											 RowCacheRelEntryAllocSize()));
-	return size;
+	return MAXALIGN(sizeof(RowCacheControl));
 }
 
 void
 RowCacheShmemInit(void)
 {
 	bool		found;
-	HASHCTL		ctl;
 
-	RowCacheCtl = (RowCacheShmemControl *)
-		ShmemInitStruct("Row Cache Control",
-						sizeof(RowCacheShmemControl),
+	RowCacheCtl = (RowCacheControl *)
+		ShmemInitStruct("Row Cache Control V4",
+						sizeof(RowCacheControl),
 						&found);
-	if (!found)
+
+	if (found)
+		return;
+
+	RowCacheCtl->global_dsa_handle = DSA_HANDLE_INVALID;
+	RowCacheCtl->hash_buckets_dp = InvalidDsaPointer;
+
+	LWLockInitialize(&RowCacheCtl->control_lock, LWTRANCHE_ROW_CACHE_CTL);
+	LWLockInitialize(&RowCacheCtl->relmeta_alloc_lock,
+					 LWTRANCHE_ROW_CACHE_RELMETA);
+
+	for (int i = 0; i < ROW_CACHE_NUM_PARTITIONS; i++)
+		LWLockInitialize(&RowCacheCtl->partition_locks[i],
+						 LWTRANCHE_ROW_CACHE_PART);
+
+	for (int i = 0; i < ROW_CACHE_MAX_RELATIONS; i++)
 	{
-		RowCacheCtl->global_dsa_handle = DSA_HANDLE_INVALID;
-		LWLockInitialize(&RowCacheCtl->control_lock, LWTRANCHE_ROW_CACHE_CTL);
+		RelMeta    *rm = &RowCacheCtl->relmetas[i];
 
-		for (int i = 0; i < ROW_CACHE_NUM_PARTITIONS; i++)
-			LWLockInitialize(&RowCacheCtl->rel_hash_locks[i],
-							 LWTRANCHE_ROW_CACHE_RELHASH);
+		rm->relid = InvalidOid;
+		pg_atomic_init_u32(&rm->state, RELMETA_DISABLED);
+		pg_atomic_init_u64(&rm->rel_gen, 0);
+		LWLockInitialize(&rm->build_lock, LWTRANCHE_ROW_CACHE_RELMETA);
+		rm->pkey_attno = 0;
+		rm->pkey_typlen = 0;
+		rm->pkey_byval = false;
 	}
-
-	ctl.keysize = sizeof(Oid);
-	ctl.entrysize = RowCacheRelEntryAllocSize();
-	ctl.num_partitions = ROW_CACHE_NUM_PARTITIONS;
-
-	RowCacheRelHash = ShmemInitHash("Row Cache Relation Hash",
-									ROW_CACHE_MAX_RELATIONS,
-									ROW_CACHE_MAX_RELATIONS,
-									&ctl,
-									HASH_ELEM | HASH_BLOBS | HASH_PARTITION);
 }
 
 /* ----------------------------------------------------------------
- * DSA lazy initialization
+ * DSA lazy init.  The bucket-head array is allocated in DSA the first
+ * time any backend touches the cache, under the control_lock.
  * ---------------------------------------------------------------- */
 
 static void
@@ -204,10 +227,9 @@ EnsureRowCacheDsa(void)
 		return;
 
 	/*
-	 * dsa_create() and dsa_attach() palloc the backend-local dsa_area struct
-	 * in CurrentMemoryContext.  LocalDsa is a backend-local global that must
-	 * outlive any single statement; allocate it in TopMemoryContext so it is
-	 * not freed when a query's es_query_cxt is deleted.
+	 * dsa_create / dsa_attach palloc the per-backend dsa_area handle in
+	 * CurrentMemoryContext; switch to TopMemoryContext so it survives the
+	 * statement that triggered initialisation.
 	 */
 	old_ctx = MemoryContextSwitchTo(TopMemoryContext);
 
@@ -216,10 +238,29 @@ EnsureRowCacheDsa(void)
 	if (RowCacheCtl->global_dsa_handle == DSA_HANDLE_INVALID)
 	{
 		dsa_area   *dsa = dsa_create(LWTRANCHE_ROW_CACHE_DSA);
+		dsa_pointer dp;
+		dsa_pointer *buckets;
 
 		dsa_pin(dsa);
 		dsa_pin_mapping(dsa);
+
+		dp = dsa_allocate0(dsa,
+						   sizeof(dsa_pointer) * ROW_CACHE_HASH_BUCKETS);
+		if (!DsaPointerIsValid(dp))
+		{
+			LWLockRelease(&RowCacheCtl->control_lock);
+			MemoryContextSwitchTo(old_ctx);
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("out of memory"),
+					 errdetail_internal("row cache: cannot allocate hash buckets")));
+		}
+		buckets = (dsa_pointer *) dsa_get_address(dsa, dp);
+		for (int i = 0; i < ROW_CACHE_HASH_BUCKETS; i++)
+			buckets[i] = InvalidDsaPointer;
+
 		RowCacheCtl->global_dsa_handle = dsa_get_handle(dsa);
+		RowCacheCtl->hash_buckets_dp = dp;
 		LocalDsa = dsa;
 	}
 	else
@@ -234,119 +275,189 @@ EnsureRowCacheDsa(void)
 }
 
 /* ----------------------------------------------------------------
- * Block-level helpers
+ * RelMeta lookup and slot allocation
  * ---------------------------------------------------------------- */
 
-static int
-TidRowBlockInitialCapacity(OffsetNumber off)
+/*
+ * Linear scan of the RelMeta array for a slot whose relid matches.
+ * Returns NULL if not found.  Caller must NOT rely on the slot staying
+ * registered: a concurrent Drop can flip state to DISABLED, but the slot
+ * (and its embedded build_lock) is never deallocated.
+ */
+static RelMeta *
+FindRelMeta(Oid relid)
 {
-	int			cap = 16;
+	if (!OidIsValid(relid))
+		return NULL;
 
-	while (cap <= (int) off)
-		cap <<= 1;
-	return cap;
+	for (int i = 0; i < ROW_CACHE_MAX_RELATIONS; i++)
+	{
+		RelMeta    *rm = &RowCacheCtl->relmetas[i];
+
+		if (rm->relid == relid)
+			return rm;
+	}
+	return NULL;
 }
 
-/* ----------------------------------------------------------------
- * Store one tuple into the flat per-block arrays (Load only).
- * ---------------------------------------------------------------- */
-
-static void
-RowCacheStoreTupleShared(TidBlockEntry *blocks, BlockNumber nblocks,
-						 TupleTableSlot *slot)
+/*
+ * Find an existing slot for `relid` or allocate a fresh one.  Returns
+ * NULL only if the array is full.  Slot allocation is serialised under
+ * relmeta_alloc_lock so two backends don't both grab the same empty
+ * slot for different relids.
+ */
+static RelMeta *
+AllocateOrFindRelMeta(Oid relid)
 {
-	BlockNumber blockno = ItemPointerGetBlockNumberNoCheck(&slot->tts_tid);
-	OffsetNumber off = ItemPointerGetOffsetNumberNoCheck(&slot->tts_tid);
-	TidBlockEntry *block;
-	dsa_pointer *entries_arr;
-	dsa_pointer flat_dp;
+	RelMeta    *rm;
 
-	if (blockno >= nblocks)
-		return;
+	rm = FindRelMeta(relid);
+	if (rm != NULL)
+		return rm;
 
-	block = &blocks[blockno];
+	LWLockAcquire(&RowCacheCtl->relmeta_alloc_lock, LW_EXCLUSIVE);
 
-	if (block->capacity == 0)
+	/* Re-check under the lock. */
+	for (int i = 0; i < ROW_CACHE_MAX_RELATIONS; i++)
 	{
-		int			cap = TidRowBlockInitialCapacity(off);
-
-		block->capacity = cap;
-		block->entries_dp = dsa_allocate0(LocalDsa,
-										  sizeof(dsa_pointer) * cap);
-	}
-	else if ((int) off >= block->capacity)
-	{
-		int			oldcap = block->capacity;
-		int			newcap = oldcap;
-		dsa_pointer new_dp;
-		dsa_pointer *old_arr;
-		dsa_pointer *new_arr;
-
-		while (newcap <= (int) off)
-			newcap <<= 1;
-
-		new_dp = dsa_allocate0(LocalDsa, sizeof(dsa_pointer) * newcap);
-		old_arr = (dsa_pointer *) dsa_get_address(LocalDsa, block->entries_dp);
-		new_arr = (dsa_pointer *) dsa_get_address(LocalDsa, new_dp);
-		memcpy(new_arr, old_arr, sizeof(dsa_pointer) * oldcap);
-
-		dsa_free(LocalDsa, block->entries_dp);
-		block->entries_dp = new_dp;
-		block->capacity = newcap;
-	}
-
-	flat_dp = RowCacheFlattenTuple(LocalDsa, slot);
-
-	entries_arr = (dsa_pointer *) dsa_get_address(LocalDsa, block->entries_dp);
-	if (DsaPointerIsValid(entries_arr[off]))
-		dsa_free(LocalDsa, entries_arr[off]);
-	entries_arr[off] = flat_dp;
-}
-
-/* ----------------------------------------------------------------
- * Destroy the flat block array + all DSA allocations for a relation
- * ---------------------------------------------------------------- */
-
-static void
-RowCacheDestroyBlocks(RowCacheRelEntry *entry)
-{
-	TidBlockEntry *blocks;
-	BlockNumber blk;
-
-	EnsureRowCacheDsa();
-
-	if (!DsaPointerIsValid(entry->blocks_dp))
-		return;
-
-	blocks = (TidBlockEntry *) dsa_get_address(LocalDsa, entry->blocks_dp);
-
-	for (blk = 0; blk < entry->nblocks; blk++)
-	{
-		TidBlockEntry *block = &blocks[blk];
-
-		if (DsaPointerIsValid(block->entries_dp))
+		if (RowCacheCtl->relmetas[i].relid == relid)
 		{
-			dsa_pointer *arr = (dsa_pointer *)
-				dsa_get_address(LocalDsa, block->entries_dp);
-
-			for (int i = 0; i < block->capacity; i++)
-			{
-				if (DsaPointerIsValid(arr[i]))
-					dsa_free(LocalDsa, arr[i]);
-			}
-			dsa_free(LocalDsa, block->entries_dp);
-			block->entries_dp = InvalidDsaPointer;
-			block->capacity = 0;
+			rm = &RowCacheCtl->relmetas[i];
+			LWLockRelease(&RowCacheCtl->relmeta_alloc_lock);
+			return rm;
 		}
 	}
 
-	dsa_free(LocalDsa, entry->blocks_dp);
-	entry->blocks_dp = InvalidDsaPointer;
-	entry->nblocks = 0;
+	/* Find an unused slot. */
+	for (int i = 0; i < ROW_CACHE_MAX_RELATIONS; i++)
+	{
+		RelMeta    *cand = &RowCacheCtl->relmetas[i];
+
+		if (cand->relid == InvalidOid)
+		{
+			cand->relid = relid;
+			pg_atomic_write_u32(&cand->state, RELMETA_DISABLED);
+			cand->pkey_attno = 0;
+			cand->pkey_typlen = 0;
+			cand->pkey_byval = false;
+			rm = cand;
+			break;
+		}
+	}
+
+	LWLockRelease(&RowCacheCtl->relmeta_alloc_lock);
+	return rm;
 }
 
 /* ----------------------------------------------------------------
- * MVCC visibility (same logic as the old demo, pure in-memory check)
+ * Pkey eligibility / serialization (Phase 1: single-col byval only)
+ * ---------------------------------------------------------------- */
+
+/*
+ * Return the 1-based heap attno of the relation's pkey column iff the
+ * pkey is single-column and pass-by-value (int2/int4/int8/oid).
+ * Returns 0 otherwise (composite, byref, deferrable, no pk, etc.).
+ */
+static AttrNumber
+CheckEligibleByvalPkey(Relation rel, int16 *out_typlen, bool *out_byval)
+{
+	Oid			pkindex_oid;
+	Relation	pkindex;
+	Form_pg_index ind;
+	Form_pg_attribute attr;
+	AttrNumber	attno = 0;
+
+	*out_typlen = 0;
+	*out_byval = false;
+
+	pkindex_oid = RelationGetPrimaryKeyIndex(rel, false);
+	if (!OidIsValid(pkindex_oid))
+		return 0;
+
+	pkindex = index_open(pkindex_oid, AccessShareLock);
+	ind = pkindex->rd_index;
+
+	if (ind == NULL || ind->indnkeyatts != 1)
+	{
+		index_close(pkindex, AccessShareLock);
+		return 0;
+	}
+
+	attno = ind->indkey.values[0];
+	index_close(pkindex, AccessShareLock);
+
+	if (attno <= 0)
+		return 0;
+
+	attr = TupleDescAttr(RelationGetDescr(rel), attno - 1);
+	if (!attr->attbyval || attr->attlen <= 0 ||
+		attr->attlen > (int) sizeof(uint64))
+		return 0;
+
+	*out_typlen = attr->attlen;
+	*out_byval = true;
+	return attno;
+}
+
+/*
+ * Pack a byval pkey Datum into a 64-bit canonical representation.
+ *
+ * For typlen <= 8 the Datum is already zero-extended to 64 bits per the
+ * PG byval convention, but we mask to typlen-relevant bits so that, e.g.,
+ * a high-bit-set int4 with junk in the upper 32 bits compares equal to
+ * the canonical zero-extended form.
+ */
+static inline uint64
+PackPkeyDatum(Datum d, int16 typlen)
+{
+	uint64		v = (uint64) d;
+
+	switch (typlen)
+	{
+		case 1:
+			return v & UINT64CONST(0xff);
+		case 2:
+			return v & UINT64CONST(0xffff);
+		case 4:
+			return v & UINT64CONST(0xffffffff);
+		case 8:
+		default:
+			return v;
+	}
+}
+
+/*
+ * Splitmix64-style finalizer; lifted from the V3 pkey_row_cache.c.  We
+ * keep it as a 32-bit return because that's all the bucket index needs.
+ */
+static inline uint32
+ComputePkeyHash(uint64 pkey_val)
+{
+	uint64		x = pkey_val;
+
+	x ^= x >> 30;
+	x *= UINT64CONST(0xbf58476d1ce4e5b9);
+	x ^= x >> 27;
+	x *= UINT64CONST(0x94d49bb133111eb1);
+	x ^= x >> 31;
+	return (uint32) x;
+}
+
+static inline LWLock *
+PartitionLockForBucket(uint32 bucket)
+{
+	return &RowCacheCtl->partition_locks[bucket % ROW_CACHE_NUM_PARTITIONS];
+}
+
+static inline dsa_pointer *
+BucketHeads(void)
+{
+	return (dsa_pointer *) dsa_get_address(LocalDsa,
+										   RowCacheCtl->hash_buckets_dp);
+}
+
+/* ----------------------------------------------------------------
+ * MVCC visibility check (lifted from V3)
  * ---------------------------------------------------------------- */
 
 static bool
@@ -377,467 +488,329 @@ RowCacheTupleVisibleMVCC(HeapTuple tuple, Snapshot snapshot)
 }
 
 /* ----------------------------------------------------------------
- * Internal lookup: find FlatCachedTuple by (relid, tid)
+ * Bucket-chain helpers
  * ---------------------------------------------------------------- */
 
-static FlatCachedTuple *
-RowCacheLookupFlat(RowCacheRelEntry *entry, ItemPointer tid)
+/*
+ * Insert a fully-initialised GlobalEntry at the head of its bucket.
+ * Caller must hold the bucket's partition lock EXCLUSIVE.
+ */
+static void
+BucketInsertHead(uint32 bucket, dsa_pointer entry_dp, GlobalEntry *entry)
 {
-	TidBlockEntry *blocks;
-	TidBlockEntry *block;
-	dsa_pointer *entries_arr;
-	BlockNumber blockno;
-	OffsetNumber off;
+	dsa_pointer *heads = BucketHeads();
 
-	EnsureRowCacheDsa();
+	entry->next_dp = heads[bucket];
+	pg_write_barrier();
+	heads[bucket] = entry_dp;
+}
 
-	blockno = ItemPointerGetBlockNumberNoCheck(tid);
-	off = ItemPointerGetOffsetNumberNoCheck(tid);
+/*
+ * Walk a bucket chain looking for an entry matching (relid, pkey_val).
+ * Returns the entry pointer (via dsa_get_address) and stores the
+ * dsa_pointer in *out_entry_dp when found; otherwise returns NULL.
+ *
+ * Read path: NO LOCK (per Phase 1 caller contract).
+ * Write path: caller holds the partition lock.
+ */
+static GlobalEntry *
+BucketLookup(uint32 bucket, Oid relid, uint64 pkey_val,
+			 dsa_pointer *out_entry_dp)
+{
+	dsa_pointer *heads = BucketHeads();
+	dsa_pointer cur_dp = heads[bucket];
 
-	if (!DsaPointerIsValid(entry->blocks_dp) || blockno >= entry->nblocks)
-		return NULL;
+	while (DsaPointerIsValid(cur_dp))
+	{
+		GlobalEntry *e = (GlobalEntry *) dsa_get_address(LocalDsa, cur_dp);
 
-	blocks = (TidBlockEntry *) dsa_get_address(LocalDsa, entry->blocks_dp);
-	block = &blocks[blockno];
-
-	if ((int) off >= block->capacity || !DsaPointerIsValid(block->entries_dp))
-		return NULL;
-
-	entries_arr = (dsa_pointer *) dsa_get_address(LocalDsa, block->entries_dp);
-	if (!DsaPointerIsValid(entries_arr[off]))
-		return NULL;
-
-	return (FlatCachedTuple *) dsa_get_address(LocalDsa, entries_arr[off]);
+		if (e->relid == relid && e->pkey_val == pkey_val)
+		{
+			if (out_entry_dp)
+				*out_entry_dp = cur_dp;
+			return e;
+		}
+		cur_dp = e->next_dp;
+	}
+	return NULL;
 }
 
 /* ----------------------------------------------------------------
  * Public API: Load
+ * ----------------------------------------------------------------
  *
- * Lock order: partition_lock → rel_lock (never reverse).
- *
- * Concurrency: state=UNLOADED is written first (via pg_atomic_write_u32)
- * so any reader that samples state afterwards bails out.  Once rebuilding
- * finishes, a write barrier is issued before state=LOADED to publish
- * blocks_dp, nblocks, and natts to readers that see the new state.
- *
- * Caller contract: no readers may be executing concurrently with Load.
- * (See RowCacheRelEntry for the full lifetime contract.)
- * ---------------------------------------------------------------- */
-
+ * 1. Find / allocate RelMeta slot.
+ * 2. build_lock EXCLUSIVE.
+ * 3. If already ENABLED, drop first (idempotent).
+ * 4. State -> LOADING.
+ * 5. Eligibility check; bail out (and leave state DISABLED) if pk is not
+ *    a supported shape.
+ * 6. Heap scan; for each tuple, allocate GlobalEntry + flatten payload,
+ *    take partition lock, push at bucket head.
+ * 7. write_barrier; state -> ENABLED.
+ * 8. Release build_lock.
+ */
 void
 RelationRowCacheLoadRelation(Relation rel)
 {
 	Oid			relid = RelationGetRelid(rel);
-	RowCacheRelEntry *entry;
-	bool		found;
-	uint32		hashcode;
-	LWLock	   *partlock;
-	BlockNumber nblocks;
-	TidBlockEntry *blocks;
-	dsa_pointer blocks_dp;
+	RelMeta    *rm;
+	AttrNumber	pkey_attno;
+	int16		pkey_typlen = 0;
+	bool		pkey_byval = false;
+	TableScanDesc scan;
+	TupleTableSlot *slot;
+	bool		pushed_snapshot = false;
+	uint64		rel_gen_at_load;
 
-	if (RowCacheRelHash == NULL)
+	if (RowCacheCtl == NULL)
 		elog(ERROR, "row cache shared memory not initialized");
 
 	EnsureRowCacheDsa();
 
-	hashcode = RowCacheRelHashCode(&relid);
-	partlock = RowCacheRelPartitionLock(hashcode);
+	rm = AllocateOrFindRelMeta(relid);
+	if (rm == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+				 errmsg("row cache: out of relation slots"),
+				 errdetail_internal("row_cache.max_relations = %d",
+									ROW_CACHE_MAX_RELATIONS)));
 
-	LWLockAcquire(partlock, LW_EXCLUSIVE);
-
-	entry = hash_search_with_hash_value(RowCacheRelHash, &relid, hashcode,
-										HASH_ENTER, &found);
-	if (!found)
-	{
-		LWLockInitialize(&entry->rel_lock, LWTRANCHE_ROW_CACHE_REL);
-		pg_atomic_init_u32(&entry->state, ROW_CACHE_STATE_UNLOADED);
-		entry->blocks_dp = InvalidDsaPointer;
-		entry->nblocks = 0;
-		entry->natts = 0;
-		entry->pkey_idx_dp = InvalidDsaPointer;
-		entry->pkey_attno = 0;
-	}
-
-	/* Acquire rel_lock while still holding partition lock to prevent a
-	 * concurrent Drop from sneaking in between the hash lookup and our
-	 * serialisation lock. */
-	LWLockAcquire(&entry->rel_lock, LW_EXCLUSIVE);
-	LWLockRelease(partlock);
+	LWLockAcquire(&rm->build_lock, LW_EXCLUSIVE);
 
 	/*
-	 * If a previous load exists, tear it down.  The caller contract
-	 * guarantees no readers are inside the old block array, so we do not
-	 * need to drain pin counts.
-	 *
-	 *   1. Flip state=UNLOADED so any late reader bails out on the
-	 *      atomic state check.
-	 *   2. Publish the state change with a memory barrier before freeing.
-	 *   3. Destroy the old flat block array.
+	 * Idempotent reload: if already ENABLED, drop the previous contents
+	 * first.  This keeps Load(rel) safe to call twice without leaving
+	 * duplicate entries in the global hash.
 	 */
-	if (pg_atomic_read_u32(&entry->state) == ROW_CACHE_STATE_LOADED)
+	if (pg_atomic_read_u32(&rm->state) == RELMETA_ENABLED)
 	{
-		pg_atomic_write_u32(&entry->state, ROW_CACHE_STATE_UNLOADED);
+		pg_atomic_write_u32(&rm->state, RELMETA_DISABLED);
+		pg_atomic_fetch_add_u64(&rm->rel_gen, 1);
 		pg_memory_barrier();
-
-		if (DsaPointerIsValid(entry->blocks_dp))
-			RowCacheDestroyBlocks(entry);
-		if (DsaPointerIsValid(entry->pkey_idx_dp))
-		{
-			RowCachePkeyIndexFree(LocalDsa, entry->pkey_idx_dp);
-			entry->pkey_idx_dp = InvalidDsaPointer;
-			entry->pkey_attno = 0;
-		}
+		DropAllEntriesForRelid(relid);
 	}
 
-	nblocks = RelationGetNumberOfBlocks(rel);
+	pg_atomic_write_u32(&rm->state, RELMETA_LOADING);
 
-	if (nblocks > 0)
+	pkey_attno = CheckEligibleByvalPkey(rel, &pkey_typlen, &pkey_byval);
+	if (pkey_attno == 0)
 	{
-		Size		bytes = mul_size(sizeof(TidBlockEntry), (Size) nblocks);
+		/*
+		 * Phase 1 limitation: composite / byref / no-pk tables are not
+		 * cacheable.  Leave the slot in DISABLED state and reset the
+		 * descriptor so a future Phase 4 reload finds a clean slate.
+		 */
+		rm->pkey_attno = 0;
+		rm->pkey_typlen = 0;
+		rm->pkey_byval = false;
+		pg_atomic_write_u32(&rm->state, RELMETA_DISABLED);
+		LastLookupRelMeta = NULL;
+		LastLookupRelid = InvalidOid;
+		LWLockRelease(&rm->build_lock);
+		return;
+	}
 
-		blocks_dp = dsa_allocate0(LocalDsa, bytes);
-		if (!DsaPointerIsValid(blocks_dp))
+	rm->pkey_attno = pkey_attno;
+	rm->pkey_typlen = pkey_typlen;
+	rm->pkey_byval = pkey_byval;
+	rel_gen_at_load = pg_atomic_read_u64(&rm->rel_gen);
+
+	if (!ActiveSnapshotSet())
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		pushed_snapshot = true;
+	}
+
+	scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL);
+	slot = table_slot_create(rel, NULL);
+
+	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+	{
+		Datum		pkey_datum;
+		uint64		pkey_packed;
+		uint32		pkey_hash;
+		uint32		bucket;
+		dsa_pointer payload_dp;
+		dsa_pointer entry_dp;
+		GlobalEntry *e;
+		LWLock	   *part;
+
+		slot_getallattrs(slot);
+		if (slot->tts_isnull[pkey_attno - 1])
+			continue;				/* defensive; pk columns are NOT NULL */
+
+		pkey_datum = slot->tts_values[pkey_attno - 1];
+		pkey_packed = PackPkeyDatum(pkey_datum, pkey_typlen);
+		pkey_hash = ComputePkeyHash(pkey_packed);
+		bucket = pkey_hash & ROW_CACHE_BUCKET_MASK;
+
+		/* Flatten and allocate before taking the partition lock. */
+		payload_dp = RowCacheFlattenTuple(LocalDsa, slot);
+		if (!DsaPointerIsValid(payload_dp))
+			continue;
+
+		entry_dp = dsa_allocate(LocalDsa, sizeof(GlobalEntry));
+		if (!DsaPointerIsValid(entry_dp))
+		{
+			dsa_free(LocalDsa, payload_dp);
 			ereport(ERROR,
 					(errcode(ERRCODE_OUT_OF_MEMORY),
 					 errmsg("out of memory"),
-					 errdetail_internal("row cache: cannot allocate TidBlockEntry array.")));
-		blocks = (TidBlockEntry *) dsa_get_address(LocalDsa, blocks_dp);
-	}
-	else
-	{
-		blocks_dp = InvalidDsaPointer;
-		blocks = NULL;
-	}
-
-	entry->natts = RelationGetDescr(rel)->natts;
-
-	{
-		TableScanDesc scan;
-		TupleTableSlot *slot;
-		bool		pushed_snapshot = false;
-		dsa_pointer pkey_idx_dp = InvalidDsaPointer;
-		AttrNumber	pkey_attno = 0;
-		uint64		row_estimate;
-
-		if (!ActiveSnapshotSet())
-		{
-			PushActiveSnapshot(GetTransactionSnapshot());
-			pushed_snapshot = true;
+					 errdetail_internal("row cache: cannot allocate GlobalEntry")));
 		}
+		e = (GlobalEntry *) dsa_get_address(LocalDsa, entry_dp);
+		e->relid = relid;
+		e->pkey_hash = pkey_hash;
+		e->pkey_val = pkey_packed;
+		e->rel_gen_at_load = rel_gen_at_load;
+		pg_atomic_init_u32(&e->state, ROW_CACHE_ENTRY_FRESH);
+		ItemPointerCopy(&slot->tts_tid, &e->tid);
+		e->payload_dp = payload_dp;
+		e->next_dp = InvalidDsaPointer;
 
-		/*
-		 * Sizing the pkey index.  Prefer rel->rd_rel->reltuples when
-		 * positive (post-ANALYZE estimate); otherwise fall back to a
-		 * crude upper bound from the heap-page count (best-effort).
-		 * Over-sizing is harmless; under-sizing degrades to long probe
-		 * chains but never fails (we cap at PKEY_MAX_BUCKETS internally).
-		 */
-		row_estimate = (rel->rd_rel->reltuples > 0)
-			? (uint64) rel->rd_rel->reltuples
-			: (uint64) nblocks * 100;
-
-		pkey_idx_dp = RowCachePkeyIndexAlloc(rel, LocalDsa,
-											 row_estimate, &pkey_attno);
-
-		scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL);
-		slot = table_slot_create(rel, NULL);
-
-		while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
-		{
-			RowCacheStoreTupleShared(blocks, nblocks, slot);
-
-			/*
-			 * Build the pkey -> TID mapping.  Pkey columns are NOT NULL
-			 * by definition; we still defensively check tts_isnull[]
-			 * before treating the Datum as a valid key.
-			 */
-			if (DsaPointerIsValid(pkey_idx_dp))
-			{
-				int			zb_attno = pkey_attno - 1;
-
-				/* slot_getallattrs already invoked inside Flatten */
-				if (!slot->tts_isnull[zb_attno])
-					RowCachePkeyIndexInsert(LocalDsa, pkey_idx_dp,
-											slot->tts_values[zb_attno],
-											&slot->tts_tid);
-			}
-		}
-
-		table_endscan(scan);
-		ExecDropSingleTupleTableSlot(slot);
-
-		if (pushed_snapshot)
-			PopActiveSnapshot();
-
-		entry->pkey_idx_dp = pkey_idx_dp;
-		entry->pkey_attno = pkey_attno;
+		part = PartitionLockForBucket(bucket);
+		LWLockAcquire(part, LW_EXCLUSIVE);
+		BucketInsertHead(bucket, entry_dp, e);
+		LWLockRelease(part);
 	}
 
-	/*
-	 * Publish: write barrier ensures blocks_dp / nblocks / natts are visible
-	 * to any reader that observes state=LOADED.
-	 */
-	entry->blocks_dp = blocks_dp;
-	entry->nblocks = nblocks;
+	table_endscan(scan);
+	ExecDropSingleTupleTableSlot(slot);
+
+	if (pushed_snapshot)
+		PopActiveSnapshot();
+
+	/* Publish ENABLED with a write barrier. */
 	pg_write_barrier();
-	pg_atomic_write_u32(&entry->state, ROW_CACHE_STATE_LOADED);
+	pg_atomic_write_u32(&rm->state, RELMETA_ENABLED);
 
-	/*
-	 * Invalidate this backend's last-used cache.  If we just reloaded the
-	 * same relation the stale pointer is still valid (entries never move),
-	 * but forcing a fresh lookup on the next read ensures LastCachedEntry
-	 * is always set via the slow path after a Load, which also re-populates
-	 * it correctly for callers that call Load then immediately Read.
-	 */
-	LastCachedEntry = NULL;
-	LastCachedRelid = InvalidOid;
+	/* Invalidate this backend's sticky cache to force a fresh lookup. */
+	LastLookupRelMeta = NULL;
+	LastLookupRelid = InvalidOid;
 
-	LWLockRelease(&entry->rel_lock);
+	LWLockRelease(&rm->build_lock);
 }
 
 /* ----------------------------------------------------------------
  * Public API: Drop
+ * ----------------------------------------------------------------
  *
- * Lock order: partition_lock(EXCLUSIVE) → rel_lock(EXCLUSIVE).
- * partition_lock is released after rel_lock is acquired (same pattern
- * as Load).  The entry is NOT removed from RowCacheRelHash: the slot
- * (and its embedded rel_lock) stays alive for the lifetime of the
- * postmaster.  Read paths take partition_lock(SHARED) on each lookup.
+ * 1. Find RelMeta; bail out if none.
+ * 2. build_lock EXCLUSIVE.
+ * 3. State -> DISABLED, bump rel_gen.
+ * 4. Sweep every bucket: under partition lock, unlink + dsa_free all
+ *    entries whose relid matches.
+ * 5. Release build_lock.
  *
- * Caller contract: no readers may be executing concurrently with Drop.
- * (See RowCacheRelEntry for the full lifetime contract.)
- *
- * Concurrency:
- *   1. Acquire rel_lock EXCLUSIVE (serialises with Load / other Drop).
- *   2. Flip state to UNLOADED — any late reader that samples state
- *      afterwards bails out before touching the block array.
- *   3. Publish the state change with a memory barrier before freeing.
- *   4. Destroy the block array.
- * ---------------------------------------------------------------- */
+ * Phase 1 frees DSA storage immediately, relying on the V3 caller
+ * contract (no readers concurrent with Drop).  Phase 2 will defer frees
+ * via EBR.
+ */
+static void
+DropAllEntriesForRelid(Oid relid)
+{
+	dsa_pointer *heads;
+
+	if (!DsaPointerIsValid(RowCacheCtl->hash_buckets_dp))
+		return;
+
+	heads = BucketHeads();
+
+	for (uint32 b = 0; b < ROW_CACHE_HASH_BUCKETS; b++)
+	{
+		LWLock	   *part = PartitionLockForBucket(b);
+		dsa_pointer prev_dp = InvalidDsaPointer;
+		dsa_pointer cur_dp;
+		GlobalEntry *prev = NULL;
+
+		LWLockAcquire(part, LW_EXCLUSIVE);
+
+		cur_dp = heads[b];
+		while (DsaPointerIsValid(cur_dp))
+		{
+			GlobalEntry *e = (GlobalEntry *) dsa_get_address(LocalDsa, cur_dp);
+			dsa_pointer next_dp = e->next_dp;
+
+			if (e->relid == relid)
+			{
+				/* Unlink. */
+				if (DsaPointerIsValid(prev_dp))
+					prev->next_dp = next_dp;
+				else
+					heads[b] = next_dp;
+
+				/* Free payload + entry.  No EBR yet (Phase 2). */
+				if (DsaPointerIsValid(e->payload_dp))
+					dsa_free(LocalDsa, e->payload_dp);
+				dsa_free(LocalDsa, cur_dp);
+
+				cur_dp = next_dp;
+				/* prev / prev_dp unchanged. */
+			}
+			else
+			{
+				prev_dp = cur_dp;
+				prev = e;
+				cur_dp = next_dp;
+			}
+		}
+
+		LWLockRelease(part);
+	}
+}
 
 void
 RelationRowCacheDropRelation(Oid relid)
 {
-	RowCacheRelEntry *entry;
-	uint32		hashcode;
-	LWLock	   *partlock;
+	RelMeta    *rm;
 
-	if (RowCacheRelHash == NULL)
+	if (RowCacheCtl == NULL)
+		return;
+
+	rm = FindRelMeta(relid);
+	if (rm == NULL)
 		return;
 
 	EnsureRowCacheDsa();
 
-	hashcode = RowCacheRelHashCode(&relid);
-	partlock = RowCacheRelPartitionLock(hashcode);
+	LWLockAcquire(&rm->build_lock, LW_EXCLUSIVE);
 
-	LWLockAcquire(partlock, LW_EXCLUSIVE);
-
-	entry = hash_search_with_hash_value(RowCacheRelHash, &relid, hashcode,
-										HASH_FIND, NULL);
-	if (entry == NULL ||
-		pg_atomic_read_u32(&entry->state) != ROW_CACHE_STATE_LOADED)
+	if (pg_atomic_read_u32(&rm->state) == RELMETA_DISABLED)
 	{
-		LWLockRelease(partlock);
+		LWLockRelease(&rm->build_lock);
 		return;
 	}
 
-	/* Lock order: partition_lock → rel_lock. */
-	LWLockAcquire(&entry->rel_lock, LW_EXCLUSIVE);
-	LWLockRelease(partlock);
+	pg_atomic_write_u32(&rm->state, RELMETA_DISABLED);
+	pg_atomic_fetch_add_u64(&rm->rel_gen, 1);
+	pg_memory_barrier();
 
-	/*
-	 * Double-check state under rel_lock: another Drop may have raced with
-	 * us and already torn the cache down.
-	 */
-	if (pg_atomic_read_u32(&entry->state) == ROW_CACHE_STATE_LOADED)
-	{
-		/* Publish UNLOADED before freeing. */
-		pg_atomic_write_u32(&entry->state, ROW_CACHE_STATE_UNLOADED);
-		pg_memory_barrier();
+	DropAllEntriesForRelid(relid);
 
-		if (DsaPointerIsValid(entry->blocks_dp))
-			RowCacheDestroyBlocks(entry);
-		if (DsaPointerIsValid(entry->pkey_idx_dp))
-		{
-			RowCachePkeyIndexFree(LocalDsa, entry->pkey_idx_dp);
-			entry->pkey_idx_dp = InvalidDsaPointer;
-			entry->pkey_attno = 0;
-		}
-	}
+	rm->pkey_attno = 0;
+	rm->pkey_typlen = 0;
+	rm->pkey_byval = false;
 
-	/*
-	 * Invalidate this backend's last-used cache so the next read goes
-	 * through the slow path and gets the correct (unloaded) state.
-	 */
-	LastCachedEntry = NULL;
-	LastCachedRelid = InvalidOid;
+	LastLookupRelMeta = NULL;
+	LastLookupRelid = InvalidOid;
 
-	LWLockRelease(&entry->rel_lock);
+	LWLockRelease(&rm->build_lock);
 }
 
 /* ----------------------------------------------------------------
- * Public API: FillSlot (simple cache lookup + slot fill)
+ * Public API: PkeyFetch
+ * ----------------------------------------------------------------
  *
- * Read-path concurrency (no rel_lock, no pin!):
- *   1. Locate the entry (backend-local fast path, or partition_lock(SHARED)
- *      + HASH_FIND on miss).
- *   2. Verify entry->relid matches and state == LOADED.  Both checks are
- *      atomic scalar reads — no RMWs, no locks.
- *   3. Access the flat block array / flat tuple.
+ * Read path is lock-free (Phase 1 contract).  See section 4.1 of the
+ * design doc for the protocol; Phase 1 omits the EBR enter/exit calls,
+ * everything else is identical:
  *
- * Safety relies on the caller contract (see RowCacheRelEntry): Load and
- * Drop never run concurrently with readers, so the block array cannot be
- * freed under our feet.
- * ---------------------------------------------------------------- */
-
-/*
- * RowCacheLookupRelEntry -- locate the hash entry for a relation.
- *
- * Hot path: if this backend already looked up the same relid in a prior call
- * the entry pointer is cached in LastCachedEntry, bypassing the partition lock
- * entirely.  The cached pointer is valid for the lifetime of the postmaster
- * (entries are never HASH_REMOVE'd), so no additional lifetime check is needed
- * here; callers validate entry->relid and entry->state atomically before use.
+ *   1. Sticky lookup -> RelMeta.
+ *   2. Atomic-read state; bail if not ENABLED.
+ *   3. Pack pkey, compute hash, walk bucket chain.
+ *   4. If found: validate rel_gen and entry state, do MVCC check, fill slot.
  */
-static RowCacheRelEntry *
-RowCacheLookupRelEntry(Oid relid)
-{
-	RowCacheRelEntry *entry;
-	uint32		hashcode;
-	LWLock	   *partlock;
-
-	/* Fast path: same relation as last lookup — skip partition lock. */
-	if (relid == LastCachedRelid && LastCachedEntry != NULL)
-		return LastCachedEntry;
-
-	/* Slow path: partition-locked hash lookup. */
-	hashcode = RowCacheRelHashCode(&relid);
-	partlock = RowCacheRelPartitionLock(hashcode);
-
-	LWLockAcquire(partlock, LW_SHARED);
-	entry = hash_search_with_hash_value(RowCacheRelHash, &relid,
-										hashcode, HASH_FIND, NULL);
-	LWLockRelease(partlock);
-
-	/* Cache the result (even NULL, but only if OidIsValid to avoid confusion). */
-	if (entry != NULL)
-	{
-		LastCachedRelid = relid;
-		LastCachedEntry = entry;
-	}
-
-	return entry;
-}
-
-/*
- * Validate a looked-up entry for the read path.  Returns true if the
- * entry is loaded for the requested relid.  Both checks are plain
- * atomic/scalar reads — no RMWs, no locks.
- */
-static inline bool
-RowCacheEntryIsLoadedFor(RowCacheRelEntry *entry, Oid relid)
-{
-	return entry->relid == relid &&
-		pg_atomic_read_u32(&entry->state) == ROW_CACHE_STATE_LOADED;
-}
-
-bool
-RelationRowCacheFillSlot(TupleTableSlot *slot)
-{
-	RowCacheRelEntry *entry;
-	FlatCachedTuple *flat;
-	Oid			relid;
-
-	Assert(slot != NULL);
-	if (RowCacheRelHash == NULL)
-		return false;
-	if (!OidIsValid(slot->tts_tableOid) || !ItemPointerIsValid(&slot->tts_tid))
-		return false;
-
-	relid = slot->tts_tableOid;
-
-	entry = RowCacheLookupRelEntry(relid);
-	if (entry == NULL || !RowCacheEntryIsLoadedFor(entry, relid))
-		return false;
-
-	flat = RowCacheLookupFlat(entry, &slot->tts_tid);
-	if (flat == NULL)
-		return false;
-
-	return RowCacheUnflattenToSlot(flat, slot->tts_tableOid,
-								   &slot->tts_tid, slot);
-}
-
-/* ----------------------------------------------------------------
- * Public API: FetchWithVisibility (MVCC-aware cache lookup)
- *
- * Same lock protocol as FillSlot.
- * ---------------------------------------------------------------- */
-
-bool
-RelationRowCacheFetchWithVisibility(Oid relid,
-									ItemPointer tid,
-									Snapshot snapshot,
-									TupleTableSlot *slot,
-									bool *is_visible,
-									bool *has_hot_chain)
-{
-	RowCacheRelEntry *entry;
-	FlatCachedTuple *flat;
-	HeapTupleData htup;
-
-	Assert(slot != NULL && is_visible != NULL && has_hot_chain != NULL);
-	*is_visible = false;
-	*has_hot_chain = false;
-
-	if (RowCacheRelHash == NULL)
-		return false;
-	if (!OidIsValid(relid) || !ItemPointerIsValid(tid))
-		return false;
-
-	entry = RowCacheLookupRelEntry(relid);
-	if (entry == NULL || !RowCacheEntryIsLoadedFor(entry, relid))
-		return false;
-
-	flat = RowCacheLookupFlat(entry, tid);
-	if (flat == NULL)
-		return false;
-
-	htup.t_data = (HeapTupleHeader) FLAT_TUPLE_HTUP_DATA(flat);
-	htup.t_len = flat->htup_len;
-	htup.t_tableOid = relid;
-	ItemPointerCopy(tid, &htup.t_self);
-
-	*has_hot_chain = HeapTupleIsHotUpdated(&htup);
-	*is_visible = RowCacheTupleVisibleMVCC(&htup, snapshot);
-
-	if (*is_visible)
-		RowCacheUnflattenToSlot(flat, relid, tid, slot);
-
-	return true;
-}
-
-/* ----------------------------------------------------------------
- * Public API: PkeyFetch -- pkey-driven fast path
- *
- * Looks up `pkey_val` in the relation's PkeyIndex (if any) to obtain a
- * TID, then performs the same MVCC visibility + unflatten dance as
- * FetchWithVisibility.
- *
- * Returns true if a matching cache entry exists (regardless of
- * visibility); the caller must inspect *is_visible to decide whether
- * to use `slot`.  Returns false when:
- *   - The relation has no cache entry / not loaded
- *   - The relation has no pkey index built (composite, non-byval, etc.)
- *   - The pkey value is not present in the index
- * In all "false" cases the caller should fall back to the regular
- * IndexScan path (which still benefits from the TID-cache hook in
- * table_index_fetch_tuple).
- *
- * Concurrency: identical to FetchWithVisibility — pure reads, no
- * locks.  Caller contract requires that no concurrent Load/Drop runs.
- * ---------------------------------------------------------------- */
 bool
 RelationRowCachePkeyFetch(Oid relid,
 						  Datum pkey_val,
@@ -846,50 +819,67 @@ RelationRowCachePkeyFetch(Oid relid,
 						  bool *is_visible,
 						  bool *has_hot_chain)
 {
-	RowCacheRelEntry *entry;
-	ItemPointerData tid;
+	RelMeta    *rm;
+	uint64		packed;
+	uint32		hash;
+	uint32		bucket;
+	GlobalEntry *entry;
 	FlatCachedTuple *flat;
 	HeapTupleData htup;
+	ItemPointerData tid;
 
-	Assert(slot != NULL && is_visible != NULL && has_hot_chain != NULL);
+	Assert(is_visible != NULL && has_hot_chain != NULL);
 	*is_visible = false;
 	*has_hot_chain = false;
 
-	if (RowCacheRelHash == NULL)
-		return false;
-	if (!OidIsValid(relid))
+	if (RowCacheCtl == NULL || !OidIsValid(relid))
 		return false;
 	if (!IsMVCCSnapshot(snapshot))
 		return false;
 
-	entry = RowCacheLookupRelEntry(relid);
-	if (entry == NULL || !RowCacheEntryIsLoadedFor(entry, relid))
-		return false;
-	if (!DsaPointerIsValid(entry->pkey_idx_dp))
-		return false;
+	/* Sticky lookup. */
+	if (relid == LastLookupRelid)
+		rm = LastLookupRelMeta;
+	else
+	{
+		rm = FindRelMeta(relid);
+		LastLookupRelid = relid;
+		LastLookupRelMeta = rm;
+	}
 
-	/*
-	 * Attach this backend to the global row-cache DSA segment if it has
-	 * not done so yet.  LocalDsa is backend-local and starts NULL in every
-	 * fresh connection; the first cache touch must initialise it before
-	 * any dsa_get_address() call, otherwise dsa_get_address(NULL, ...)
-	 * dereferences a null area pointer and segfaults.
-	 *
-	 * Old read paths (FillSlot / FetchWithVisibility) call
-	 * RowCacheLookupFlat() first, which calls EnsureRowCacheDsa() on
-	 * entry, so they were implicitly safe.  PkeyFetch performs the
-	 * pkey-index lookup BEFORE LookupFlat, so we must ensure DSA here.
-	 */
+	if (rm == NULL ||
+		pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
+		return false;
+	pg_read_barrier();
+
 	EnsureRowCacheDsa();
 
-	if (!RowCachePkeyIndexLookup(LocalDsa, entry->pkey_idx_dp,
-								 pkey_val, &tid))
+	packed = PackPkeyDatum(pkey_val, rm->pkey_typlen);
+	hash = ComputePkeyHash(packed);
+	bucket = hash & ROW_CACHE_BUCKET_MASK;
+
+	entry = BucketLookup(bucket, relid, packed, NULL);
+	if (entry == NULL)
 		return false;
 
-	flat = RowCacheLookupFlat(entry, &tid);
-	if (flat == NULL)
+	/* Validate entry: must be FRESH and same generation. */
+	if (pg_atomic_read_u32(&entry->state) != ROW_CACHE_ENTRY_FRESH)
 		return false;
+	if (entry->rel_gen_at_load != pg_atomic_read_u64(&rm->rel_gen))
+		return false;
+	pg_read_barrier();
 
+	if (!DsaPointerIsValid(entry->payload_dp))
+		return false;
+	flat = (FlatCachedTuple *) dsa_get_address(LocalDsa, entry->payload_dp);
+
+	/*
+	 * Reconstruct an in-memory HeapTuple pointing into the flat payload
+	 * so we can run the MVCC visibility check.  The TID is recovered
+	 * from the embedded HeapTupleHeader (set when we flattened) for the
+	 * has_hot_chain / slot fill.
+	 */
+	ItemPointerCopy(&entry->tid, &tid);
 	htup.t_data = (HeapTupleHeader) FLAT_TUPLE_HTUP_DATA(flat);
 	htup.t_len = flat->htup_len;
 	htup.t_tableOid = relid;
@@ -908,24 +898,63 @@ RelationRowCachePkeyFetch(Oid relid,
 	return true;
 }
 
-/*
- * Return the 1-based pkey attno if a pkey index is currently loaded for
- * the given relation, or 0 otherwise.  Cheap read-only check intended
- * for executor plan-init to decide whether to wire up the fast path.
- */
+/* ----------------------------------------------------------------
+ * Public API: PkeyAttno
+ * ---------------------------------------------------------------- */
+
 AttrNumber
 RelationRowCachePkeyAttno(Oid relid)
 {
-	RowCacheRelEntry *entry;
+	RelMeta    *rm;
 
-	if (RowCacheRelHash == NULL || !OidIsValid(relid))
+	if (RowCacheCtl == NULL || !OidIsValid(relid))
 		return 0;
 
-	entry = RowCacheLookupRelEntry(relid);
-	if (entry == NULL || !RowCacheEntryIsLoadedFor(entry, relid))
-		return 0;
-	if (!DsaPointerIsValid(entry->pkey_idx_dp))
+	if (relid == LastLookupRelid)
+		rm = LastLookupRelMeta;
+	else
+	{
+		rm = FindRelMeta(relid);
+		LastLookupRelid = relid;
+		LastLookupRelMeta = rm;
+	}
+
+	if (rm == NULL ||
+		pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
 		return 0;
 
-	return entry->pkey_attno;
+	return rm->pkey_attno;
+}
+
+/* ----------------------------------------------------------------
+ * Legacy TID-keyed API: stubs.  Phase 1 has no TID-keyed path; the
+ * tableam.h hook sites still call these but get a clean "miss" so they
+ * fall through to the native AM path.
+ * ---------------------------------------------------------------- */
+
+bool
+RelationRowCacheFillSlot(TupleTableSlot *slot)
+{
+	(void) slot;
+	return false;
+}
+
+bool
+RelationRowCacheFetchWithVisibility(Oid relid,
+									ItemPointer tid,
+									Snapshot snapshot,
+									TupleTableSlot *slot,
+									bool *is_visible,
+									bool *has_hot_chain)
+{
+	(void) relid;
+	(void) tid;
+	(void) snapshot;
+	(void) slot;
+
+	if (is_visible)
+		*is_visible = false;
+	if (has_hot_chain)
+		*has_hot_chain = false;
+	return false;
 }

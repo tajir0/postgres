@@ -1,3 +1,34 @@
+/*-------------------------------------------------------------------------
+ *
+ * relation_row_cache.h
+ *	  V4 Phase 1 row cache: single flat global hash (relid, pkey) -> entry
+ *	  + fixed-size RelMeta array for per-relation metadata.
+ *
+ * Phase 1 scope:
+ *   - Global chained hash in DSA, 128 partition locks for write serialization.
+ *   - RelMeta array (64 slots) with DISABLED / LOADING / ENABLED state.
+ *   - Pkey serialization: single-column, pass-by-value only (int2/int4/int8/oid).
+ *     Composite / byref pks bail out at Load time; design leaves room for
+ *     Phase 4 extensions.
+ *   - IndexNext hook (in nodeIndexscan.c) calls RelationRowCachePkeyFetch.
+ *   - FlatCachedTuple (from tid_row_cache.{c,h}) is reused as the payload.
+ *
+ * Phase 1 lifetime contract (same as V3):
+ *   Callers must guarantee no readers run concurrently with Load / Drop.
+ *   This phase has no EBR (deferred to Phase 2): Drop frees DSA entries
+ *   immediately, relying on the caller contract to avoid use-after-free.
+ *
+ * Phase 1 OUT of scope (left as stubs):
+ *   - EBR / retire-list / bgworker GC (Phase 2)
+ *   - DML hooks (heap_insert/update/delete) (Phase 3)
+ *   - Composite / byref pk (Phase 4)
+ *
+ * Legacy V1/V2 TID-keyed API: RelationRowCacheFillSlot /
+ * RelationRowCacheFetchWithVisibility are kept as stubs returning false so
+ * existing tableam.h call sites compile unchanged.
+ *
+ *-------------------------------------------------------------------------
+ */
 #ifndef RELATION_ROW_CACHE_H
 #define RELATION_ROW_CACHE_H
 
@@ -11,36 +42,17 @@
 extern Size RowCacheShmemSize(void);
 extern void RowCacheShmemInit(void);
 
-/* Load all visible tuples of a relation into the shared row cache. */
+/* Load / Drop a relation's cache.  See lifetime contract above. */
 extern void RelationRowCacheLoadRelation(Relation rel);
-/* Fill slot from the shared cache using slot->tts_tableOid + slot->tts_tid. */
-extern bool RelationRowCacheFillSlot(TupleTableSlot *slot);
-/*
- * Lookup (relid, tid) in the shared cache and report visibility / HOT-chain
- * status.  Returns true if the cache entry was found; *is_visible and
- * *has_hot_chain carry the MVCC results.
- */
-extern bool RelationRowCacheFetchWithVisibility(Oid relid,
-												ItemPointer tid,
-												Snapshot snapshot,
-												TupleTableSlot *slot,
-												bool *is_visible,
-												bool *has_hot_chain);
-/* Drop the shared cache for a relation. */
 extern void RelationRowCacheDropRelation(Oid relid);
 
 /*
- * Pkey-driven fast path: lookup a tuple by primary-key value, bypassing
- * the btree.  Only succeeds when the relation was loaded with a pkey
- * index (single-column, byval primary key) and the entry is in the
- * LOADED state.
+ * V4 pkey-driven fast path (used by nodeIndexscan.c).
+ * On hit returns true; *is_visible tells the caller whether the tuple was
+ * MVCC-visible to `snapshot`.  On not-loaded / not-found / not-eligible
+ * returns false (caller must fall back to btree).
  *
- * On hit: fills `slot` with the visible tuple and returns true.
- * On miss / not eligible / not visible: returns false.  Caller should
- * fall back to the regular IndexScan + TID-cache path.
- *
- * `pkey_val` must be a non-null Datum of the same type as the
- * relation's primary key column.
+ * `pkey_val` is a non-null Datum of the relation's pkey column type.
  */
 extern bool RelationRowCachePkeyFetch(Oid relid,
 									  Datum pkey_val,
@@ -50,11 +62,24 @@ extern bool RelationRowCachePkeyFetch(Oid relid,
 									  bool *has_hot_chain);
 
 /*
- * Return the 1-based attno of the relation's pkey column if the cache
- * entry has a pkey index loaded.  Returns 0 if no entry, not loaded, or
- * no pkey index.  Used by the executor at plan-init time to decide
- * whether to enable the pkey fast path for a given IndexScan.
+ * Return the 1-based pkey attno currently registered for this relation
+ * (matching the cache's pkey column).  Returns 0 if the relation is not
+ * cached, not loaded, or its cache uses a key shape this Phase doesn't
+ * support.  Cheap; safe on the executor hot path.
  */
 extern AttrNumber RelationRowCachePkeyAttno(Oid relid);
+
+/*
+ * Legacy TID-keyed API.  V4 Phase 1 has no TID-keyed path; these are
+ * stubs returning false so existing tableam.h hook sites compile and
+ * harmlessly fall through to the native path.
+ */
+extern bool RelationRowCacheFillSlot(TupleTableSlot *slot);
+extern bool RelationRowCacheFetchWithVisibility(Oid relid,
+												ItemPointer tid,
+												Snapshot snapshot,
+												TupleTableSlot *slot,
+												bool *is_visible,
+												bool *has_hot_chain);
 
 #endif							/* RELATION_ROW_CACHE_H */
