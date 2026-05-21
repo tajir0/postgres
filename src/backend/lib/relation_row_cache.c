@@ -235,6 +235,158 @@ RowCacheComputeSafeEpoch(void)
 		: oldest;
 }
 
+/* ----------------------------------------------------------------
+ * Phase 2 (2/4): Backend-local retire list
+ *
+ * Writers (DML hooks, Drop) do not call dsa_free directly.  Instead they
+ * call RowCacheEpochRetire with up to three DSA pointers (payload, entry,
+ * pkey buffer), which pushes a RetireNode onto a backend-local list along
+ * with a snapshot of global_epoch.
+ *
+ * Backend-local reclaim (RowCacheLocalGC) consumes safe_epoch_published
+ * (set by the GC bgworker — future commit) and dsa_free's every node
+ * whose recorded epoch is strictly less than safe_epoch.  This decouples
+ * write throughput from GC latency: writers never block waiting for
+ * readers to drain.
+ *
+ * Memory:
+ *   - RetireNodes are palloc'd in TopMemoryContext so they survive
+ *     across statements / transactions until LocalGC reclaims them.
+ *   - dp[0..2] hold up to three DSA pointers per node.  Unused slots
+ *     are InvalidDsaPointer and skipped at free time.  This 3-slot
+ *     layout matches the common case (DELETE of a single entry retires
+ *     payload + entry + pkey buffer in one node).
+ *
+ * Epoch bumping:
+ *   We bump the global epoch opportunistically every RETIRE_BUMP_THRESHOLD
+ *   retires.  Bumping too aggressively contends fetch_add on the shared
+ *   counter; bumping too lazily lets retire lists grow before any GC can
+ *   make progress.  64 strikes a reasonable balance for OLTP workloads.
+ *
+ * Backend exit:
+ *   On crash / disconnect the retire list is leaked along with the
+ *   backend's palloc memory; the underlying DSA blocks are likewise
+ *   leaked.  Phase 2 (3/4) will install before_shmem_exit cleanup to
+ *   move the list to a global orphan list reclaimable by the GC worker.
+ * ---------------------------------------------------------------- */
+
+#define RETIRE_BUMP_THRESHOLD	64
+#define RETIRE_NODE_SLOTS		3
+
+typedef struct RetireNode
+{
+	uint64				epoch;
+	dsa_pointer			dp[RETIRE_NODE_SLOTS];
+	struct RetireNode  *next;
+} RetireNode;
+
+static RetireNode  *MyRetireHead = NULL;
+static size_t		MyRetireListLen = 0;
+
+/* Forward-declared here so RowCacheLocalGC can call it before the main
+ * forward-declaration block (which lives further down with the rest of
+ * the V4 Phase 1 helpers). */
+static void EnsureRowCacheDsa(void);
+
+void
+RowCacheEpochRetire(dsa_pointer dp_a, dsa_pointer dp_b, dsa_pointer dp_c)
+{
+	RetireNode	   *n;
+	MemoryContext	old;
+
+	Assert(RowCacheCtl != NULL);
+
+	/* Nothing to retire — skip allocation. */
+	if (!DsaPointerIsValid(dp_a) &&
+		!DsaPointerIsValid(dp_b) &&
+		!DsaPointerIsValid(dp_c))
+		return;
+
+	old = MemoryContextSwitchTo(TopMemoryContext);
+	n = (RetireNode *) palloc(sizeof(RetireNode));
+	MemoryContextSwitchTo(old);
+
+	n->epoch = pg_atomic_read_u64(&RowCacheCtl->global_epoch);
+	n->dp[0] = dp_a;
+	n->dp[1] = dp_b;
+	n->dp[2] = dp_c;
+	n->next = MyRetireHead;
+	MyRetireHead = n;
+	MyRetireListLen++;
+
+	/*
+	 * Opportunistic global_epoch bump.  Not strictly required (the GC
+	 * worker bumps on its own schedule) but lets a hot writer drive the
+	 * counter forward so its own retires can be reclaimed sooner.
+	 *
+	 * fetch_add returns the prior value; we discard it.
+	 */
+	if (MyRetireListLen % RETIRE_BUMP_THRESHOLD == 0)
+		(void) pg_atomic_fetch_add_u64(&RowCacheCtl->global_epoch, 1);
+}
+
+/*
+ * RowCacheLocalGC: free every RetireNode in this backend's list whose
+ * recorded epoch is strictly less than the published safe_epoch.
+ *
+ * Should be called at convenient quiescent points (CommitTransaction
+ * tail, CHECK_FOR_INTERRUPTS, idle).  Phase 2 (4/4) wires the actual
+ * call sites; this commit only provides the function.
+ *
+ * Cheap when no work to do: one atomic_load + one list-head check.
+ */
+void
+RowCacheLocalGC(void)
+{
+	uint64			safe;
+	RetireNode	  **pp;
+	RetireNode	   *node;
+
+	if (MyRetireHead == NULL || RowCacheCtl == NULL)
+		return;
+
+	/*
+	 * dsa_free needs LocalDsa.  This backend must already be attached
+	 * (otherwise it could not have called EpochRetire), but EnsureRowCacheDsa
+	 * is idempotent and cheap on the attached-fast-path.
+	 */
+	EnsureRowCacheDsa();
+
+	safe = pg_atomic_read_u64(&RowCacheCtl->safe_epoch_published);
+
+	/*
+	 * Walk the singly-linked list with a back-pointer so we can splice
+	 * out reclaimable nodes in O(1) per visit without a separate pass.
+	 */
+	pp = &MyRetireHead;
+	while ((node = *pp) != NULL)
+	{
+		if (node->epoch < safe)
+		{
+			*pp = node->next;
+			for (int i = 0; i < RETIRE_NODE_SLOTS; i++)
+			{
+				if (DsaPointerIsValid(node->dp[i]))
+					dsa_free(LocalDsa, node->dp[i]);
+			}
+			pfree(node);
+			Assert(MyRetireListLen > 0);
+			MyRetireListLen--;
+		}
+		else
+		{
+			pp = &node->next;
+		}
+	}
+}
+
+/* Diagnostics: current length of this backend's retire list. */
+size_t
+RowCacheLocalRetireCount(void)
+{
+	return MyRetireListLen;
+}
+
 /*
  * Sticky per-backend cache for relmeta lookup.  Invalidated by Load/Drop
  * on the same backend (LastCachedRelMeta=NULL) so a subsequent call

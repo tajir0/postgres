@@ -37,6 +37,7 @@
 #include "executor/tuptable.h"
 #include "port/atomics.h"
 #include "storage/proc.h"
+#include "utils/dsa.h"
 #include "utils/rel.h"
 #include "utils/snapshot.h"
 
@@ -63,6 +64,29 @@ extern uint64 RowCacheGlobalEpochBump(void);
 extern uint64 RowCacheSafeEpochRead(void);
 extern void   RowCacheSafeEpochPublish(uint64 safe);
 extern uint64 RowCacheComputeSafeEpoch(void);
+
+/*
+ * Retire / reclaim API (Phase 2 2/4).
+ *
+ * Writers (DML / Drop / future LRU eviction) call RowCacheEpochRetire with
+ * up to 3 DSA pointers — typically (payload, entry, pkey_buffer) — instead
+ * of dsa_free'ing them directly.  Each retire snapshots the current
+ * global_epoch and pushes a node onto a backend-local list.  Pass
+ * InvalidDsaPointer for unused slots; passing all three Invalid is a no-op
+ * (no allocation).
+ *
+ * RowCacheLocalGC walks this backend's retire list and dsa_free's every
+ * node whose recorded epoch < safe_epoch_published (set by the future GC
+ * bgworker; until then it remains 0 and LocalGC is effectively a no-op).
+ *
+ * RowCacheLocalRetireCount returns the current pending count for
+ * diagnostics / pg_row_cache_stat (Phase 5).
+ */
+extern void   RowCacheEpochRetire(dsa_pointer dp_a,
+								  dsa_pointer dp_b,
+								  dsa_pointer dp_c);
+extern void   RowCacheLocalGC(void);
+extern size_t RowCacheLocalRetireCount(void);
 
 /*
  * Enter a row-cache read critical section.
