@@ -319,6 +319,20 @@ struct PGPROC
 	PGPROC	   *lockGroupLeader;	/* lock group leader, if I'm a member */
 	dlist_head	lockGroupMembers;	/* list of members, if I'm a leader */
 	dlist_node	lockGroupLink;	/* my member link, if I'm a member */
+
+	/*
+	 * Row-cache EBR (Epoch-Based Reclamation) per-backend epoch marker.
+	 *
+	 * 0  = backend is NOT inside a row-cache read critical section.
+	 * >0 = backend entered the critical section observing global_epoch == this
+	 *      value.  Writer-side retire/GC code reads min(>0) over ProcArray to
+	 *      compute the safe epoch up to which retired DSA blocks can be freed.
+	 *
+	 * Read path writes this with a single atomic store + memory barrier at
+	 * entry, and zeroes it at exit.  There is no RMW on the hot path.
+	 * See src/backend/lib/relation_row_cache.c for the protocol.
+	 */
+	pg_atomic_uint64 rowcache_local_epoch;
 };
 
 /* NOTE: "typedef struct PGPROC PGPROC" appears in storage/lock.h. */

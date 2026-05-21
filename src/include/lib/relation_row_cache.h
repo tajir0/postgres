@@ -35,12 +35,67 @@
 #include "postgres.h"
 
 #include "executor/tuptable.h"
+#include "port/atomics.h"
+#include "storage/proc.h"
 #include "utils/rel.h"
 #include "utils/snapshot.h"
 
 /* Shared memory sizing and initialization (called from ipci.c). */
 extern Size RowCacheShmemSize(void);
 extern void RowCacheShmemInit(void);
+
+/* ----------------------------------------------------------------
+ * Phase 2: EBR (Epoch-Based Reclamation) primitives
+ *
+ * Read path declares its critical section with RowCacheEpochEnter/Exit.
+ * Writers retire DSA blocks instead of dsa_free'ing immediately; the GC
+ * worker (subsequent commit) computes safe_epoch = min over all backends'
+ * rowcache_local_epoch and publishes it for retire-list reclamation.
+ *
+ * This commit only wires the counters + the enter/exit primitives.  The
+ * retire list, GC bgworker, and read-path integration land in later
+ * Phase 2 commits.
+ * ---------------------------------------------------------------- */
+
+/* Accessors backed by the shmem RowCacheControl.  Defined in the .c file. */
+extern uint64 RowCacheGlobalEpochRead(void);
+extern uint64 RowCacheGlobalEpochBump(void);
+extern uint64 RowCacheSafeEpochRead(void);
+extern void   RowCacheSafeEpochPublish(uint64 safe);
+extern uint64 RowCacheComputeSafeEpoch(void);
+
+/*
+ * Enter a row-cache read critical section.
+ *
+ * Snapshots the current global_epoch into MyProc->rowcache_local_epoch
+ * with release-store semantics so any subsequent atomic_load(payload_dp)
+ * inside the section is ordered after this store.
+ *
+ * Hot path: 1 atomic_load + 1 atomic_store + 1 memory barrier (~3-5 ns).
+ * No RMW, no lock, no cache-line ping-pong (each backend writes its own
+ * PGPROC cache line).
+ */
+static inline void
+RowCacheEpochEnter(void)
+{
+	uint64		e = RowCacheGlobalEpochRead();
+
+	pg_atomic_write_u64(&MyProc->rowcache_local_epoch, e);
+	pg_memory_barrier();
+}
+
+/*
+ * Exit a row-cache read critical section.
+ *
+ * Stores 0, telling the GC that this backend no longer holds a reference
+ * to any retire-list block whose recorded epoch is <= the previously
+ * observed value.
+ */
+static inline void
+RowCacheEpochExit(void)
+{
+	pg_atomic_write_u64(&MyProc->rowcache_local_epoch, 0);
+}
 
 /* Load / Drop a relation's cache.  See lifetime contract above. */
 extern void RelationRowCacheLoadRelation(Relation rel);

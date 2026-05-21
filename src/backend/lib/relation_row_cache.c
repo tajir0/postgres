@@ -43,6 +43,8 @@
 #include "storage/itemptr.h"
 #include "storage/lockdefs.h"
 #include "storage/lwlock.h"
+#include "storage/proc.h"
+#include "storage/procarray.h"
 #include "storage/shmem.h"
 #include "utils/dsa.h"
 #include "utils/hsearch.h"
@@ -131,6 +133,29 @@ typedef struct RowCacheControl
 	 */
 	dsa_pointer		hash_buckets_dp;
 
+	/*
+	 * EBR (Epoch-Based Reclamation) infrastructure, Phase 2.
+	 *
+	 *   global_epoch         — monotonically increasing counter.  Writers
+	 *                          bump it when they retire DSA blocks; readers
+	 *                          snapshot it into PGPROC.rowcache_local_epoch
+	 *                          on entering a read critical section.
+	 *
+	 *   safe_epoch_published — published by the GC worker after scanning
+	 *                          ProcArray.  Any retire batch whose recorded
+	 *                          epoch is strictly less than this value has
+	 *                          no live reader left and can be dsa_free'd.
+	 *
+	 * Both are monotonic, plain uint64 atomics.  They never roll over in
+	 * any realistic timescale (would take ~5800 millennia at 10k bumps/s).
+	 *
+	 * Phase 2 only wires the storage + initialization.  The GC bgworker
+	 * (which publishes safe_epoch_published) and the retire-list machinery
+	 * are added in subsequent Phase 2 commits.
+	 */
+	pg_atomic_uint64 global_epoch;
+	pg_atomic_uint64 safe_epoch_published;
+
 	RelMeta			relmetas[ROW_CACHE_MAX_RELATIONS];
 } RowCacheControl;
 
@@ -140,6 +165,75 @@ typedef struct RowCacheControl
 
 static RowCacheControl *RowCacheCtl = NULL;
 static dsa_area *LocalDsa = NULL;
+
+/* ----------------------------------------------------------------
+ * Phase 2: EBR accessor implementations.
+ *
+ * RowCacheEpochEnter / Exit (in the header) write the per-backend slot in
+ * PGPROC; the helpers below operate on the shared counters.
+ *
+ * All counters are pg_atomic_uint64; reads / writes are single-instruction
+ * on x86_64 / aarch64.  Bump uses fetch_add to advance the global counter
+ * and returns the *previous* value (matching epoch semantics: writers
+ * advance the global counter, but the value handed to a retire batch is
+ * the one observed before retiring).
+ *
+ * ComputeSafeEpoch scans ProcArray under SHARED ProcArrayLock and returns
+ * min(rowcache_local_epoch) over all non-idle slots.  If every backend is
+ * idle (local_epoch == 0), there are no live readers and the current
+ * global_epoch is itself safe.  Callers should publish the result via
+ * RowCacheSafeEpochPublish so backend-local GC can consume it cheaply.
+ * ---------------------------------------------------------------- */
+
+uint64
+RowCacheGlobalEpochRead(void)
+{
+	Assert(RowCacheCtl != NULL);
+	return pg_atomic_read_u64(&RowCacheCtl->global_epoch);
+}
+
+uint64
+RowCacheGlobalEpochBump(void)
+{
+	Assert(RowCacheCtl != NULL);
+	return pg_atomic_fetch_add_u64(&RowCacheCtl->global_epoch, 1);
+}
+
+uint64
+RowCacheSafeEpochRead(void)
+{
+	Assert(RowCacheCtl != NULL);
+	return pg_atomic_read_u64(&RowCacheCtl->safe_epoch_published);
+}
+
+void
+RowCacheSafeEpochPublish(uint64 safe)
+{
+	Assert(RowCacheCtl != NULL);
+	pg_atomic_write_u64(&RowCacheCtl->safe_epoch_published, safe);
+}
+
+uint64
+RowCacheComputeSafeEpoch(void)
+{
+	uint64		oldest = UINT64_MAX;
+
+	Assert(RowCacheCtl != NULL);
+
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+	for (int i = 0; i < ProcGlobal->allProcCount; i++)
+	{
+		uint64	le = pg_atomic_read_u64(&ProcGlobal->allProcs[i].rowcache_local_epoch);
+
+		if (le > 0 && le < oldest)
+			oldest = le;
+	}
+	LWLockRelease(ProcArrayLock);
+
+	return (oldest == UINT64_MAX)
+		? pg_atomic_read_u64(&RowCacheCtl->global_epoch)
+		: oldest;
+}
 
 /*
  * Sticky per-backend cache for relmeta lookup.  Invalidated by Load/Drop
@@ -190,6 +284,14 @@ RowCacheShmemInit(void)
 
 	RowCacheCtl->global_dsa_handle = DSA_HANDLE_INVALID;
 	RowCacheCtl->hash_buckets_dp = InvalidDsaPointer;
+
+	/*
+	 * EBR counters start at 1 so that 0 in PGPROC.rowcache_local_epoch
+	 * unambiguously means "not in a critical section".  Any value >= 1 is
+	 * a real snapshot of global_epoch taken by some reader.
+	 */
+	pg_atomic_init_u64(&RowCacheCtl->global_epoch, 1);
+	pg_atomic_init_u64(&RowCacheCtl->safe_epoch_published, 0);
 
 	LWLockInitialize(&RowCacheCtl->control_lock, LWTRANCHE_ROW_CACHE_CTL);
 	LWLockInitialize(&RowCacheCtl->relmeta_alloc_lock,
