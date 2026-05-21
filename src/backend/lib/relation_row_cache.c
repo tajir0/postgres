@@ -33,6 +33,8 @@
 #include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/tableam.h"
+#include "access/tupmacs.h"
+#include "common/hashfn.h"
 #include "catalog/pg_index.h"
 #include "executor/tuptable.h"
 #include "lib/relation_row_cache.h"
@@ -94,6 +96,35 @@ StaticAssertDecl((ROW_CACHE_HASH_BUCKETS & ROW_CACHE_BUCKET_MASK) == 0,
  * Lookup is a linear scan of up to ROW_CACHE_MAX_RELATIONS slots; a sticky
  * per-backend cache short-circuits repeated lookups for the same relid.
  */
+
+/*
+ * Pkey-storage parameters.
+ *
+ * ROW_CACHE_PKEY_MAX_ATTS  — max # of pkey columns we accept at Load
+ *                            eligibility.  TPC-C uses up to 4 columns
+ *                            (bmsql_order_line); we round up to 8 for
+ *                            headroom without bloating RelMeta.
+ *
+ * ROW_CACHE_PKEY_INLINE_BYTES — max byte length of the serialized
+ *                            (concatenated) pkey we'll embed in
+ *                            GlobalEntry.  32 bytes covers any of:
+ *                              - 1 column int8        (8B)
+ *                              - 2 columns int8       (16B)
+ *                              - 3 columns int8       (24B)
+ *                              - 4 columns int8       (32B)
+ *                              - 4 columns int4       (16B)
+ *                              - 8 columns int4       (32B)
+ *                            Tables exceeding this fail eligibility
+ *                            and stay un-cached.  Byref pks are out of
+ *                            scope for this commit (still rejected at
+ *                            Load time, same as before).
+ */
+#define ROW_CACHE_PKEY_MAX_ATTS		8
+#define ROW_CACHE_PKEY_INLINE_BYTES	32
+
+StaticAssertDecl(ROW_CACHE_PKEY_MAX_ATTS <= INDEX_MAX_KEYS,
+				 "ROW_CACHE_PKEY_MAX_ATTS must not exceed INDEX_MAX_KEYS");
+
 typedef struct RelMeta
 {
 	Oid				relid;			/* InvalidOid = unused slot */
@@ -101,24 +132,48 @@ typedef struct RelMeta
 	pg_atomic_uint64 rel_gen;		/* bumped on Drop / DDL invalidation */
 	LWLock			build_lock;		/* serializes Load / Drop; not on read path */
 
-	/* Pkey descriptor.  Phase 1: single-col byval only. */
-	AttrNumber		pkey_attno;		/* 1-based heap attno of pkey column */
-	int16			pkey_typlen;
-	bool			pkey_byval;
+	/*
+	 * Pkey descriptor.
+	 *
+	 * Phase 1 supported only single-column byval; this commit (Phase 4
+	 * subset) extends to composite byval keys up to ROW_CACHE_PKEY_MAX_ATTS
+	 * columns with total serialized length <= ROW_CACHE_PKEY_INLINE_BYTES.
+	 *
+	 * Byref pkeys remain out of scope: pkey_byvals[] is therefore always
+	 * true after a successful eligibility check; the field is kept (rather
+	 * than dropped) to leave a clean extension point for future byref
+	 * support, and so the eligibility check can early-fail by clearing it.
+	 */
+	int				n_pkey_attrs;	/* 0 if not eligible / not loaded */
+	AttrNumber		pkey_attnos[ROW_CACHE_PKEY_MAX_ATTS];
+	int16			pkey_typlens[ROW_CACHE_PKEY_MAX_ATTS];
+	bool			pkey_byvals[ROW_CACHE_PKEY_MAX_ATTS];
+	int				pkey_total_len;	/* sum of pkey_typlens, <= ROW_CACHE_PKEY_INLINE_BYTES */
 } RelMeta;
 
 /*
  * GlobalEntry: one element of the chained global hash.  Lives in DSA.
  *
- * For Phase 1 the pkey is always a single-col byval Datum which fits in
- * 64 bits; pkey_val stores it directly (no separate dsa_pointer needed).
- * Phase 4 will widen this when composite/byref support lands.
+ * Pkey storage:
+ *   pkey_len + pkey_buf hold the byte-serialised key (concatenation of
+ *   per-column store_att_byval payloads in attno order).  All cache
+ *   lookups compare by (relid, pkey_hash, pkey_len, memcmp(pkey_buf)).
+ *
+ *   Phase 4 single-col case: pkey_len == typlen (1/2/4/8 bytes), buf
+ *   holds the canonical byval representation.  Tail bytes up to
+ *   ROW_CACHE_PKEY_INLINE_BYTES are unused (not zeroed; equality check
+ *   gates on pkey_len so stale tail bytes are harmless).
+ *
+ *   Future byref support would either spill pkey to DSA via a
+ *   pkey_dp pointer or extend pkey_buf — both extension points are
+ *   intentionally left clean here.
  */
 typedef struct GlobalEntry
 {
 	Oid				relid;
 	uint32			pkey_hash;
-	uint64			pkey_val;		/* packed byval Datum */
+	uint8			pkey_len;		/* serialized length, <= ROW_CACHE_PKEY_INLINE_BYTES */
+	uint8			pkey_buf[ROW_CACHE_PKEY_INLINE_BYTES];
 	uint64			rel_gen_at_load;
 	pg_atomic_uint32 state;			/* ROW_CACHE_ENTRY_{FRESH,STALE,DELETED} */
 	ItemPointerData	tid;			/* heap TID at load time (for slot fill) */
@@ -828,11 +883,13 @@ static RelMeta	   *LastLookupRelMeta = NULL;
 static void EnsureRowCacheDsa(void);
 static RelMeta *FindRelMeta(Oid relid);
 static RelMeta *AllocateOrFindRelMeta(Oid relid);
-static AttrNumber CheckEligibleByvalPkey(Relation rel,
-										 int16 *out_typlen,
-										 bool *out_byval);
-static inline uint64 PackPkeyDatum(Datum d, int16 typlen);
-static inline uint32 ComputePkeyHash(uint64 pkey_val);
+static bool CheckEligiblePkey(Relation rel, RelMeta *rm);
+static int SerializePkeyFromSlot(TupleTableSlot *slot, RelMeta *rm,
+								 uint8 *out_buf);
+static int SerializePkeyFromTuple(HeapTuple tuple, TupleDesc desc,
+								  RelMeta *rm, uint8 *out_buf);
+static int SerializePkeyFromDatum(Datum d, RelMeta *rm, uint8 *out_buf);
+static inline uint32 ComputePkeyHashBytes(const uint8 *buf, int len);
 static void DropAllEntriesForRelid(Oid relid);
 
 /* ----------------------------------------------------------------
@@ -890,9 +947,8 @@ RowCacheShmemInit(void)
 		pg_atomic_init_u32(&rm->state, RELMETA_DISABLED);
 		pg_atomic_init_u64(&rm->rel_gen, 0);
 		LWLockInitialize(&rm->build_lock, LWTRANCHE_ROW_CACHE_RELMETA);
-		rm->pkey_attno = 0;
-		rm->pkey_typlen = 0;
-		rm->pkey_byval = false;
+		rm->n_pkey_attrs = 0;
+		rm->pkey_total_len = 0;
 	}
 }
 
@@ -1034,9 +1090,8 @@ AllocateOrFindRelMeta(Oid relid)
 		{
 			cand->relid = relid;
 			pg_atomic_write_u32(&cand->state, RELMETA_DISABLED);
-			cand->pkey_attno = 0;
-			cand->pkey_typlen = 0;
-			cand->pkey_byval = false;
+			cand->n_pkey_attrs = 0;
+			cand->pkey_total_len = 0;
 			rm = cand;
 			break;
 		}
@@ -1055,89 +1110,202 @@ AllocateOrFindRelMeta(Oid relid)
  * pkey is single-column and pass-by-value (int2/int4/int8/oid).
  * Returns 0 otherwise (composite, byref, deferrable, no pk, etc.).
  */
-static AttrNumber
-CheckEligibleByvalPkey(Relation rel, int16 *out_typlen, bool *out_byval)
+/*
+ * Inspect rel's primary key and, if eligible, populate the pkey
+ * descriptor portion of `rm`:
+ *
+ *   - n_pkey_attrs       — # of pkey columns (1..ROW_CACHE_PKEY_MAX_ATTS)
+ *   - pkey_attnos[]      — heap attno of each pkey column, in index order
+ *   - pkey_typlens[]     — attlen of each pkey column (1/2/4/8)
+ *   - pkey_byvals[]      — always true (byref is out of scope this commit)
+ *   - pkey_total_len     — sum of pkey_typlens, <= ROW_CACHE_PKEY_INLINE_BYTES
+ *
+ * Returns true on success, false on rejection.  On rejection `rm`'s
+ * pkey descriptor is left in the "not eligible" state (n_pkey_attrs=0)
+ * so the read path's pkey_attno checks naturally see "no pkey".
+ *
+ * Rejection cases:
+ *   - relation has no primary key (or it's deferrable)
+ *   - any pkey column is system / expression (attno <= 0)
+ *   - any pkey column is byref or has weird attlen (<=0 or > 8)
+ *   - more than ROW_CACHE_PKEY_MAX_ATTS columns
+ *   - serialized total length > ROW_CACHE_PKEY_INLINE_BYTES
+ */
+static bool
+CheckEligiblePkey(Relation rel, RelMeta *rm)
 {
 	Oid			pkindex_oid;
 	Relation	pkindex;
 	Form_pg_index ind;
-	Form_pg_attribute attr;
-	AttrNumber	attno = 0;
+	int			natts;
+	int			total = 0;
+	AttrNumber	attnos[ROW_CACHE_PKEY_MAX_ATTS];
+	int16		typlens[ROW_CACHE_PKEY_MAX_ATTS];
 
-	*out_typlen = 0;
-	*out_byval = false;
+	rm->n_pkey_attrs = 0;
+	rm->pkey_total_len = 0;
 
 	pkindex_oid = RelationGetPrimaryKeyIndex(rel, false);
 	if (!OidIsValid(pkindex_oid))
-		return 0;
+		return false;
 
 	pkindex = index_open(pkindex_oid, AccessShareLock);
 	ind = pkindex->rd_index;
 
-	if (ind == NULL || ind->indnkeyatts != 1)
+	if (ind == NULL || ind->indnkeyatts <= 0 ||
+		ind->indnkeyatts > ROW_CACHE_PKEY_MAX_ATTS)
 	{
 		index_close(pkindex, AccessShareLock);
-		return 0;
+		return false;
 	}
 
-	attno = ind->indkey.values[0];
+	natts = ind->indnkeyatts;
+	for (int i = 0; i < natts; i++)
+	{
+		AttrNumber	attno = ind->indkey.values[i];
+		Form_pg_attribute attr;
+
+		if (attno <= 0)
+		{
+			/* system column / expression-key — not supported */
+			index_close(pkindex, AccessShareLock);
+			return false;
+		}
+
+		attr = TupleDescAttr(RelationGetDescr(rel), attno - 1);
+
+		/* Phase 4 subset: byval-only.  Reject byref or odd attlen. */
+		if (!attr->attbyval ||
+			attr->attlen <= 0 ||
+			attr->attlen > (int) sizeof(uint64))
+		{
+			index_close(pkindex, AccessShareLock);
+			return false;
+		}
+
+		if (total + attr->attlen > ROW_CACHE_PKEY_INLINE_BYTES)
+		{
+			index_close(pkindex, AccessShareLock);
+			return false;
+		}
+
+		attnos[i] = attno;
+		typlens[i] = attr->attlen;
+		total += attr->attlen;
+	}
+
 	index_close(pkindex, AccessShareLock);
 
-	if (attno <= 0)
-		return 0;
-
-	attr = TupleDescAttr(RelationGetDescr(rel), attno - 1);
-	if (!attr->attbyval || attr->attlen <= 0 ||
-		attr->attlen > (int) sizeof(uint64))
-		return 0;
-
-	*out_typlen = attr->attlen;
-	*out_byval = true;
-	return attno;
-}
-
-/*
- * Pack a byval pkey Datum into a 64-bit canonical representation.
- *
- * For typlen <= 8 the Datum is already zero-extended to 64 bits per the
- * PG byval convention, but we mask to typlen-relevant bits so that, e.g.,
- * a high-bit-set int4 with junk in the upper 32 bits compares equal to
- * the canonical zero-extended form.
- */
-static inline uint64
-PackPkeyDatum(Datum d, int16 typlen)
-{
-	uint64		v = (uint64) d;
-
-	switch (typlen)
+	/* Commit descriptor into RelMeta. */
+	rm->n_pkey_attrs = natts;
+	rm->pkey_total_len = total;
+	for (int i = 0; i < natts; i++)
 	{
-		case 1:
-			return v & UINT64CONST(0xff);
-		case 2:
-			return v & UINT64CONST(0xffff);
-		case 4:
-			return v & UINT64CONST(0xffffffff);
-		case 8:
-		default:
-			return v;
+		rm->pkey_attnos[i] = attnos[i];
+		rm->pkey_typlens[i] = typlens[i];
+		rm->pkey_byvals[i] = true;
 	}
+	return true;
 }
 
 /*
- * Splitmix64-style finalizer; lifted from the V3 pkey_row_cache.c.  We
- * keep it as a 32-bit return because that's all the bucket index needs.
+ * Pkey serialization helpers (composite byval, Phase 4 subset).
+ *
+ * The serialized form is the byte-wise concatenation of each pkey
+ * column's store_att_byval result, in attno order, with no padding
+ * or length prefix between columns (length is fixed by typlen and
+ * implicit in the RelMeta descriptor).
+ *
+ * Equality compares (pkey_len, memcmp(pkey_buf)); identical byval
+ * Datums always produce identical byte sequences inside a single PG
+ * instance (one endianness, one Datum width).
+ *
+ * Three input flavors:
+ *
+ *   FromSlot   — Load path; slot already has tts_values[] filled by
+ *                slot_getallattrs.
+ *   FromTuple  — DML hook path; tuple's t_data is buffer-mapped, use
+ *                heap_getattr on each pkey column.
+ *   FromDatum  — single-Datum convenience for the legacy Fetch API;
+ *                returns -1 if RelMeta is not single-column (the
+ *                caller is supposed to gate on n_pkey_attrs == 1).
+ *
+ * All three return the total serialized length on success, -1 on
+ * defensive failure (null pkey column — shouldn't happen, PK columns
+ * are NOT NULL — or buffer overrun which the eligibility check should
+ * have prevented).
+ */
+
+static int
+SerializePkeyFromSlot(TupleTableSlot *slot, RelMeta *rm, uint8 *out_buf)
+{
+	int			total = 0;
+
+	for (int i = 0; i < rm->n_pkey_attrs; i++)
+	{
+		AttrNumber	attno = rm->pkey_attnos[i];
+		int16		typlen = rm->pkey_typlens[i];
+
+		if (slot->tts_isnull[attno - 1])
+			return -1;
+
+		if (total + typlen > ROW_CACHE_PKEY_INLINE_BYTES)
+			return -1;
+
+		store_att_byval(out_buf + total,
+						slot->tts_values[attno - 1],
+						typlen);
+		total += typlen;
+	}
+	return total;
+}
+
+static int
+SerializePkeyFromTuple(HeapTuple tuple, TupleDesc desc, RelMeta *rm,
+					   uint8 *out_buf)
+{
+	int			total = 0;
+
+	for (int i = 0; i < rm->n_pkey_attrs; i++)
+	{
+		AttrNumber	attno = rm->pkey_attnos[i];
+		int16		typlen = rm->pkey_typlens[i];
+		Datum		d;
+		bool		isnull;
+
+		d = heap_getattr(tuple, attno, desc, &isnull);
+		if (isnull)
+			return -1;
+
+		if (total + typlen > ROW_CACHE_PKEY_INLINE_BYTES)
+			return -1;
+
+		store_att_byval(out_buf + total, d, typlen);
+		total += typlen;
+	}
+	return total;
+}
+
+static int
+SerializePkeyFromDatum(Datum d, RelMeta *rm, uint8 *out_buf)
+{
+	if (rm->n_pkey_attrs != 1)
+		return -1;
+	if (rm->pkey_typlens[0] > ROW_CACHE_PKEY_INLINE_BYTES)
+		return -1;
+	store_att_byval(out_buf, d, rm->pkey_typlens[0]);
+	return rm->pkey_typlens[0];
+}
+
+/*
+ * Hash a serialized pkey byte buffer to a 32-bit bucket-selector.
+ * Uses PG's hash_bytes (same family as hash join / hash agg, no Datum
+ * boxing) which is specifically tuned for short byte sequences.
  */
 static inline uint32
-ComputePkeyHash(uint64 pkey_val)
+ComputePkeyHashBytes(const uint8 *buf, int len)
 {
-	uint64		x = pkey_val;
-
-	x ^= x >> 30;
-	x *= UINT64CONST(0xbf58476d1ce4e5b9);
-	x ^= x >> 27;
-	x *= UINT64CONST(0x94d49bb133111eb1);
-	x ^= x >> 31;
-	return (uint32) x;
+	return hash_bytes(buf, len);
 }
 
 static inline LWLock *
@@ -1203,15 +1371,25 @@ BucketInsertHead(uint32 bucket, dsa_pointer entry_dp, GlobalEntry *entry)
 }
 
 /*
- * Walk a bucket chain looking for an entry matching (relid, pkey_val).
- * Returns the entry pointer (via dsa_get_address) and stores the
- * dsa_pointer in *out_entry_dp when found; otherwise returns NULL.
+ * Walk a bucket chain looking for an entry matching
+ * (relid, pkey_hash, pkey_len, pkey_buf).
  *
- * Read path: NO LOCK (per Phase 1 caller contract).
+ * Match criteria progressively widen the cheap-cmp filter:
+ *   - relid equality (4-byte cmp)
+ *   - pkey_hash equality (cheap hash collision filter)
+ *   - pkey_len equality (single-byte cmp)
+ *   - memcmp(pkey_buf, ..., pkey_len) for definitive equality
+ *
+ * Returns the entry pointer (via dsa_get_address) and stores the
+ * dsa_pointer in *out_entry_dp when found; NULL otherwise.
+ *
+ * Read path: takes no lock; relies on EBR (Phase 3 (5/5)) to keep
+ * chain-walked entries alive across concurrent writers.
  * Write path: caller holds the partition lock.
  */
 static GlobalEntry *
-BucketLookup(uint32 bucket, Oid relid, uint64 pkey_val,
+BucketLookup(uint32 bucket, Oid relid, uint32 pkey_hash,
+			 const uint8 *pkey_buf, int pkey_len,
 			 dsa_pointer *out_entry_dp)
 {
 	dsa_pointer *heads = BucketHeads();
@@ -1221,7 +1399,10 @@ BucketLookup(uint32 bucket, Oid relid, uint64 pkey_val,
 	{
 		GlobalEntry *e = (GlobalEntry *) dsa_get_address(LocalDsa, cur_dp);
 
-		if (e->relid == relid && e->pkey_val == pkey_val)
+		if (e->relid == relid &&
+			e->pkey_hash == pkey_hash &&
+			e->pkey_len == pkey_len &&
+			memcmp(e->pkey_buf, pkey_buf, pkey_len) == 0)
 		{
 			if (out_entry_dp)
 				*out_entry_dp = cur_dp;
@@ -1252,9 +1433,6 @@ RelationRowCacheLoadRelation(Relation rel)
 {
 	Oid			relid = RelationGetRelid(rel);
 	RelMeta    *rm;
-	AttrNumber	pkey_attno;
-	int16		pkey_typlen = 0;
-	bool		pkey_byval = false;
 	TableScanDesc scan;
 	TupleTableSlot *slot;
 	bool		pushed_snapshot = false;
@@ -1290,17 +1468,15 @@ RelationRowCacheLoadRelation(Relation rel)
 
 	pg_atomic_write_u32(&rm->state, RELMETA_LOADING);
 
-	pkey_attno = CheckEligibleByvalPkey(rel, &pkey_typlen, &pkey_byval);
-	if (pkey_attno == 0)
+	if (!CheckEligiblePkey(rel, rm))
 	{
 		/*
-		 * Phase 1 limitation: composite / byref / no-pk tables are not
-		 * cacheable.  Leave the slot in DISABLED state and reset the
-		 * descriptor so a future Phase 4 reload finds a clean slate.
+		 * Composite > ROW_CACHE_PKEY_MAX_ATTS, byref, total length >
+		 * ROW_CACHE_PKEY_INLINE_BYTES, or no/deferrable pk.  Leave the
+		 * slot in DISABLED state; descriptor is already cleared inside
+		 * CheckEligiblePkey on rejection so a future re-eligible Load
+		 * finds a clean slate.
 		 */
-		rm->pkey_attno = 0;
-		rm->pkey_typlen = 0;
-		rm->pkey_byval = false;
 		pg_atomic_write_u32(&rm->state, RELMETA_DISABLED);
 		LastLookupRelMeta = NULL;
 		LastLookupRelid = InvalidOid;
@@ -1308,9 +1484,6 @@ RelationRowCacheLoadRelation(Relation rel)
 		return;
 	}
 
-	rm->pkey_attno = pkey_attno;
-	rm->pkey_typlen = pkey_typlen;
-	rm->pkey_byval = pkey_byval;
 	rel_gen_at_load = pg_atomic_read_u64(&rm->rel_gen);
 
 	if (!ActiveSnapshotSet())
@@ -1324,8 +1497,8 @@ RelationRowCacheLoadRelation(Relation rel)
 
 	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
 	{
-		Datum		pkey_datum;
-		uint64		pkey_packed;
+		uint8		pkey_buf[ROW_CACHE_PKEY_INLINE_BYTES];
+		int			pkey_len;
 		uint32		pkey_hash;
 		uint32		bucket;
 		dsa_pointer payload_dp;
@@ -1334,12 +1507,12 @@ RelationRowCacheLoadRelation(Relation rel)
 		LWLock	   *part;
 
 		slot_getallattrs(slot);
-		if (slot->tts_isnull[pkey_attno - 1])
+
+		pkey_len = SerializePkeyFromSlot(slot, rm, pkey_buf);
+		if (pkey_len < 0)
 			continue;				/* defensive; pk columns are NOT NULL */
 
-		pkey_datum = slot->tts_values[pkey_attno - 1];
-		pkey_packed = PackPkeyDatum(pkey_datum, pkey_typlen);
-		pkey_hash = ComputePkeyHash(pkey_packed);
+		pkey_hash = ComputePkeyHashBytes(pkey_buf, pkey_len);
 		bucket = pkey_hash & ROW_CACHE_BUCKET_MASK;
 
 		/* Flatten and allocate before taking the partition lock. */
@@ -1359,7 +1532,8 @@ RelationRowCacheLoadRelation(Relation rel)
 		e = (GlobalEntry *) dsa_get_address(LocalDsa, entry_dp);
 		e->relid = relid;
 		e->pkey_hash = pkey_hash;
-		e->pkey_val = pkey_packed;
+		e->pkey_len = (uint8) pkey_len;
+		memcpy(e->pkey_buf, pkey_buf, pkey_len);
 		e->rel_gen_at_load = rel_gen_at_load;
 		pg_atomic_init_u32(&e->state, ROW_CACHE_ENTRY_FRESH);
 		ItemPointerCopy(&slot->tts_tid, &e->tid);
@@ -1561,16 +1735,17 @@ DropAllEntriesForRelid(Oid relid)
  * ---------------------------------------------------------------- */
 
 /*
- * Internal: locate (relid, pkey) in the global hash, unlink the entry,
+ * Internal: locate (relid, pkey_buf) in the global hash, unlink the entry,
  * and retire payload + entry via EBR.  No-op if not found.
  *
  * Caller must already have determined that `rm` is the live RelMeta
- * for `relid` and that `pkey_datum` is non-null.
+ * for `relid` and that `pkey_buf` is a valid serialized pkey of length
+ * `pkey_len`.
  */
 static void
-InvalidateEntryByPkey(RelMeta *rm, Oid relid, Datum pkey_datum)
+InvalidateEntryByPkeyBytes(RelMeta *rm, Oid relid,
+						   const uint8 *pkey_buf, int pkey_len)
 {
-	uint64			packed;
 	uint32			pkey_hash;
 	uint32			bucket;
 	LWLock		   *part;
@@ -1591,9 +1766,8 @@ InvalidateEntryByPkey(RelMeta *rm, Oid relid, Datum pkey_datum)
 	 */
 	EnsureRowCacheDsa();
 
-	packed = PackPkeyDatum(pkey_datum, rm->pkey_typlen);
-	pkey_hash = ComputePkeyHash(packed);
-	bucket = pkey_hash % ROW_CACHE_HASH_BUCKETS;
+	pkey_hash = ComputePkeyHashBytes(pkey_buf, pkey_len);
+	bucket = pkey_hash & ROW_CACHE_BUCKET_MASK;
 	part = PartitionLockForBucket(bucket);
 
 	LWLockAcquire(part, LW_EXCLUSIVE);
@@ -1615,7 +1789,8 @@ InvalidateEntryByPkey(RelMeta *rm, Oid relid, Datum pkey_datum)
 
 		if (e->relid == relid &&
 			e->pkey_hash == pkey_hash &&
-			e->pkey_val == packed)
+			e->pkey_len == pkey_len &&
+			memcmp(e->pkey_buf, pkey_buf, pkey_len) == 0)
 		{
 			/* Unlink from chain. */
 			if (DsaPointerIsValid(prev_dp))
@@ -1628,9 +1803,9 @@ InvalidateEntryByPkey(RelMeta *rm, Oid relid, Datum pkey_datum)
 
 			/*
 			 * Mark DELETED so any reader that already grabbed `e` (under
-			 * future Phase 2 EBR enter) bails out instead of using its
-			 * payload.  Plain atomic store; the bucket-chain unlink above
-			 * makes the entry unreachable to new readers.
+			 * EBR) bails out instead of using its payload.  Plain atomic
+			 * store; the bucket-chain unlink above makes the entry
+			 * unreachable to new readers.
 			 */
 			pg_atomic_write_u32(&e->state, ROW_CACHE_ENTRY_DELETED);
 			break;
@@ -1656,20 +1831,20 @@ InvalidateEntryByPkey(RelMeta *rm, Oid relid, Datum pkey_datum)
  * Shared front-end used by RowCacheOnHeapUpdate / RowCacheOnHeapDelete.
  *
  * Steps:
- *   1. Cheap pre-checks (RowCacheCtl set, relmeta enabled).  Sticky-relmeta
- *      friendly: in the common case of repeated DML on the same relation,
- *      FindRelMeta will hit and the only work is a couple of atomic loads.
- *   2. Extract the pkey Datum from `tuple` using rel's tuple descriptor.
- *      Bail if null (defensive; pkeys are NOT NULL by definition).
- *   3. Defer to InvalidateEntryByPkey.
+ *   1. Cheap pre-checks (RowCacheCtl set, relmeta enabled, has pkey).
+ *      Sticky-relmeta friendly.
+ *   2. Serialize the composite (or single) pkey columns from `tuple`
+ *      using rel's tuple descriptor.  Bail if any column is null
+ *      (defensive; pkeys are NOT NULL by definition).
+ *   3. Defer to InvalidateEntryByPkeyBytes.
  */
 static void
 InvalidateByHeapTuple(Relation rel, HeapTuple tuple)
 {
 	RelMeta	   *rm;
-	Datum		pkey_datum;
-	bool		isnull;
 	Oid			relid;
+	uint8		pkey_buf[ROW_CACHE_PKEY_INLINE_BYTES];
+	int			pkey_len;
 
 	if (RowCacheCtl == NULL)
 		return;
@@ -1682,15 +1857,15 @@ InvalidateByHeapTuple(Relation rel, HeapTuple tuple)
 		return;
 	if (pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
 		return;
-	if (rm->pkey_attno <= 0)
+	if (rm->n_pkey_attrs <= 0)
 		return;
 
-	pkey_datum = heap_getattr(tuple, rm->pkey_attno,
-							  RelationGetDescr(rel), &isnull);
-	if (isnull)
+	pkey_len = SerializePkeyFromTuple(tuple, RelationGetDescr(rel),
+									  rm, pkey_buf);
+	if (pkey_len < 0)
 		return;
 
-	InvalidateEntryByPkey(rm, relid, pkey_datum);
+	InvalidateEntryByPkeyBytes(rm, relid, pkey_buf, pkey_len);
 }
 
 /* ----------------------------------------------------------------
@@ -1774,19 +1949,19 @@ FlattenHeapTupleToDsa(Relation rel, HeapTuple htup)
 }
 
 /*
- * Find entry by (relid, pkey) and atomically swap its payload_dp to
+ * Find entry by (relid, pkey_buf) and atomically swap its payload_dp to
  * `new_payload_dp`.  On success returns the previous payload_dp (which
- * the caller must retire).  On miss returns InvalidDsaPointer and
- * `*found` is set to false; caller should dsa_free the wasted new
- * payload directly.
+ * the caller must retire) and sets *found=true.  On miss returns
+ * InvalidDsaPointer and *found=false; caller should dsa_free the
+ * wasted new payload directly.
  *
- * Uses the same lock + walk discipline as InvalidateEntryByPkey.
+ * Uses the same lock + walk discipline as InvalidateEntryByPkeyBytes.
  */
 static dsa_pointer
-ReplaceEntryPayloadByPkey(RelMeta *rm, Oid relid, Datum pkey_datum,
-						  dsa_pointer new_payload_dp, bool *found)
+ReplaceEntryPayloadByPkeyBytes(RelMeta *rm, Oid relid,
+							   const uint8 *pkey_buf, int pkey_len,
+							   dsa_pointer new_payload_dp, bool *found)
 {
-	uint64			packed;
 	uint32			pkey_hash;
 	uint32			bucket;
 	LWLock		   *part;
@@ -1799,8 +1974,7 @@ ReplaceEntryPayloadByPkey(RelMeta *rm, Oid relid, Datum pkey_datum,
 
 	EnsureRowCacheDsa();
 
-	packed = PackPkeyDatum(pkey_datum, rm->pkey_typlen);
-	pkey_hash = ComputePkeyHash(packed);
+	pkey_hash = ComputePkeyHashBytes(pkey_buf, pkey_len);
 	bucket = pkey_hash & ROW_CACHE_BUCKET_MASK;
 	part = PartitionLockForBucket(bucket);
 
@@ -1821,7 +1995,8 @@ ReplaceEntryPayloadByPkey(RelMeta *rm, Oid relid, Datum pkey_datum,
 
 		if (e->relid == relid &&
 			e->pkey_hash == pkey_hash &&
-			e->pkey_val == packed)
+			e->pkey_len == pkey_len &&
+			memcmp(e->pkey_buf, pkey_buf, pkey_len) == 0)
 		{
 			old_payload_dp = e->payload_dp;
 			/*
@@ -1854,13 +2029,12 @@ void
 RowCacheOnHeapUpdate(Relation rel, HeapTuple oldtup, HeapTuple newtup)
 {
 	RelMeta		   *rm;
-	Datum			old_pkey;
-	Datum			new_pkey;
-	bool			old_isnull;
-	bool			new_isnull;
 	Oid				relid;
-	uint64			old_packed;
-	uint64			new_packed;
+	uint8			old_buf[ROW_CACHE_PKEY_INLINE_BYTES];
+	uint8			new_buf[ROW_CACHE_PKEY_INLINE_BYTES];
+	int				old_len;
+	int				new_len;
+	TupleDesc		desc;
 	dsa_pointer		new_payload_dp;
 	dsa_pointer		old_payload_dp;
 	bool			found;
@@ -1878,36 +2052,35 @@ RowCacheOnHeapUpdate(Relation rel, HeapTuple oldtup, HeapTuple newtup)
 		return;
 	if (pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
 		return;
-	if (rm->pkey_attno <= 0)
+	if (rm->n_pkey_attrs <= 0)
 		return;
 
-	old_pkey = heap_getattr(oldtup, rm->pkey_attno,
-							RelationGetDescr(rel), &old_isnull);
-	if (old_isnull)
-		return;
+	desc = RelationGetDescr(rel);
 
-	new_pkey = heap_getattr(newtup, rm->pkey_attno,
-							RelationGetDescr(rel), &new_isnull);
-	if (new_isnull)
+	old_len = SerializePkeyFromTuple(oldtup, desc, rm, old_buf);
+	if (old_len < 0)
+		return;					/* defensive */
+
+	new_len = SerializePkeyFromTuple(newtup, desc, rm, new_buf);
+	if (new_len < 0)
 	{
-		/* Defensive: pkeys are NOT NULL.  If somehow null, treat the
-		 * update as an invalidation of the old pkey. */
-		InvalidateEntryByPkey(rm, relid, old_pkey);
+		/* Defensive: new pkey null shouldn't happen.  Fall back to
+		 * invalidating the old. */
+		InvalidateEntryByPkeyBytes(rm, relid, old_buf, old_len);
 		return;
 	}
 
-	old_packed = PackPkeyDatum(old_pkey, rm->pkey_typlen);
-	new_packed = PackPkeyDatum(new_pkey, rm->pkey_typlen);
-
 	/*
-	 * Key-update degrade path: pkey changed.  Without an INSERT hook
-	 * we cannot populate the new pkey, so the most-consistent thing
-	 * we can do is evict the old entry and leave both old and new
-	 * pkey to fall back to native btree.
+	 * Key-update degrade path: pkey columns changed.  Without an INSERT
+	 * hook we cannot populate the new pkey, so the most-consistent
+	 * thing we can do is evict the old entry and leave both old and
+	 * new pkey to fall back to native btree.  For composite pkeys we
+	 * compare both length and bytes since either could change in
+	 * principle (though length usually doesn't).
 	 */
-	if (old_packed != new_packed)
+	if (old_len != new_len || memcmp(old_buf, new_buf, old_len) != 0)
 	{
-		InvalidateEntryByPkey(rm, relid, old_pkey);
+		InvalidateEntryByPkeyBytes(rm, relid, old_buf, old_len);
 		return;
 	}
 
@@ -1916,8 +2089,9 @@ RowCacheOnHeapUpdate(Relation rel, HeapTuple oldtup, HeapTuple newtup)
 	if (!DsaPointerIsValid(new_payload_dp))
 		return;					/* unlikely; flatten ereports on OOM */
 
-	old_payload_dp = ReplaceEntryPayloadByPkey(rm, relid, old_pkey,
-											   new_payload_dp, &found);
+	old_payload_dp = ReplaceEntryPayloadByPkeyBytes(rm, relid,
+													old_buf, old_len,
+													new_payload_dp, &found);
 
 	if (found)
 	{
@@ -2049,9 +2223,8 @@ RelationRowCacheDropRelation(Oid relid)
 
 	DropAllEntriesForRelid(relid);
 
-	rm->pkey_attno = 0;
-	rm->pkey_typlen = 0;
-	rm->pkey_byval = false;
+	rm->n_pkey_attrs = 0;
+	rm->pkey_total_len = 0;
 
 	LastLookupRelMeta = NULL;
 	LastLookupRelid = InvalidOid;
@@ -2081,7 +2254,8 @@ RelationRowCachePkeyFetch(Oid relid,
 						  bool *has_hot_chain)
 {
 	RelMeta    *rm;
-	uint64		packed;
+	uint8		pkey_buf[ROW_CACHE_PKEY_INLINE_BYTES];
+	int			pkey_len;
 	uint32		hash;
 	uint32		bucket;
 	GlobalEntry *entry;
@@ -2120,6 +2294,15 @@ RelationRowCachePkeyFetch(Oid relid,
 		return false;
 
 	/*
+	 * Single-Datum fetch API only handles single-column pkeys (executor's
+	 * IndexNext gate currently never triggers for composite pkeys).
+	 * Composite-pkey tables can still be Load'd into the cache but reads
+	 * must go through the future composite-aware Fetch entry point.
+	 */
+	if (rm->n_pkey_attrs != 1)
+		return false;
+
+	/*
 	 * Phase 4 EBR enter: from here until EpochExit we are a "reader" in
 	 * EBR terms.  Any GlobalEntry / FlatCachedTuple we touch is
 	 * guaranteed to remain physically backed by DSA — even if Drop /
@@ -2147,11 +2330,14 @@ RelationRowCachePkeyFetch(Oid relid,
 
 	EnsureRowCacheDsa();
 
-	packed = PackPkeyDatum(pkey_val, rm->pkey_typlen);
-	hash = ComputePkeyHash(packed);
+	pkey_len = SerializePkeyFromDatum(pkey_val, rm, pkey_buf);
+	if (pkey_len < 0)
+		goto out;
+
+	hash = ComputePkeyHashBytes(pkey_buf, pkey_len);
 	bucket = hash & ROW_CACHE_BUCKET_MASK;
 
-	entry = BucketLookup(bucket, relid, packed, NULL);
+	entry = BucketLookup(bucket, relid, hash, pkey_buf, pkey_len, NULL);
 	if (entry == NULL)
 		goto out;
 
@@ -2225,7 +2411,20 @@ RelationRowCachePkeyAttno(Oid relid)
 		pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
 		return 0;
 
-	return rm->pkey_attno;
+	/*
+	 * The single-Datum executor dispatch only supports single-column
+	 * pkey relations.  Return 0 for composite tables so the executor's
+	 * IndexNext gate never tries the single-Datum Fetch path.
+	 *
+	 * Composite tables are still loaded and maintained in the cache
+	 * (DML hooks / Drop / DDL keep them in sync); a future executor
+	 * extension can call a composite-aware Fetch that builds a Datum
+	 * array from multiple ScanKeys.
+	 */
+	if (rm->n_pkey_attrs != 1)
+		return 0;
+
+	return rm->pkey_attnos[0];
 }
 
 /* ----------------------------------------------------------------
