@@ -1522,19 +1522,250 @@ InvalidateByHeapTuple(Relation rel, HeapTuple tuple)
 	InvalidateEntryByPkey(rm, relid, pkey_datum);
 }
 
+/* ----------------------------------------------------------------
+ * Phase 3 (2/2): write-through for UPDATE
+ *
+ * Replaces the prior invalidate-only handling of heap_update so that
+ * the cached payload stays in sync with the heap.  Keeps the cache
+ * "hot" across a stream of UPDATEs to the same pkey — the typical OLTP
+ * pattern for warehouse / district / customer / profile-table rows.
+ *
+ * Steps for the common case (non-key-update on a cached row):
+ *   1. Flatten newtup to a fresh DSA block (allocations happen OUTSIDE
+ *      the partition lock; slot-create / flatten / dsa_allocate are
+ *      the expensive bits).
+ *   2. Acquire partition lock EXCLUSIVE for the target bucket.
+ *   3. Walk bucket chain; on (relid, pkey_hash, pkey_val) match:
+ *        old_dp = e->payload_dp;
+ *        pg_write_barrier();
+ *        e->payload_dp = new_dp;     -- atomic, single-word
+ *      The barrier guarantees any reader who loads the new pointer
+ *      sees the fully-initialised FlatCachedTuple it points to.
+ *   4. Release partition lock.
+ *   5. RowCacheEpochRetire(old_dp) — outside the lock; lets the GC
+ *      reclaim old payload once no EBR critical section can still hold
+ *      a pointer into it.
+ *
+ * Degraded paths (still correct, just less optimal):
+ *
+ *   key-update (old_pkey != new_pkey):
+ *     Cannot write-through because the new pkey has no entry to update
+ *     (no INSERT hook in this phase).  Falls back to invalidate-only on
+ *     the OLD pkey.  Both old and new pkey will miss cache thereafter
+ *     until Drop+Load; safe but cache-miss.
+ *
+ *   entry-not-cached (UPDATE to a relation that's cache-enabled but
+ *   the specific pkey is not in the bucket chain — e.g. concurrently
+ *   evicted, or the row was inserted after Load):
+ *     Walk completes without a match.  The freshly-flattened payload
+ *     is dsa_free'd directly (no reader ever observed it, so EBR
+ *     retire is unnecessary — direct free is safe and a tiny bit
+ *     faster).
+ *
+ *   flatten failure (OOM):
+ *     RowCacheFlattenTuple ereports on dsa_allocate failure.  That's
+ *     fine: heap_update is past END_CRIT_SECTION and the transaction
+ *     can abort cleanly.  Cache contents remain consistent (the entry
+ *     keeps its previous payload).
+ *
+ * NOT bumping entry_gen: Phase 3 readers (added in Phase 4) tolerate
+ * "saw old payload after writer swapped" via MVCC visibility check,
+ * exactly as for in-heap stale reads.  If a future reader needs
+ * stronger "did this entry get replaced under me" detection, add a
+ * pg_atomic_fetch_add_u64 on entry->entry_gen here.
+ * ---------------------------------------------------------------- */
+
+/*
+ * Wrap RowCacheFlattenTuple so callers that hold only a HeapTuple
+ * (heap_update / heap_delete hooks) can flatten without manually
+ * setting up a slot.
+ *
+ * Allocates a single-tuple slot in CurrentMemoryContext (caller
+ * guarantees we're not in a CRIT_SECTION; allocation may ereport on
+ * OOM).  Slot is dropped before return so we never leak across calls.
+ */
+static dsa_pointer
+FlattenHeapTupleToDsa(Relation rel, HeapTuple htup)
+{
+	TupleTableSlot *slot;
+	dsa_pointer		dp;
+
+	Assert(rel != NULL && htup != NULL);
+
+	EnsureRowCacheDsa();
+
+	slot = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsHeapTuple);
+	ExecStoreHeapTuple(htup, slot, false);
+	dp = RowCacheFlattenTuple(LocalDsa, slot);
+	ExecDropSingleTupleTableSlot(slot);
+
+	return dp;
+}
+
+/*
+ * Find entry by (relid, pkey) and atomically swap its payload_dp to
+ * `new_payload_dp`.  On success returns the previous payload_dp (which
+ * the caller must retire).  On miss returns InvalidDsaPointer and
+ * `*found` is set to false; caller should dsa_free the wasted new
+ * payload directly.
+ *
+ * Uses the same lock + walk discipline as InvalidateEntryByPkey.
+ */
+static dsa_pointer
+ReplaceEntryPayloadByPkey(RelMeta *rm, Oid relid, Datum pkey_datum,
+						  dsa_pointer new_payload_dp, bool *found)
+{
+	uint64			packed;
+	uint32			pkey_hash;
+	uint32			bucket;
+	LWLock		   *part;
+	dsa_pointer	   *heads;
+	dsa_pointer		cur_dp;
+	dsa_pointer		old_payload_dp = InvalidDsaPointer;
+
+	Assert(rm != NULL && found != NULL);
+	*found = false;
+
+	EnsureRowCacheDsa();
+
+	packed = PackPkeyDatum(pkey_datum, rm->pkey_typlen);
+	pkey_hash = ComputePkeyHash(packed);
+	bucket = pkey_hash & ROW_CACHE_BUCKET_MASK;
+	part = PartitionLockForBucket(bucket);
+
+	LWLockAcquire(part, LW_EXCLUSIVE);
+
+	if (!DsaPointerIsValid(RowCacheCtl->hash_buckets_dp))
+	{
+		LWLockRelease(part);
+		return InvalidDsaPointer;
+	}
+
+	heads = BucketHeads();
+	cur_dp = heads[bucket];
+
+	while (DsaPointerIsValid(cur_dp))
+	{
+		GlobalEntry *e = (GlobalEntry *) dsa_get_address(LocalDsa, cur_dp);
+
+		if (e->relid == relid &&
+			e->pkey_hash == pkey_hash &&
+			e->pkey_val == packed)
+		{
+			old_payload_dp = e->payload_dp;
+			/*
+			 * write_barrier before publishing the new pointer so a
+			 * reader that loads new_payload_dp afterwards sees the
+			 * fully-initialised FlatCachedTuple at that address.
+			 */
+			pg_write_barrier();
+			e->payload_dp = new_payload_dp;
+			*found = true;
+			break;
+		}
+		cur_dp = e->next_dp;
+	}
+
+	LWLockRelease(part);
+
+	return old_payload_dp;
+}
+
 /*
  * Public DML hooks.  Called from heap_update / heap_delete after
  * END_CRIT_SECTION + CacheInvalidateHeapTuple but before ReleaseBuffer.
  *
- * `oldtup` is the heap tuple being replaced/removed; for UPDATE we use
- * the OLD pkey to evict (see header comment for the key-update edge
- * case discussion).
+ * UPDATE uses write-through (Phase 3 (2/2)); DELETE uses invalidate-
+ * only (Phase 3 (1/2) — DELETE removes the entry entirely, so write-
+ * through is not meaningful).
  */
 void
 RowCacheOnHeapUpdate(Relation rel, HeapTuple oldtup, HeapTuple newtup)
 {
-	(void) newtup;					/* unused: invalidate-only strategy */
-	InvalidateByHeapTuple(rel, oldtup);
+	RelMeta		   *rm;
+	Datum			old_pkey;
+	Datum			new_pkey;
+	bool			old_isnull;
+	bool			new_isnull;
+	Oid				relid;
+	uint64			old_packed;
+	uint64			new_packed;
+	dsa_pointer		new_payload_dp;
+	dsa_pointer		old_payload_dp;
+	bool			found;
+
+	if (RowCacheCtl == NULL)
+		return;
+	if (rel == NULL || oldtup == NULL || oldtup->t_data == NULL)
+		return;
+	if (newtup == NULL || newtup->t_data == NULL)
+		return;
+
+	relid = RelationGetRelid(rel);
+	rm = FindRelMeta(relid);
+	if (rm == NULL)
+		return;
+	if (pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
+		return;
+	if (rm->pkey_attno <= 0)
+		return;
+
+	old_pkey = heap_getattr(oldtup, rm->pkey_attno,
+							RelationGetDescr(rel), &old_isnull);
+	if (old_isnull)
+		return;
+
+	new_pkey = heap_getattr(newtup, rm->pkey_attno,
+							RelationGetDescr(rel), &new_isnull);
+	if (new_isnull)
+	{
+		/* Defensive: pkeys are NOT NULL.  If somehow null, treat the
+		 * update as an invalidation of the old pkey. */
+		InvalidateEntryByPkey(rm, relid, old_pkey);
+		return;
+	}
+
+	old_packed = PackPkeyDatum(old_pkey, rm->pkey_typlen);
+	new_packed = PackPkeyDatum(new_pkey, rm->pkey_typlen);
+
+	/*
+	 * Key-update degrade path: pkey changed.  Without an INSERT hook
+	 * we cannot populate the new pkey, so the most-consistent thing
+	 * we can do is evict the old entry and leave both old and new
+	 * pkey to fall back to native btree.
+	 */
+	if (old_packed != new_packed)
+	{
+		InvalidateEntryByPkey(rm, relid, old_pkey);
+		return;
+	}
+
+	/* Non-key-update: write-through. */
+	new_payload_dp = FlattenHeapTupleToDsa(rel, newtup);
+	if (!DsaPointerIsValid(new_payload_dp))
+		return;					/* unlikely; flatten ereports on OOM */
+
+	old_payload_dp = ReplaceEntryPayloadByPkey(rm, relid, old_pkey,
+											   new_payload_dp, &found);
+
+	if (found)
+	{
+		/* Retire old payload — no reader who already loaded it can be
+		 * harmed because EBR keeps the dpts alive until safe_epoch. */
+		if (DsaPointerIsValid(old_payload_dp))
+			RowCacheEpochRetire(old_payload_dp,
+								InvalidDsaPointer,
+								InvalidDsaPointer);
+	}
+	else
+	{
+		/*
+		 * Entry not in cache (concurrent eviction / never loaded).  The
+		 * freshly-flattened payload was never published to any reader,
+		 * so direct dsa_free is safe and avoids one EBR cycle of delay.
+		 */
+		dsa_free(LocalDsa, new_payload_dp);
+	}
 }
 
 void
