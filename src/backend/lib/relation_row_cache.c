@@ -56,6 +56,7 @@
 #include "utils/wait_event.h"
 #include "utils/dsa.h"
 #include "utils/hsearch.h"
+#include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/relcache.h"
@@ -310,6 +311,13 @@ static size_t		MyRetireListLen = 0;
  * the V4 Phase 1 helpers). */
 static void EnsureRowCacheDsa(void);
 
+/* Forward-declared here so rowcache_relcache_callback (defined below in
+ * the EBR section) can touch the sticky-lookup statics and FindRelMeta
+ * helper that physically live further down with the Phase 1 globals. */
+static Oid			LastLookupRelid;
+static RelMeta	   *LastLookupRelMeta;
+static RelMeta *FindRelMeta(Oid relid);
+
 void
 RowCacheEpochRetire(dsa_pointer dp_a, dsa_pointer dp_b, dsa_pointer dp_c)
 {
@@ -446,8 +454,10 @@ typedef struct OrphanBatch
 } OrphanBatch;
 
 static bool	RowCacheExitCallbackRegistered = false;
+static bool	RowCacheRelcacheCallbackRegistered = false;
 
 static void rowcache_backend_exit_cleanup(int code, Datum arg);
+static void rowcache_relcache_callback(Datum arg, Oid relid);
 
 /*
  * Idempotent: install before_shmem_exit once per backend, the first time
@@ -461,6 +471,25 @@ RowCacheRegisterExitCallback(void)
 		return;
 	before_shmem_exit(rowcache_backend_exit_cleanup, (Datum) 0);
 	RowCacheExitCallbackRegistered = true;
+}
+
+/*
+ * Idempotent: install a relcache invalidation callback once per backend.
+ * Called from EnsureRowCacheDsa alongside the exit hook so any backend
+ * that touches the cache also wires up DDL-driven invalidation.
+ *
+ * sinval is delivered to every backend, so each cache-touching backend
+ * runs the callback independently when its AcceptInvalidationMessages
+ * fires.  All updates land on shmem (RelMeta.state / rel_gen) which is
+ * idempotent under concurrent writes.
+ */
+static void
+RowCacheRegisterRelcacheCallback(void)
+{
+	if (RowCacheRelcacheCallbackRegistered)
+		return;
+	CacheRegisterRelcacheCallback(rowcache_relcache_callback, (Datum) 0);
+	RowCacheRelcacheCallbackRegistered = true;
 }
 
 /*
@@ -531,6 +560,78 @@ rowcache_backend_exit_cleanup(int code, Datum arg)
 	LWLockRelease(&RowCacheCtl->orphan_list_lock);
 
 	MyRetireListLen = 0;
+}
+
+/*
+ * Relcache invalidation callback (Phase 3 (5/5)).
+ *
+ * Fired in every backend when a relation's catalog state changes
+ * (DROP TABLE, ALTER TABLE that rewrites tuples, schema changes,
+ * etc.).  Our job is to unpublish the cached entries for `relid` so
+ * future readers in this and every other backend stop using them.
+ *
+ * Two-level invariant:
+ *
+ *   - state = DISABLED  → atomic_load in the read path's fast-fail
+ *     short-circuit will bail before even entering the EBR critical
+ *     section.
+ *
+ *   - rel_gen ++         → any reader that did enter the critical
+ *     section and grabbed a GlobalEntry whose rel_gen_at_load matched
+ *     the OLD value will fail the rel_gen check after our bump and
+ *     treat it as a miss.
+ *
+ * Note: we do NOT sweep + retire entries here.  sinval is broadcast to
+ * every backend, so a sweep would happen in each backend independently
+ * — O(N_backends × N_buckets) work for what is conceptually a single
+ * O(N_buckets) job.  Physical reclamation is deferred to the next
+ * explicit Drop, the next Load (which detects stale state via build_lock
+ * + double-check), or future LRU eviction.
+ *
+ * Idempotence + race-safety: pg_atomic_write_u32 and fetch_add_u64 are
+ * safe under concurrent firings of this callback in multiple backends;
+ * the final state and rel_gen value are well-defined.
+ *
+ * relid == InvalidOid means "everything is potentially invalid"; this
+ * happens e.g. after CREATE/DROP DATABASE.  We don't currently support
+ * a bulk-bump, but the cache is anyway DROP'd at database boundaries
+ * (via sinval on each individual relation that gets dropped), so the
+ * miss is harmless in practice.  Wire up a per-RelMeta scan here later
+ * if a workload actually triggers it.
+ */
+static void
+rowcache_relcache_callback(Datum arg, Oid relid)
+{
+	RelMeta	   *rm;
+
+	if (RowCacheCtl == NULL)
+		return;
+	if (!OidIsValid(relid))
+		return;					/* see note above */
+
+	rm = FindRelMeta(relid);
+	if (rm == NULL)
+		return;
+
+	/*
+	 * Two-step unpublish, atomic store + atomic add; safe to race
+	 * across backends.  The exact order doesn't matter for correctness
+	 * because readers fail on EITHER signal; we write state first so a
+	 * fast-fail reader bails before paying for EpochEnter.
+	 */
+	pg_atomic_write_u32(&rm->state, RELMETA_DISABLED);
+	(void) pg_atomic_fetch_add_u64(&rm->rel_gen, 1);
+
+	/*
+	 * Invalidate this backend's sticky-lookup cache.  Other backends
+	 * each receive their own sinval and will invalidate their own
+	 * sticky during their own callback firing.
+	 */
+	if (LastLookupRelid == relid)
+	{
+		LastLookupRelid = InvalidOid;
+		LastLookupRelMeta = NULL;
+	}
 }
 
 /*
@@ -861,6 +962,13 @@ EnsureRowCacheDsa(void)
 	 * once per backend (idempotent inside RowCacheRegisterExitCallback).
 	 */
 	RowCacheRegisterExitCallback();
+
+	/*
+	 * Lazily install the relcache invalidation callback so DDL on cached
+	 * relations is observed by this backend.  Same rationale as above:
+	 * skip the cost in backends that never touch the cache.
+	 */
+	RowCacheRegisterRelcacheCallback();
 }
 
 /* ----------------------------------------------------------------
@@ -1980,6 +2088,7 @@ RelationRowCachePkeyFetch(Oid relid,
 	FlatCachedTuple *flat;
 	HeapTupleData htup;
 	ItemPointerData tid;
+	bool		result = false;
 
 	Assert(is_visible != NULL && has_hot_chain != NULL);
 	*is_visible = false;
@@ -2000,9 +2109,40 @@ RelationRowCachePkeyFetch(Oid relid,
 		LastLookupRelMeta = rm;
 	}
 
+	/*
+	 * Fast-fail: out-of-EBR atomic_load of state.  Avoids paying for
+	 * EpochEnter on every fetch when the relation is not cache-enabled
+	 * (the overwhelming common case for non-cached tables in TPC-C-like
+	 * workloads).
+	 */
 	if (rm == NULL ||
 		pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
 		return false;
+
+	/*
+	 * Phase 4 EBR enter: from here until EpochExit we are a "reader" in
+	 * EBR terms.  Any GlobalEntry / FlatCachedTuple we touch is
+	 * guaranteed to remain physically backed by DSA — even if Drop /
+	 * DML / VACUUM retires it concurrently, GC won't dsa_free until
+	 * after we EpochExit.
+	 *
+	 * EpochEnter cost: 1 atomic_load (global_epoch) + 1 atomic_store
+	 * (MyProc->rowcache_local_epoch) + 1 memory_barrier ≈ 3-5 ns.  No
+	 * RMW, no lock, no cache-line ping-pong.
+	 */
+	RowCacheEpochEnter();
+
+	/*
+	 * Re-check state after EpochEnter.  Without this, a Drop that
+	 * completed between our fast-fail check above and EpochEnter would
+	 * be invisible: its retire epoch could be < our local_epoch, GC
+	 * would dsa_free the entry, and our subsequent dsa_get_address
+	 * could land on freed memory.  Re-reading state under our
+	 * critical-section flag guarantees the (state, retire) ordering
+	 * Drop established with its memory_barrier still applies.
+	 */
+	if (pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
+		goto out;
 	pg_read_barrier();
 
 	EnsureRowCacheDsa();
@@ -2013,17 +2153,17 @@ RelationRowCachePkeyFetch(Oid relid,
 
 	entry = BucketLookup(bucket, relid, packed, NULL);
 	if (entry == NULL)
-		return false;
+		goto out;
 
 	/* Validate entry: must be FRESH and same generation. */
 	if (pg_atomic_read_u32(&entry->state) != ROW_CACHE_ENTRY_FRESH)
-		return false;
+		goto out;
 	if (entry->rel_gen_at_load != pg_atomic_read_u64(&rm->rel_gen))
-		return false;
+		goto out;
 	pg_read_barrier();
 
 	if (!DsaPointerIsValid(entry->payload_dp))
-		return false;
+		goto out;
 	flat = (FlatCachedTuple *) dsa_get_address(LocalDsa, entry->payload_dp);
 
 	/*
@@ -2031,6 +2171,11 @@ RelationRowCachePkeyFetch(Oid relid,
 	 * so we can run the MVCC visibility check.  The TID is recovered
 	 * from the embedded HeapTupleHeader (set when we flattened) for the
 	 * has_hot_chain / slot fill.
+	 *
+	 * EBR guarantees `flat` stays valid until EpochExit even if a
+	 * concurrent write-through swapped entry->payload_dp to a new
+	 * block and retired this one — the retired block's dsa_free is
+	 * gated on safe_epoch > our local_epoch.
 	 */
 	ItemPointerCopy(&entry->tid, &tid);
 	htup.t_data = (HeapTupleHeader) FLAT_TUPLE_HTUP_DATA(flat);
@@ -2048,7 +2193,11 @@ RelationRowCachePkeyFetch(Oid relid,
 		RowCacheUnflattenToSlot(flat, relid, &tid, slot);
 	}
 
-	return true;
+	result = true;
+
+out:
+	RowCacheEpochExit();
+	return result;
 }
 
 /* ----------------------------------------------------------------

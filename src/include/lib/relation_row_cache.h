@@ -13,10 +13,21 @@
  *   - IndexNext hook (in nodeIndexscan.c) calls RelationRowCachePkeyFetch.
  *   - FlatCachedTuple (from tid_row_cache.{c,h}) is reused as the payload.
  *
- * Phase 1 lifetime contract (same as V3):
- *   Callers must guarantee no readers run concurrently with Load / Drop.
- *   This phase has no EBR (deferred to Phase 2): Drop frees DSA entries
- *   immediately, relying on the caller contract to avoid use-after-free.
+ * Concurrent-reader safety (as of Phase 3 (5/5)):
+ *   The Phase 1 lifetime contract that required "no readers concurrent
+ *   with Load / Drop" has been LIFTED.  Drop now goes through unpublish
+ *   (state=DISABLED + rel_gen bump) + EBR-retire (Phase 3 (3/4)), and
+ *   the read path (RelationRowCachePkeyFetch) wraps its critical
+ *   section with RowCacheEpochEnter/Exit (Phase 3 (5/5)).  Together
+ *   these guarantee that any reader in flight when Drop / DML / DDL
+ *   fires keeps a valid view of its already-loaded GlobalEntry /
+ *   FlatCachedTuple until it exits the EBR critical section; physical
+ *   reclamation by the rowcache-gc worker is gated on safe_epoch
+ *   advancing past every in-flight reader's local_epoch.
+ *
+ *   Load remains serialized with itself and with Drop via per-RelMeta
+ *   build_lock; concurrent readers see either "old, fully-published
+ *   state" or "new, fully-published state" but never an intermediate.
  *
  * Phase 1 OUT of scope (left as stubs):
  *   - EBR / retire-list / bgworker GC (Phase 2)
