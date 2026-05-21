@@ -889,6 +889,8 @@ static int SerializePkeyFromSlot(TupleTableSlot *slot, RelMeta *rm,
 static int SerializePkeyFromTuple(HeapTuple tuple, TupleDesc desc,
 								  RelMeta *rm, uint8 *out_buf);
 static int SerializePkeyFromDatum(Datum d, RelMeta *rm, uint8 *out_buf);
+static int SerializePkeyFromDatumArray(const Datum *vals, int nvals,
+									   RelMeta *rm, uint8 *out_buf);
 static inline uint32 ComputePkeyHashBytes(const uint8 *buf, int len);
 static void DropAllEntriesForRelid(Oid relid);
 
@@ -1295,6 +1297,36 @@ SerializePkeyFromDatum(Datum d, RelMeta *rm, uint8 *out_buf)
 		return -1;
 	store_att_byval(out_buf, d, rm->pkey_typlens[0]);
 	return rm->pkey_typlens[0];
+}
+
+/*
+ * Composite Datum-array flavor.  Used by the executor IndexNext gate
+ * (Phase 4 (2/2)) after it has gathered one Datum per cached pkey
+ * column from the scan's equality ScanKeys.
+ *
+ * Caller must pass nvals == rm->n_pkey_attrs and supply Datums in the
+ * exact attno order recorded in rm->pkey_attnos[].  Returns -1 if those
+ * preconditions don't hold or buffer would overflow.
+ */
+static int
+SerializePkeyFromDatumArray(const Datum *vals, int nvals,
+							RelMeta *rm, uint8 *out_buf)
+{
+	int		total = 0;
+
+	if (nvals != rm->n_pkey_attrs)
+		return -1;
+	if (rm->pkey_total_len > ROW_CACHE_PKEY_INLINE_BYTES)
+		return -1;
+
+	for (int i = 0; i < nvals; i++)
+	{
+		int16	typlen = rm->pkey_typlens[i];
+
+		store_att_byval(out_buf + total, vals[i], typlen);
+		total += typlen;
+	}
+	return total;
 }
 
 /*
@@ -2233,106 +2265,76 @@ RelationRowCacheDropRelation(Oid relid)
 }
 
 /* ----------------------------------------------------------------
- * Public API: PkeyFetch
+ * Public API: PkeyFetch / PkeyFetchComposite
  * ----------------------------------------------------------------
  *
- * Read path is lock-free (Phase 1 contract).  See section 4.1 of the
- * design doc for the protocol; Phase 1 omits the EBR enter/exit calls,
- * everything else is identical:
+ * Shared protocol (Phase 3 (5/5) + Phase 4):
  *
  *   1. Sticky lookup -> RelMeta.
- *   2. Atomic-read state; bail if not ENABLED.
- *   3. Pack pkey, compute hash, walk bucket chain.
- *   4. If found: validate rel_gen and entry state, do MVCC check, fill slot.
+ *   2. Out-of-EBR fast-fail atomic_load(state).
+ *   3. Caller serializes pkey from its own input shape (single Datum,
+ *      Datum[], future byref bytes, ...) and verifies n_pkey_attrs.
+ *   4. RowCacheEpochEnter (EBR critical section begins).
+ *   5. Re-check state inside EBR (guards against Drop-after-fast-fail).
+ *   6. Bucket lookup, validate entry FRESH + same rel_gen.
+ *   7. dsa_get_address payload, MVCC visibility check, slot fill.
+ *   8. RowCacheEpochExit (EBR critical section ends).
+ *
+ * Steps 4-8 are identical for single-col and composite paths; we
+ * factor them into DoPkeyFetchBytes so the two public entry points
+ * only differ in how they produce the serialized pkey buffer.
  */
-bool
-RelationRowCachePkeyFetch(Oid relid,
-						  Datum pkey_val,
-						  Snapshot snapshot,
-						  TupleTableSlot *slot,
-						  bool *is_visible,
-						  bool *has_hot_chain)
+
+/*
+ * Inner read-side workhorse.  Caller MUST have already:
+ *   - validated rm is non-null and state was ENABLED at fast-fail time
+ *   - validated rm->n_pkey_attrs matches the call shape
+ *   - serialized the pkey into pkey_buf[0..pkey_len-1] using
+ *     SerializePkeyFromDatum / SerializePkeyFromDatumArray
+ *
+ * Returns true when a cache entry was found (regardless of MVCC
+ * visibility).  Sets *is_visible / *has_hot_chain accordingly.
+ * Returns false when:
+ *   - state flipped to non-ENABLED inside EBR critical section
+ *   - bucket lookup found nothing
+ *   - entry state was not FRESH or rel_gen mismatch
+ *   - entry payload was unexpectedly invalid
+ *
+ * Always exits EBR before returning.
+ */
+static bool
+DoPkeyFetchBytes(RelMeta *rm, Oid relid,
+				 const uint8 *pkey_buf, int pkey_len,
+				 Snapshot snapshot, TupleTableSlot *slot,
+				 bool *is_visible, bool *has_hot_chain)
 {
-	RelMeta    *rm;
-	uint8		pkey_buf[ROW_CACHE_PKEY_INLINE_BYTES];
-	int			pkey_len;
-	uint32		hash;
-	uint32		bucket;
-	GlobalEntry *entry;
+	uint32			hash;
+	uint32			bucket;
+	GlobalEntry	   *entry;
 	FlatCachedTuple *flat;
-	HeapTupleData htup;
-	ItemPointerData tid;
-	bool		result = false;
-
-	Assert(is_visible != NULL && has_hot_chain != NULL);
-	*is_visible = false;
-	*has_hot_chain = false;
-
-	if (RowCacheCtl == NULL || !OidIsValid(relid))
-		return false;
-	if (!IsMVCCSnapshot(snapshot))
-		return false;
-
-	/* Sticky lookup. */
-	if (relid == LastLookupRelid)
-		rm = LastLookupRelMeta;
-	else
-	{
-		rm = FindRelMeta(relid);
-		LastLookupRelid = relid;
-		LastLookupRelMeta = rm;
-	}
+	HeapTupleData	htup;
+	ItemPointerData	tid;
+	bool			result = false;
 
 	/*
-	 * Fast-fail: out-of-EBR atomic_load of state.  Avoids paying for
-	 * EpochEnter on every fetch when the relation is not cache-enabled
-	 * (the overwhelming common case for non-cached tables in TPC-C-like
-	 * workloads).
-	 */
-	if (rm == NULL ||
-		pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
-		return false;
-
-	/*
-	 * Single-Datum fetch API only handles single-column pkeys (executor's
-	 * IndexNext gate currently never triggers for composite pkeys).
-	 * Composite-pkey tables can still be Load'd into the cache but reads
-	 * must go through the future composite-aware Fetch entry point.
-	 */
-	if (rm->n_pkey_attrs != 1)
-		return false;
-
-	/*
-	 * Phase 4 EBR enter: from here until EpochExit we are a "reader" in
-	 * EBR terms.  Any GlobalEntry / FlatCachedTuple we touch is
-	 * guaranteed to remain physically backed by DSA — even if Drop /
-	 * DML / VACUUM retires it concurrently, GC won't dsa_free until
-	 * after we EpochExit.
-	 *
-	 * EpochEnter cost: 1 atomic_load (global_epoch) + 1 atomic_store
-	 * (MyProc->rowcache_local_epoch) + 1 memory_barrier ≈ 3-5 ns.  No
-	 * RMW, no lock, no cache-line ping-pong.
+	 * Phase 3 (5/5) EBR enter.  Any GlobalEntry / FlatCachedTuple we
+	 * touch from this point on is guaranteed to remain physically
+	 * backed by DSA, even if Drop / DML / VACUUM retires it
+	 * concurrently — GC waits for safe_epoch > our local_epoch.
 	 */
 	RowCacheEpochEnter();
 
 	/*
-	 * Re-check state after EpochEnter.  Without this, a Drop that
-	 * completed between our fast-fail check above and EpochEnter would
-	 * be invisible: its retire epoch could be < our local_epoch, GC
-	 * would dsa_free the entry, and our subsequent dsa_get_address
-	 * could land on freed memory.  Re-reading state under our
-	 * critical-section flag guarantees the (state, retire) ordering
-	 * Drop established with its memory_barrier still applies.
+	 * Re-check state inside EBR.  Without this, a Drop that completed
+	 * between the caller's fast-fail and our EpochEnter would have
+	 * pushed its retire batches at an epoch < our local_epoch; GC could
+	 * dsa_free the entries before we observe their unlinked state.
 	 */
 	if (pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
 		goto out;
 	pg_read_barrier();
 
 	EnsureRowCacheDsa();
-
-	pkey_len = SerializePkeyFromDatum(pkey_val, rm, pkey_buf);
-	if (pkey_len < 0)
-		goto out;
 
 	hash = ComputePkeyHashBytes(pkey_buf, pkey_len);
 	bucket = hash & ROW_CACHE_BUCKET_MASK;
@@ -2341,7 +2343,7 @@ RelationRowCachePkeyFetch(Oid relid,
 	if (entry == NULL)
 		goto out;
 
-	/* Validate entry: must be FRESH and same generation. */
+	/* Validate entry: must be FRESH and same rel_gen. */
 	if (pg_atomic_read_u32(&entry->state) != ROW_CACHE_ENTRY_FRESH)
 		goto out;
 	if (entry->rel_gen_at_load != pg_atomic_read_u64(&rm->rel_gen))
@@ -2352,17 +2354,6 @@ RelationRowCachePkeyFetch(Oid relid,
 		goto out;
 	flat = (FlatCachedTuple *) dsa_get_address(LocalDsa, entry->payload_dp);
 
-	/*
-	 * Reconstruct an in-memory HeapTuple pointing into the flat payload
-	 * so we can run the MVCC visibility check.  The TID is recovered
-	 * from the embedded HeapTupleHeader (set when we flattened) for the
-	 * has_hot_chain / slot fill.
-	 *
-	 * EBR guarantees `flat` stays valid until EpochExit even if a
-	 * concurrent write-through swapped entry->payload_dp to a new
-	 * block and retired this one — the retired block's dsa_free is
-	 * gated on safe_epoch > our local_epoch.
-	 */
 	ItemPointerCopy(&entry->tid, &tid);
 	htup.t_data = (HeapTupleHeader) FLAT_TUPLE_HTUP_DATA(flat);
 	htup.t_len = flat->htup_len;
@@ -2386,8 +2377,124 @@ out:
 	return result;
 }
 
+/*
+ * Shared per-call entry sequence used by the two public Fetch APIs.
+ * Looks up sticky RelMeta + does the out-of-EBR state fast-fail.
+ * Returns the RelMeta if eligible to proceed, NULL otherwise.
+ */
+static RelMeta *
+LookupRelMetaForFetch(Oid relid)
+{
+	RelMeta	   *rm;
+
+	if (RowCacheCtl == NULL || !OidIsValid(relid))
+		return NULL;
+
+	if (relid == LastLookupRelid)
+		rm = LastLookupRelMeta;
+	else
+	{
+		rm = FindRelMeta(relid);
+		LastLookupRelid = relid;
+		LastLookupRelMeta = rm;
+	}
+
+	if (rm == NULL ||
+		pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
+		return NULL;
+
+	return rm;
+}
+
+/*
+ * Single-Datum entry point.  Legacy API used by the executor when the
+ * cached relation has exactly one pkey column.  Returns false (no hit)
+ * for composite-pkey tables; callers route composite via
+ * RelationRowCachePkeyFetchComposite.
+ */
+bool
+RelationRowCachePkeyFetch(Oid relid,
+						  Datum pkey_val,
+						  Snapshot snapshot,
+						  TupleTableSlot *slot,
+						  bool *is_visible,
+						  bool *has_hot_chain)
+{
+	RelMeta	   *rm;
+	uint8		pkey_buf[ROW_CACHE_PKEY_INLINE_BYTES];
+	int			pkey_len;
+
+	Assert(is_visible != NULL && has_hot_chain != NULL);
+	*is_visible = false;
+	*has_hot_chain = false;
+
+	if (!IsMVCCSnapshot(snapshot))
+		return false;
+
+	rm = LookupRelMetaForFetch(relid);
+	if (rm == NULL)
+		return false;
+
+	if (rm->n_pkey_attrs != 1)
+		return false;
+
+	pkey_len = SerializePkeyFromDatum(pkey_val, rm, pkey_buf);
+	if (pkey_len < 0)
+		return false;
+
+	return DoPkeyFetchBytes(rm, relid, pkey_buf, pkey_len,
+							snapshot, slot, is_visible, has_hot_chain);
+}
+
+/*
+ * Composite entry point (Phase 4 (2/2)).  Caller passes one Datum per
+ * pkey column in attno-order as recorded by
+ * RelationRowCachePkeyDescriptor.  nvals must equal the descriptor's
+ * natts; mismatch returns false.
+ *
+ * This is the entry point the executor's IndexNext composite dispatch
+ * uses after gathering equality ScanKeys; it also serves any future
+ * caller that needs to probe by multi-column pkey value.
+ */
+bool
+RelationRowCachePkeyFetchComposite(Oid relid,
+								   const Datum *vals,
+								   int nvals,
+								   Snapshot snapshot,
+								   TupleTableSlot *slot,
+								   bool *is_visible,
+								   bool *has_hot_chain)
+{
+	RelMeta	   *rm;
+	uint8		pkey_buf[ROW_CACHE_PKEY_INLINE_BYTES];
+	int			pkey_len;
+
+	Assert(is_visible != NULL && has_hot_chain != NULL);
+	*is_visible = false;
+	*has_hot_chain = false;
+
+	if (vals == NULL || nvals <= 0)
+		return false;
+	if (!IsMVCCSnapshot(snapshot))
+		return false;
+
+	rm = LookupRelMetaForFetch(relid);
+	if (rm == NULL)
+		return false;
+
+	if (rm->n_pkey_attrs != nvals)
+		return false;
+
+	pkey_len = SerializePkeyFromDatumArray(vals, nvals, rm, pkey_buf);
+	if (pkey_len < 0)
+		return false;
+
+	return DoPkeyFetchBytes(rm, relid, pkey_buf, pkey_len,
+							snapshot, slot, is_visible, has_hot_chain);
+}
+
 /* ----------------------------------------------------------------
- * Public API: PkeyAttno
+ * Public API: PkeyAttno + PkeyDescriptor
  * ---------------------------------------------------------------- */
 
 AttrNumber
@@ -2412,19 +2519,70 @@ RelationRowCachePkeyAttno(Oid relid)
 		return 0;
 
 	/*
-	 * The single-Datum executor dispatch only supports single-column
-	 * pkey relations.  Return 0 for composite tables so the executor's
-	 * IndexNext gate never tries the single-Datum Fetch path.
-	 *
-	 * Composite tables are still loaded and maintained in the cache
-	 * (DML hooks / Drop / DDL keep them in sync); a future executor
-	 * extension can call a composite-aware Fetch that builds a Datum
-	 * array from multiple ScanKeys.
+	 * Legacy single-Datum dispatch path returns 0 for composite tables.
+	 * Composite-aware callers should use RelationRowCachePkeyDescriptor
+	 * to learn the full attno list and then dispatch via
+	 * RelationRowCachePkeyFetchComposite.
 	 */
 	if (rm->n_pkey_attrs != 1)
 		return 0;
 
 	return rm->pkey_attnos[0];
+}
+
+/*
+ * Snapshot the relation's cached pkey descriptor into caller-supplied
+ * buffers.  Used by the executor IndexNext gate (Phase 4 (2/2)) to
+ * decide whether to dispatch to RelationRowCachePkeyFetchComposite
+ * and, if so, in what column order to assemble the Datum array.
+ *
+ * On success returns the number of pkey columns (>= 1) and writes
+ * `out_attnos[0..return-1]` with heap attno of each column, in the
+ * order the cache expects to receive Datums.
+ *
+ * Returns 0 when:
+ *   - cache not initialised
+ *   - relid invalid
+ *   - no RelMeta slot for this relid
+ *   - RelMeta state != ENABLED
+ *   - max_attnos < cached n_pkey_attrs (caller buffer too small)
+ *
+ * Cheap: one sticky lookup + a handful of atomic loads + a memcpy of
+ * up to 8 AttrNumbers.  Safe to call on the executor hot path.
+ */
+int
+RelationRowCachePkeyDescriptor(Oid relid, AttrNumber *out_attnos,
+							   int max_attnos)
+{
+	RelMeta	   *rm;
+	int			n;
+
+	if (RowCacheCtl == NULL || !OidIsValid(relid))
+		return 0;
+	if (out_attnos == NULL || max_attnos <= 0)
+		return 0;
+
+	if (relid == LastLookupRelid)
+		rm = LastLookupRelMeta;
+	else
+	{
+		rm = FindRelMeta(relid);
+		LastLookupRelid = relid;
+		LastLookupRelMeta = rm;
+	}
+
+	if (rm == NULL ||
+		pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
+		return 0;
+
+	n = rm->n_pkey_attrs;
+	if (n <= 0 || n > max_attnos)
+		return 0;
+
+	for (int i = 0; i < n; i++)
+		out_attnos[i] = rm->pkey_attnos[i];
+
+	return n;
 }
 
 /* ----------------------------------------------------------------

@@ -201,11 +201,18 @@ extern void RelationRowCacheDropRelation(Oid relid);
 
 /*
  * V4 pkey-driven fast path (used by nodeIndexscan.c).
+ *
+ * RelationRowCachePkeyFetch       — single-column pkey relation.
+ * RelationRowCachePkeyFetchComposite — composite pkey relation.
+ *
  * On hit returns true; *is_visible tells the caller whether the tuple was
  * MVCC-visible to `snapshot`.  On not-loaded / not-found / not-eligible
  * returns false (caller must fall back to btree).
  *
- * `pkey_val` is a non-null Datum of the relation's pkey column type.
+ * For composite, `vals[0..nvals-1]` must be supplied in the attno order
+ * reported by RelationRowCachePkeyDescriptor (which is the order the
+ * cache recorded at Load time, i.e. the index's indkey order).  nvals
+ * must equal the cached n_pkey_attrs; mismatch returns false.
  */
 extern bool RelationRowCachePkeyFetch(Oid relid,
 									  Datum pkey_val,
@@ -213,14 +220,35 @@ extern bool RelationRowCachePkeyFetch(Oid relid,
 									  TupleTableSlot *slot,
 									  bool *is_visible,
 									  bool *has_hot_chain);
+extern bool RelationRowCachePkeyFetchComposite(Oid relid,
+											   const Datum *vals,
+											   int nvals,
+											   Snapshot snapshot,
+											   TupleTableSlot *slot,
+											   bool *is_visible,
+											   bool *has_hot_chain);
 
 /*
  * Return the 1-based pkey attno currently registered for this relation
  * (matching the cache's pkey column).  Returns 0 if the relation is not
- * cached, not loaded, or its cache uses a key shape this Phase doesn't
- * support.  Cheap; safe on the executor hot path.
+ * cached, not loaded, or its cache uses a composite pkey.  Cheap; safe
+ * on the executor hot path.
  */
 extern AttrNumber RelationRowCachePkeyAttno(Oid relid);
+
+/*
+ * Snapshot the relation's cached pkey descriptor: writes the cache's
+ * full attno list (in load-time / index order) into out_attnos[] and
+ * returns the count.  Returns 0 when the relation is not cached, not
+ * loaded, or the caller's buffer is too small.
+ *
+ * Used by nodeIndexscan.c IndexNext to verify a runtime composite-
+ * dispatch is safe (cache attnos match index attnos position-for-
+ * position) and to know how many ScanKey arguments to gather.
+ */
+extern int RelationRowCachePkeyDescriptor(Oid relid,
+										   AttrNumber *out_attnos,
+										   int max_attnos);
 
 /*
  * Legacy TID-keyed API.  V4 Phase 1 has no TID-keyed path; these are
