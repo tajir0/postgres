@@ -89,6 +89,14 @@ extern void   RowCacheLocalGC(void);
 extern size_t RowCacheLocalRetireCount(void);
 
 /*
+ * Register the rowcache-gc background worker.  Called once from postmaster
+ * startup (see src/backend/postmaster/postmaster.c) before
+ * process_shared_preload_libraries runs, so the worker slot is reserved
+ * before extensions get a chance to consume one.
+ */
+extern void RowCacheGCRegister(void);
+
+/*
  * Enter a row-cache read critical section.
  *
  * Snapshots the current global_epoch into MyProc->rowcache_local_epoch

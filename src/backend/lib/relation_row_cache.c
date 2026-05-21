@@ -40,12 +40,20 @@
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/bufmgr.h"
+#include "libpq/pqsignal.h"
+#include "postmaster/bgworker.h"
+#include "postmaster/interrupt.h"
+#include "storage/ipc.h"
 #include "storage/itemptr.h"
+#include "storage/latch.h"
 #include "storage/lockdefs.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/shmem.h"
+#include "tcop/tcopprot.h"
+#include "utils/guc.h"
+#include "utils/wait_event.h"
 #include "utils/dsa.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
@@ -385,6 +393,115 @@ size_t
 RowCacheLocalRetireCount(void)
 {
 	return MyRetireListLen;
+}
+
+/* ----------------------------------------------------------------
+ * Phase 2 (3/4): "rowcache-gc" background worker
+ *
+ * One commonly-shared, postmaster-monitored bgworker that periodically:
+ *   1. Computes safe_epoch = min over ProcArray of every backend's
+ *      rowcache_local_epoch (skipping idle slots == 0).
+ *   2. Publishes the result via RowCacheSafeEpochPublish.
+ *   3. Sleeps GC_INTERVAL_MS (latch-interruptible).
+ *
+ * Backends consume the published value in their own RowCacheLocalGC
+ * pass — see Phase 2 (2/4).  This worker therefore does not directly
+ * dsa_free anything; it is purely the safe-epoch publisher.
+ *
+ * Registration (RowCacheGCRegister) is called from postmaster startup
+ * just after ApplyLauncherRegister, before process_shared_preload_libraries
+ * gets a chance to consume worker slots.  Uses BGWORKER_SHMEM_ACCESS but
+ * NOT BGWORKER_BACKEND_DATABASE_CONNECTION — the GC only touches shmem
+ * (ProcArray + RowCacheCtl), no catalog access required.
+ *
+ * Restart policy:
+ *   bgw_restart_time = 5 seconds.  A crash here is fixable without
+ *   bringing down the cluster: until a new GC instance comes up,
+ *   safe_epoch_published stays frozen and retire lists grow, but the
+ *   cluster keeps serving reads.
+ *
+ * Future Phase 2 (3/4 cont.):
+ *   When the orphan list (for crashed-backend cleanup) lands, this
+ *   worker will also drain it under the published safe_epoch.
+ * ---------------------------------------------------------------- */
+
+#define ROWCACHE_GC_INTERVAL_MS	100
+
+PGDLLEXPORT void RowCacheGCMain(Datum main_arg);
+
+void
+RowCacheGCMain(Datum main_arg)
+{
+	ereport(DEBUG1,
+			(errmsg_internal("row-cache GC worker started")));
+
+	/* Standard bgworker signal handlers. */
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	pqsignal(SIGTERM, die);
+	BackgroundWorkerUnblockSignals();
+
+	for (;;)
+	{
+		int		rc;
+		uint64	safe;
+
+		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * Core duty: compute and publish safe_epoch.  Even if no backend
+		 * has anything to retire, publishing keeps the counter fresh so
+		 * any future retire is reclaimable promptly.
+		 */
+		if (RowCacheCtl != NULL)
+		{
+			safe = RowCacheComputeSafeEpoch();
+			RowCacheSafeEpochPublish(safe);
+		}
+
+		/* Sleep until SIGHUP / SIGTERM / interval timeout / postmaster death. */
+		rc = WaitLatch(MyLatch,
+					   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+					   ROWCACHE_GC_INTERVAL_MS,
+					   WAIT_EVENT_ROWCACHE_GC_MAIN);
+
+		if (rc & WL_LATCH_SET)
+		{
+			ResetLatch(MyLatch);
+			CHECK_FOR_INTERRUPTS();
+		}
+
+		if (ConfigReloadPending)
+		{
+			ConfigReloadPending = false;
+			ProcessConfigFile(PGC_SIGHUP);
+		}
+	}
+	/* unreachable; die() and proc_exit() handle exit paths */
+}
+
+/*
+ * Register the rowcache-gc worker.  Called from postmaster startup.
+ *
+ * Built-in worker, library_name = "postgres" so the postmaster looks the
+ * function up in its own symbol table rather than dlopening a .so.
+ */
+void
+RowCacheGCRegister(void)
+{
+	BackgroundWorker bgw;
+
+	memset(&bgw, 0, sizeof(bgw));
+	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS;
+	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	bgw.bgw_restart_time = 5;
+	snprintf(bgw.bgw_library_name, MAXPGPATH, "postgres");
+	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "RowCacheGCMain");
+	snprintf(bgw.bgw_name, BGW_MAXLEN, "rowcache-gc");
+	snprintf(bgw.bgw_type, BGW_MAXLEN, "rowcache-gc");
+	bgw.bgw_notify_pid = 0;
+	bgw.bgw_main_arg = (Datum) 0;
+
+	RegisterBackgroundWorker(&bgw);
 }
 
 /*
