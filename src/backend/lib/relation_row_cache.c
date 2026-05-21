@@ -164,6 +164,20 @@ typedef struct RowCacheControl
 	pg_atomic_uint64 global_epoch;
 	pg_atomic_uint64 safe_epoch_published;
 
+	/*
+	 * Orphan retire list (Phase 2 4/4 prerequisite).
+	 *
+	 * When a backend exits (normally or abnormally) with retires still
+	 * pending in its backend-local list, the before_shmem_exit hook moves
+	 * them here so the GC worker can reclaim them once safe_epoch passes.
+	 *
+	 *   orphan_list_lock     — protects head pointer updates
+	 *   orphan_list_head_dp  — head of a chain of OrphanBatch nodes in DSA;
+	 *                          InvalidDsaPointer when empty
+	 */
+	LWLock			orphan_list_lock;
+	dsa_pointer		orphan_list_head_dp;
+
 	RelMeta			relmetas[ROW_CACHE_MAX_RELATIONS];
 } RowCacheControl;
 
@@ -396,6 +410,193 @@ RowCacheLocalRetireCount(void)
 }
 
 /* ----------------------------------------------------------------
+ * Phase 2 (4/4 prerequisite): backend-exit cleanup + orphan list
+ *
+ * If a backend dies (clean disconnect, FATAL, postmaster signal) while
+ * its retire list is non-empty, the palloc'd RetireNodes evaporate with
+ * the backend's memory context — but the DSA blocks they point at do
+ * NOT.  Without intervention those DSA blocks leak forever.
+ *
+ * Mitigation:
+ *
+ *   1. Register a before_shmem_exit hook the first time this backend
+ *      attaches to the row-cache DSA.  Backends that never touched the
+ *      cache pay nothing.
+ *
+ *   2. On exit the hook walks MyRetireHead and moves each entry into
+ *      the shmem-anchored orphan list as an OrphanBatch node allocated
+ *      in DSA (this backend is still attached to DSA at before_shmem_exit
+ *      time — DSA detach is sequenced after, in on_shmem_exit).  After
+ *      splicing it also forces MyProc->rowcache_local_epoch to 0 so a
+ *      dead backend can never permanently block safe_epoch advance.
+ *
+ *   3. The GC worker drains the orphan list each tick under the freshly
+ *      published safe_epoch, dsa_free'ing each batch's payload pointers
+ *      and freeing the OrphanBatch node itself.
+ *
+ * Lock-order: orphan_list_lock is leaf — no other lock is acquired
+ * while held, so it cannot deadlock against partition / build locks.
+ * ---------------------------------------------------------------- */
+
+typedef struct OrphanBatch
+{
+	uint64			epoch;
+	dsa_pointer		dp[RETIRE_NODE_SLOTS];
+	dsa_pointer		next_dp;	/* InvalidDsaPointer at list tail */
+} OrphanBatch;
+
+static bool	RowCacheExitCallbackRegistered = false;
+
+static void rowcache_backend_exit_cleanup(int code, Datum arg);
+
+/*
+ * Idempotent: install before_shmem_exit once per backend, the first time
+ * the backend touches the cache (i.e. inside EnsureRowCacheDsa).  Backends
+ * that never call EnsureRowCacheDsa skip this entirely.
+ */
+static void
+RowCacheRegisterExitCallback(void)
+{
+	if (RowCacheExitCallbackRegistered)
+		return;
+	before_shmem_exit(rowcache_backend_exit_cleanup, (Datum) 0);
+	RowCacheExitCallbackRegistered = true;
+}
+
+/*
+ * Splice MyRetireHead onto the shmem orphan list, then drop our
+ * rowcache_local_epoch so we never block safe_epoch advance after exit.
+ *
+ * Runs during proc_exit_prepare before shmem teardown, so:
+ *   - DSA is still attached (dsa_allocate / dsa_get_address are safe).
+ *   - LWLockAcquire is safe (not yet in lwlock cleanup).
+ *   - TopMemoryContext is still alive (pfree on local RetireNode is safe).
+ *
+ * If a DSA allocation fails (out of segment space) we LOG and leak that
+ * one node — orphans are best-effort, the cluster must not crash here.
+ */
+static void
+rowcache_backend_exit_cleanup(int code, Datum arg)
+{
+	/* Always release our epoch slot, even when we have nothing to splice. */
+	if (MyProc != NULL)
+		pg_atomic_write_u64(&MyProc->rowcache_local_epoch, 0);
+
+	if (MyRetireHead == NULL || RowCacheCtl == NULL || LocalDsa == NULL)
+	{
+		MyRetireHead = NULL;
+		MyRetireListLen = 0;
+		return;
+	}
+
+	LWLockAcquire(&RowCacheCtl->orphan_list_lock, LW_EXCLUSIVE);
+
+	while (MyRetireHead != NULL)
+	{
+		RetireNode	   *node = MyRetireHead;
+		dsa_pointer		ob_dp;
+		OrphanBatch	   *ob;
+
+		MyRetireHead = node->next;
+
+		ob_dp = dsa_allocate_extended(LocalDsa, sizeof(OrphanBatch),
+									  DSA_ALLOC_NO_OOM);
+		if (DsaPointerIsValid(ob_dp))
+		{
+			ob = (OrphanBatch *) dsa_get_address(LocalDsa, ob_dp);
+			ob->epoch = node->epoch;
+			ob->dp[0] = node->dp[0];
+			ob->dp[1] = node->dp[1];
+			ob->dp[2] = node->dp[2];
+			ob->next_dp = RowCacheCtl->orphan_list_head_dp;
+			RowCacheCtl->orphan_list_head_dp = ob_dp;
+		}
+		else
+		{
+			/*
+			 * DSA out of memory during exit cleanup.  Log and skip; the
+			 * three dpts on this node will leak but the cluster must not
+			 * fail to shut a backend down.
+			 */
+			ereport(LOG,
+					(errmsg_internal("row cache: orphan-list dsa_allocate failed during backend exit; leaking %d DSA block(s)",
+									 (DsaPointerIsValid(node->dp[0]) ? 1 : 0) +
+									 (DsaPointerIsValid(node->dp[1]) ? 1 : 0) +
+									 (DsaPointerIsValid(node->dp[2]) ? 1 : 0))));
+		}
+
+		pfree(node);
+	}
+
+	LWLockRelease(&RowCacheCtl->orphan_list_lock);
+
+	MyRetireListLen = 0;
+}
+
+/*
+ * GC-side drain.  Called from the rowcache-gc worker after publishing
+ * safe_epoch.  Walks the orphan list under orphan_list_lock and reclaims
+ * every batch whose epoch < safe.
+ *
+ * Holding orphan_list_lock for the entire walk is acceptable because:
+ *   - The list is only mutated at backend exit (rare) and during this
+ *     drain (single worker, single-threaded inside the lock).
+ *   - dsa_free is the heavy operation; if contention ever becomes real
+ *     we can split the list into shards or copy-out-then-free.
+ *
+ * Returns the number of batches freed (for diagnostics / future logging).
+ */
+static int
+RowCacheReclaimOrphans(uint64 safe)
+{
+	dsa_pointer	   *pp;
+	dsa_pointer		cur_dp;
+	int				freed = 0;
+
+	if (RowCacheCtl == NULL)
+		return 0;
+
+	/*
+	 * GC needs DSA attached to call dsa_free on payload pointers and on
+	 * the OrphanBatch nodes themselves.  EnsureRowCacheDsa is idempotent.
+	 */
+	EnsureRowCacheDsa();
+
+	LWLockAcquire(&RowCacheCtl->orphan_list_lock, LW_EXCLUSIVE);
+
+	pp = &RowCacheCtl->orphan_list_head_dp;
+	cur_dp = *pp;
+	while (DsaPointerIsValid(cur_dp))
+	{
+		OrphanBatch *ob = (OrphanBatch *) dsa_get_address(LocalDsa, cur_dp);
+
+		if (ob->epoch < safe)
+		{
+			dsa_pointer	next = ob->next_dp;
+
+			*pp = next;
+			for (int i = 0; i < RETIRE_NODE_SLOTS; i++)
+			{
+				if (DsaPointerIsValid(ob->dp[i]))
+					dsa_free(LocalDsa, ob->dp[i]);
+			}
+			dsa_free(LocalDsa, cur_dp);
+			cur_dp = next;
+			freed++;
+		}
+		else
+		{
+			pp = &ob->next_dp;
+			cur_dp = ob->next_dp;
+		}
+	}
+
+	LWLockRelease(&RowCacheCtl->orphan_list_lock);
+
+	return freed;
+}
+
+/* ----------------------------------------------------------------
  * Phase 2 (3/4): "rowcache-gc" background worker
  *
  * One commonly-shared, postmaster-monitored bgworker that periodically:
@@ -451,11 +652,16 @@ RowCacheGCMain(Datum main_arg)
 		 * Core duty: compute and publish safe_epoch.  Even if no backend
 		 * has anything to retire, publishing keeps the counter fresh so
 		 * any future retire is reclaimable promptly.
+		 *
+		 * Then drain the orphan list under the freshly published safe
+		 * epoch.  Orphans come from backends that exited (clean or crash)
+		 * with retires still pending — see rowcache_backend_exit_cleanup.
 		 */
 		if (RowCacheCtl != NULL)
 		{
 			safe = RowCacheComputeSafeEpoch();
 			RowCacheSafeEpochPublish(safe);
+			(void) RowCacheReclaimOrphans(safe);
 		}
 
 		/* Sleep until SIGHUP / SIGTERM / interval timeout / postmaster death. */
@@ -562,9 +768,14 @@ RowCacheShmemInit(void)
 	pg_atomic_init_u64(&RowCacheCtl->global_epoch, 1);
 	pg_atomic_init_u64(&RowCacheCtl->safe_epoch_published, 0);
 
+	/* Orphan list starts empty. */
+	RowCacheCtl->orphan_list_head_dp = InvalidDsaPointer;
+
 	LWLockInitialize(&RowCacheCtl->control_lock, LWTRANCHE_ROW_CACHE_CTL);
 	LWLockInitialize(&RowCacheCtl->relmeta_alloc_lock,
 					 LWTRANCHE_ROW_CACHE_RELMETA);
+	LWLockInitialize(&RowCacheCtl->orphan_list_lock,
+					 LWTRANCHE_ROW_CACHE_CTL);
 
 	for (int i = 0; i < ROW_CACHE_NUM_PARTITIONS; i++)
 		LWLockInitialize(&RowCacheCtl->partition_locks[i],
@@ -643,6 +854,13 @@ EnsureRowCacheDsa(void)
 	LWLockRelease(&RowCacheCtl->control_lock);
 
 	MemoryContextSwitchTo(old_ctx);
+
+	/*
+	 * Lazily install the backend-exit cleanup hook here so that backends
+	 * which never touch the cache pay zero exit-time overhead.  Registered
+	 * once per backend (idempotent inside RowCacheRegisterExitCallback).
+	 */
+	RowCacheRegisterExitCallback();
 }
 
 /* ----------------------------------------------------------------
