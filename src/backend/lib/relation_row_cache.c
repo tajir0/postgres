@@ -1837,6 +1837,82 @@ RowCacheOnHeapDelete(Relation rel, HeapTuple oldtup)
 	InvalidateByHeapTuple(rel, oldtup);
 }
 
+/* ----------------------------------------------------------------
+ * Phase 3 (4/4): VACUUM LP_UNUSED fallback
+ *
+ * Called by lazy_vacuum_heap_page after it converts LP_DEAD line
+ * pointers to LP_UNUSED (the point at which the (block, offnum) pair
+ * becomes available for INSERT to reuse).
+ *
+ * Why we need this hook:
+ *
+ *   V4's cache key is (relid, pkey), so TID reuse — the silent
+ *   stale-read bug that haunts the V1/V2 TID-keyed design — is NOT a
+ *   correctness problem here.  A new INSERT into a recycled (block,
+ *   offnum) has a brand-new pkey; a cache lookup by that pkey misses
+ *   naturally (no entry exists; INSERT hook is intentionally absent).
+ *
+ *   What this hook DOES address is the secondary concern of stale
+ *   cache-entry contents whose embedded HeapTupleHeader / t_self
+ *   reference an (offnum) that has since been LP_UNUSED'd and possibly
+ *   recycled.  Because read paths return FlatCachedTuple content
+ *   directly (not via heap), this is not a correctness risk either —
+ *   but the cached row is no longer reachable through the live heap,
+ *   so its cache occupancy is effectively dead weight.
+ *
+ *   Bumping rel_gen makes every existing entry of this relation appear
+ *   stale to future readers (rel_gen_at_load mismatch); they fall back
+ *   to native btree.  Physical reclamation is deferred to the next
+ *   explicit Drop, or to future LRU eviction.  This is the same
+ *   "simple but heavy" design the V4 doc calls out.
+ *
+ * Cost / call shape:
+ *   - One sticky relmeta lookup + one atomic_load + (if cached) one
+ *     fetch_add_u64.  Tens of ns; well under the latency of one
+ *     lazy_vacuum_heap_page invocation.
+ *   - Idempotent: bumping rel_gen multiple times during a single
+ *     VACUUM is fine, even desirable (each bump shifts the cutoff
+ *     forward so concurrent readers re-evaluate).
+ *
+ * Caller contract (vacuumlazy.c):
+ *   - Must be called only when nunused > 0 (page actually produced
+ *     LP_UNUSED items).  Caller already gates on this.
+ *   - Must be called AFTER END_CRIT_SECTION — fetch_add is safe in
+ *     crit section but the sticky-cache update path would not be.
+ *
+ * Out of scope (deliberately not hooked):
+ *   - heap_page_prune: HOT-chain compression rarely produces LP_UNUSED
+ *     (mostly LP_REDIRECT).  When it does, the next VACUUM picks up
+ *     the slack.  Adding the hook here would invalidate cache on
+ *     ordinary SELECTs that trigger opportunistic pruning, which is
+ *     too aggressive.
+ *   - Toast vacuum: toast rels are not pkey-cached in V4 (no single
+ *     byval pk).
+ */
+void
+RowCacheOnVacuumLPUnused(Relation rel)
+{
+	RelMeta	   *rm;
+
+	if (RowCacheCtl == NULL)
+		return;
+	if (rel == NULL)
+		return;
+
+	rm = FindRelMeta(RelationGetRelid(rel));
+	if (rm == NULL)
+		return;
+	if (pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
+		return;
+
+	/*
+	 * Bump rel_gen.  Readers will see the new value via atomic_load on
+	 * their next fetch and treat any entry with rel_gen_at_load != new
+	 * value as a miss, falling back to native btree.
+	 */
+	(void) pg_atomic_fetch_add_u64(&rm->rel_gen, 1);
+}
+
 void
 RelationRowCacheDropRelation(Oid relid)
 {

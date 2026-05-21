@@ -143,6 +143,7 @@
 #include "commands/dbcommands.h"
 #include "commands/progress.h"
 #include "commands/vacuum.h"
+#include "lib/relation_row_cache.h"
 #include "common/int.h"
 #include "common/pg_prng.h"
 #include "executor/instrument.h"
@@ -2932,6 +2933,20 @@ lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno, Buffer buffer,
 
 	/* Revert to the previous phase information for error traceback */
 	restore_vacuum_error_info(vacrel, &saved_err_info);
+
+	/*
+	 * V4 row-cache fallback: bump rel_gen so cached entries describing
+	 * rows that have just had their LP slots LP_UNUSED'd are treated as
+	 * stale by future readers.  Strictly defense-in-depth for V4
+	 * (pkey-keyed cache is immune to TID reuse correctness issues), but
+	 * keeps cache occupancy honest.  No-op early-out when the relation
+	 * is not cache-enabled (~5-15 ns).
+	 *
+	 * nunused is guaranteed > 0 here by the Assert above; gating on
+	 * nunused is therefore redundant but documents intent.
+	 */
+	if (nunused > 0)
+		RowCacheOnVacuumLPUnused(vacrel->rel);
 }
 
 /*

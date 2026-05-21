@@ -132,6 +132,26 @@ extern void RowCacheOnHeapDelete(Relation rel,
 								 HeapTuple oldtup);
 
 /*
+ * VACUUM LP_UNUSED fallback (Phase 3 (4/4)).
+ *
+ * Called from lazy_vacuum_heap_page once it has converted at least one
+ * LP_DEAD slot to LP_UNUSED.  Bumps the relation's rel_gen so any cache
+ * entry whose recorded rel_gen_at_load no longer matches is treated as
+ * a miss by future readers.
+ *
+ * Strictly a "defense in depth" hook for V4: pkey-keyed cache is
+ * naturally immune to TID reuse (new INSERT into a recycled TID has a
+ * fresh pkey and won't collide).  This hook prevents the secondary
+ * issue of stale-content entries lingering after rows they describe
+ * are gone from the live heap.
+ *
+ * Cost is ~tens of ns (sticky relmeta lookup + atomic_load + atomic_add)
+ * for cache-enabled tables, and ~5-15 ns early-out otherwise.  Caller
+ * must gate on "this page actually produced LP_UNUSED items".
+ */
+extern void RowCacheOnVacuumLPUnused(Relation rel);
+
+/*
  * Enter a row-cache read critical section.
  *
  * Snapshots the current global_epoch into MyProc->rowcache_local_epoch
