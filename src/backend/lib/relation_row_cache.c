@@ -1282,19 +1282,67 @@ RelationRowCacheLoadRelation(Relation rel)
 }
 
 /* ----------------------------------------------------------------
- * Public API: Drop
+ * Public API: Drop  (Phase 3 (3/3): unpublish + EBR retire)
  * ----------------------------------------------------------------
  *
- * 1. Find RelMeta; bail out if none.
- * 2. build_lock EXCLUSIVE.
- * 3. State -> DISABLED, bump rel_gen.
- * 4. Sweep every bucket: under partition lock, unlink + dsa_free all
- *    entries whose relid matches.
- * 5. Release build_lock.
+ * Two-phase teardown decouples the "make new readers miss" half from
+ * the "reclaim DSA blocks" half:
  *
- * Phase 1 frees DSA storage immediately, relying on the V3 caller
- * contract (no readers concurrent with Drop).  Phase 2 will defer frees
- * via EBR.
+ *   Unpublish (writer-visible, completes immediately):
+ *     1. Find RelMeta; bail out if none.
+ *     2. build_lock EXCLUSIVE (serialise concurrent Load / Drop / Drop).
+ *     3. Atomic-store state -> DISABLED + fetch_add rel_gen + memory
+ *        barrier.  Any reader that enters the EBR critical section
+ *        AFTER this point either sees state != ENABLED (early miss)
+ *        or grabs an entry whose rel_gen_at_load mismatches (gen miss).
+ *
+ *   Retire (deferred reclaim, runs under EBR safe_epoch):
+ *     4. Sweep every bucket; under partition lock, unlink each entry
+ *        whose relid matches, atomic-store entry->state=DELETED,
+ *        push (payload_dp, entry_dp) onto this backend's EBR retire
+ *        list.  Backend-local LocalGC (Phase 2 2/4) + the rowcache-gc
+ *        worker (Phase 2 3/4) actually dsa_free them once safe_epoch
+ *        exceeds the retire epoch.
+ *     5. Clear RelMeta pkey descriptor (allows the slot to be reused
+ *        by a future Load of a different relation or a re-Load with
+ *        a different pkey shape).
+ *     6. Invalidate per-backend sticky-lookup cache.
+ *     7. Release build_lock.
+ *
+ * Concurrent-reader safety: once Phase 4 wires EpochEnter/Exit into
+ * the read path, this Drop is safe under any number of in-flight
+ * readers.  EBR keeps the freshly-unlinked entry's backing memory
+ * alive until those readers leave their critical sections, and the
+ * unpublish step guarantees no NEW reader can reach the entry through
+ * the bucket chain.
+ *
+ * Until Phase 4 lands, the V3 caller contract (no readers concurrent
+ * with Drop) still applies; Drop's behavior is observably identical
+ * to the prior immediate-dsa_free implementation — just with the
+ * actual free deferred by one GC tick.
+ *
+ * Phase 3 (3/3) upgrade:
+ *   - Caller (RelationRowCacheDropRelation) has already set
+ *     rel->state = DISABLED and bumped rel_gen, so any reader that
+ *     enters the EBR critical section AFTER this point will either
+ *     observe state != ENABLED (early miss) or load an entry whose
+ *     rel_gen_at_load != current rel_gen (gen-mismatch miss).
+ *   - Readers that were ALREADY inside an EBR critical section before
+ *     the unpublish may still hold a pointer to a GlobalEntry we're
+ *     about to unlink.  EBR-retiring the entry + payload (rather than
+ *     dsa_free'ing) keeps their backing memory alive until safe_epoch
+ *     exceeds the retire epoch, at which point all in-flight readers
+ *     have left the critical section.
+ *
+ * Net effect: Drop becomes safe under concurrent readers once Phase 4
+ * wires EpochEnter/Exit into the read path.  Until then (i.e. through
+ * Phase 1's caller contract), retire is just a slightly delayed
+ * dsa_free with identical observable behavior.
+ *
+ * Each unlinked entry pushes (payload_dp, entry_dp, Invalid) onto this
+ * backend's retire list.  RETIRE_NODE_SLOTS' third slot is reserved
+ * for the per-entry pkey buffer that Phase 4 (composite / byref pk)
+ * will introduce.
  */
 static void
 DropAllEntriesForRelid(Oid relid)
@@ -1323,16 +1371,31 @@ DropAllEntriesForRelid(Oid relid)
 
 			if (e->relid == relid)
 			{
+				dsa_pointer	victim_payload;
+
 				/* Unlink. */
 				if (DsaPointerIsValid(prev_dp))
 					prev->next_dp = next_dp;
 				else
 					heads[b] = next_dp;
 
-				/* Free payload + entry.  No EBR yet (Phase 2). */
-				if (DsaPointerIsValid(e->payload_dp))
-					dsa_free(LocalDsa, e->payload_dp);
-				dsa_free(LocalDsa, cur_dp);
+				/*
+				 * Mark DELETED so any future-EBR reader that already
+				 * grabbed `e` from the bucket chain bails out instead
+				 * of using its payload.  Chain-unlink above prevents
+				 * NEW readers from finding it; this state flip protects
+				 * readers that already have the pointer in hand.
+				 */
+				victim_payload = e->payload_dp;
+				pg_atomic_write_u32(&e->state, ROW_CACHE_ENTRY_DELETED);
+
+				/*
+				 * Retire payload + entry via EBR instead of dsa_free.
+				 * GC bgworker (Phase 2 3/4) + backend-local reclaim
+				 * (Phase 2 2/4) will free them once safe_epoch passes.
+				 */
+				RowCacheEpochRetire(victim_payload, cur_dp,
+									InvalidDsaPointer);
 
 				cur_dp = next_dp;
 				/* prev / prev_dp unchanged. */
