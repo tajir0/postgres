@@ -1349,6 +1349,200 @@ DropAllEntriesForRelid(Oid relid)
 	}
 }
 
+/* ----------------------------------------------------------------
+ * Phase 3 (1/2): DML hooks — invalidate-only strategy
+ *
+ * On UPDATE / DELETE of a cached row, the cached payload is now stale.
+ * Strategy choice for Phase 3:
+ *
+ *   invalidate-only (this commit):
+ *     Unlink the matching GlobalEntry from its bucket chain and retire
+ *     payload + entry + (pkey buffer, when extended in Phase 4) via the
+ *     EBR retire list.  Future reads for the same pkey miss the cache
+ *     and fall back to the native btree path.  Cache content is NEVER
+ *     refreshed by DML; only an explicit Drop+Load (or future LRU
+ *     eviction) repopulates.
+ *
+ *   write-through (NOT this commit):
+ *     Would re-flatten the new tuple and atomic-swap the payload_dp.
+ *     Skipped here because the corresponding INSERT hook is out of
+ *     scope, so we cannot keep cache contents in sync end-to-end
+ *     anyway.  Defer to a later phase when LRU + INSERT land together.
+ *
+ * UPDATE handling note: we ALWAYS evict by the OLD pkey value.  Cases:
+ *   - non-key-update: old pkey == new pkey, old entry evicted, future
+ *     reads fall back to native (correct).
+ *   - key-update (rare): old pkey != new pkey, old entry evicted; new
+ *     pkey simply has no cache entry until next Load (correct, no
+ *     stale data possible).
+ *
+ * HOT update also routes through heap_update, so this hook fires for
+ * HOT too.  That's intentional: HOT changes the tuple content even
+ * when btree is untouched, so the cached payload is equally stale.
+ *
+ * Call-site contract (heapam.c):
+ *   - Must be called BEFORE ReleaseBuffer(buffer) — we read tuple->t_data
+ *     via heap_getattr which dereferences buffer memory.
+ *   - Must be called AFTER END_CRIT_SECTION — we palloc inside
+ *     RowCacheEpochRetire which can throw OOM.
+ *   - The "between CacheInvalidateHeapTuple and ReleaseBuffer" slot in
+ *     both heap_update and heap_delete satisfies both constraints.
+ * ---------------------------------------------------------------- */
+
+/*
+ * Internal: locate (relid, pkey) in the global hash, unlink the entry,
+ * and retire payload + entry via EBR.  No-op if not found.
+ *
+ * Caller must already have determined that `rm` is the live RelMeta
+ * for `relid` and that `pkey_datum` is non-null.
+ */
+static void
+InvalidateEntryByPkey(RelMeta *rm, Oid relid, Datum pkey_datum)
+{
+	uint64			packed;
+	uint32			pkey_hash;
+	uint32			bucket;
+	LWLock		   *part;
+	dsa_pointer	   *heads;
+	dsa_pointer		prev_dp;
+	dsa_pointer		cur_dp;
+	GlobalEntry	   *prev;
+	dsa_pointer		victim_dp = InvalidDsaPointer;
+	dsa_pointer		victim_payload_dp = InvalidDsaPointer;
+
+	Assert(rm != NULL);
+
+	/*
+	 * EnsureRowCacheDsa needs to have run at least once for this backend
+	 * so that LocalDsa is valid and BucketHeads can be resolved.  In the
+	 * DML hook path we may be the first to touch the cache from this
+	 * backend; attach lazily.
+	 */
+	EnsureRowCacheDsa();
+
+	packed = PackPkeyDatum(pkey_datum, rm->pkey_typlen);
+	pkey_hash = ComputePkeyHash(packed);
+	bucket = pkey_hash % ROW_CACHE_HASH_BUCKETS;
+	part = PartitionLockForBucket(bucket);
+
+	LWLockAcquire(part, LW_EXCLUSIVE);
+
+	if (!DsaPointerIsValid(RowCacheCtl->hash_buckets_dp))
+	{
+		LWLockRelease(part);
+		return;
+	}
+
+	heads = BucketHeads();
+	prev_dp = InvalidDsaPointer;
+	prev = NULL;
+	cur_dp = heads[bucket];
+
+	while (DsaPointerIsValid(cur_dp))
+	{
+		GlobalEntry *e = (GlobalEntry *) dsa_get_address(LocalDsa, cur_dp);
+
+		if (e->relid == relid &&
+			e->pkey_hash == pkey_hash &&
+			e->pkey_val == packed)
+		{
+			/* Unlink from chain. */
+			if (DsaPointerIsValid(prev_dp))
+				prev->next_dp = e->next_dp;
+			else
+				heads[bucket] = e->next_dp;
+
+			victim_dp = cur_dp;
+			victim_payload_dp = e->payload_dp;
+
+			/*
+			 * Mark DELETED so any reader that already grabbed `e` (under
+			 * future Phase 2 EBR enter) bails out instead of using its
+			 * payload.  Plain atomic store; the bucket-chain unlink above
+			 * makes the entry unreachable to new readers.
+			 */
+			pg_atomic_write_u32(&e->state, ROW_CACHE_ENTRY_DELETED);
+			break;
+		}
+
+		prev_dp = cur_dp;
+		prev = e;
+		cur_dp = e->next_dp;
+	}
+
+	LWLockRelease(part);
+
+	/*
+	 * Retire OUTSIDE the partition lock.  EpochRetire may palloc and
+	 * could in theory ereport on OOM; holding the lock across it would
+	 * widen the critical section unnecessarily.
+	 */
+	if (DsaPointerIsValid(victim_dp))
+		RowCacheEpochRetire(victim_payload_dp, victim_dp, InvalidDsaPointer);
+}
+
+/*
+ * Shared front-end used by RowCacheOnHeapUpdate / RowCacheOnHeapDelete.
+ *
+ * Steps:
+ *   1. Cheap pre-checks (RowCacheCtl set, relmeta enabled).  Sticky-relmeta
+ *      friendly: in the common case of repeated DML on the same relation,
+ *      FindRelMeta will hit and the only work is a couple of atomic loads.
+ *   2. Extract the pkey Datum from `tuple` using rel's tuple descriptor.
+ *      Bail if null (defensive; pkeys are NOT NULL by definition).
+ *   3. Defer to InvalidateEntryByPkey.
+ */
+static void
+InvalidateByHeapTuple(Relation rel, HeapTuple tuple)
+{
+	RelMeta	   *rm;
+	Datum		pkey_datum;
+	bool		isnull;
+	Oid			relid;
+
+	if (RowCacheCtl == NULL)
+		return;
+	if (rel == NULL || tuple == NULL || tuple->t_data == NULL)
+		return;
+
+	relid = RelationGetRelid(rel);
+	rm = FindRelMeta(relid);
+	if (rm == NULL)
+		return;
+	if (pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
+		return;
+	if (rm->pkey_attno <= 0)
+		return;
+
+	pkey_datum = heap_getattr(tuple, rm->pkey_attno,
+							  RelationGetDescr(rel), &isnull);
+	if (isnull)
+		return;
+
+	InvalidateEntryByPkey(rm, relid, pkey_datum);
+}
+
+/*
+ * Public DML hooks.  Called from heap_update / heap_delete after
+ * END_CRIT_SECTION + CacheInvalidateHeapTuple but before ReleaseBuffer.
+ *
+ * `oldtup` is the heap tuple being replaced/removed; for UPDATE we use
+ * the OLD pkey to evict (see header comment for the key-update edge
+ * case discussion).
+ */
+void
+RowCacheOnHeapUpdate(Relation rel, HeapTuple oldtup, HeapTuple newtup)
+{
+	(void) newtup;					/* unused: invalidate-only strategy */
+	InvalidateByHeapTuple(rel, oldtup);
+}
+
+void
+RowCacheOnHeapDelete(Relation rel, HeapTuple oldtup)
+{
+	InvalidateByHeapTuple(rel, oldtup);
+}
+
 void
 RelationRowCacheDropRelation(Oid relid)
 {

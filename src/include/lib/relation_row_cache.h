@@ -34,6 +34,7 @@
 
 #include "postgres.h"
 
+#include "access/htup.h"
 #include "executor/tuptable.h"
 #include "port/atomics.h"
 #include "storage/proc.h"
@@ -95,6 +96,40 @@ extern size_t RowCacheLocalRetireCount(void);
  * before extensions get a chance to consume one.
  */
 extern void RowCacheGCRegister(void);
+
+/* ----------------------------------------------------------------
+ * Phase 3 (1/2): DML hooks — invalidate-only
+ *
+ * Called from heap_update / heap_delete after END_CRIT_SECTION +
+ * CacheInvalidateHeapTuple but BEFORE ReleaseBuffer (so oldtup->t_data
+ * is still mapped for heap_getattr-based pkey extraction).
+ *
+ * Both hooks early-exit cheaply (~5-15 ns) when:
+ *   - RowCacheCtl is uninitialised, or
+ *   - the relation has no RelMeta slot, or
+ *   - its RelMeta is not ENABLED, or
+ *   - the relation's pkey is not a single byval column.
+ *
+ * When invalidation actually fires, the old GlobalEntry is unlinked from
+ * its bucket chain (under partition lock EXCLUSIVE) and its payload +
+ * entry are pushed to the EBR retire list (under no lock).  Cache
+ * content is never refreshed by DML; subsequent reads for the same pkey
+ * miss the cache and fall back to the native btree path until the next
+ * explicit Drop+Load (or, post Phase 4 / 5, LRU eviction triggers).
+ *
+ * The newtup parameter on RowCacheOnHeapUpdate is reserved for a future
+ * write-through strategy and is ignored under the invalidate-only path
+ * shipped in this commit.
+ *
+ * INSERT is intentionally not hooked: with no LRU / population strategy
+ * for newly inserted rows, an INSERT hook would only add overhead with
+ * no possible cache-hit benefit.  Pre-loaded rows are unaffected.
+ */
+extern void RowCacheOnHeapUpdate(Relation rel,
+								 HeapTuple oldtup,
+								 HeapTuple newtup);
+extern void RowCacheOnHeapDelete(Relation rel,
+								 HeapTuple oldtup);
 
 /*
  * Enter a row-cache read critical section.
