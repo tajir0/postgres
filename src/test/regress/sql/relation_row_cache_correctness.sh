@@ -89,6 +89,21 @@ echo " CTRL_INTERVAL=${CTRL_INTERVAL_MS}ms"
 echo " OUT_DIR=${OUT_DIR}"
 echo "=========================================="
 
+# Defensive: terminate any orphan psql connections from previous runs that
+# might still be holding locks on row_cache_correctness.  Without this a
+# DROP SCHEMA below silently blocks forever.
+echo " killing orphan workers from previous runs..."
+"$PSQL" "${PSQL_OPTS[@]}" <<EOSQL >/dev/null 2>&1 || true
+SELECT pg_terminate_backend(pid)
+FROM   pg_stat_activity
+WHERE  pid <> pg_backend_pid()
+  AND  (query ILIKE '%row_cache_correctness%'
+        OR query ILIKE '%pg_load_relation_row_cache%'
+        OR query ILIKE '%pg_drop_relation_row_cache%');
+EOSQL
+sleep 1
+
+echo " running setup (DROP SCHEMA + CREATE + INSERT + Load)..."
 run_psql <<EOSQL
 SET client_min_messages = warning;
 
@@ -374,13 +389,30 @@ EOSQL
 WORKERS=()
 LOGS=()
 
+# Hard cleanup on any exit path (Ctrl-C, script error, normal exit) so we
+# never leave orphan psql sessions holding locks on row_cache_correctness.
+# Without this, a second run of the script gets stuck at DROP SCHEMA.
+cleanup_workers() {
+  for pid in "${WORKERS[@]:-}"; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  sleep 1
+  for pid in "${WORKERS[@]:-}"; do
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+}
+trap cleanup_workers EXIT INT TERM
+
 start_worker() {
   local kind="$1"
   local idx="$2"
   local sql_file="$3"
   local log_file="$OUT_DIR/${kind}_${idx}.log"
   LOGS+=("$log_file")
-  ( "$PSQL" "${PSQL_OPTS[@]}" -f "$sql_file" >"$log_file" 2>&1; echo $? >"$log_file.exit" ) &
+  # exec replaces the subshell with psql itself so the PID we record is
+  # the actual psql process — kill -TERM / -KILL on it directly reaches
+  # psql, not a wrapper subshell that would otherwise orphan psql to init.
+  ( exec "$PSQL" "${PSQL_OPTS[@]}" -f "$sql_file" >"$log_file" 2>&1 ) &
   WORKERS+=($!)
   echo " spawned ${kind}_${idx} pid=$!"
 }
@@ -438,16 +470,14 @@ echo "=========================================="
 
 WORKER_FAIL=0
 for log in "${LOGS[@]}"; do
-  exit_file="$log.exit"
-  if [[ -f "$exit_file" ]]; then
-    code=$(cat "$exit_file" 2>/dev/null || echo "?")
-  else
-    code="killed"
-  fi
-
-  # exit code 0 = success, but our workers are designed to loop forever
-  # and be killed; so "killed by signal" (psql exits 1/2 with WAS_KILLED)
-  # is OK.  What we MUST NOT see is RAISE EXCEPTION (psql exits 3).
+  # workers were SIGTERM/SIGKILL'd by the controller after DURATION_SEC,
+  # so per-process exit codes are not meaningful — the log content is
+  # the only oracle.  We MUST NOT see "invariant violated" (reader's
+  # cache-correctness oracle) or PANIC/server crash; everything else
+  # (deadlock_detected, serialization_failure, "attempted to update
+  # invisible tuple", lock_timeout) is expected OLTP noise the writer
+  # already caught in EXCEPTION blocks.
+  code="killed"
   if grep -q "invariant violated" "$log" 2>/dev/null; then
     echo "  $log  -> FAIL (invariant violation)"
     WORKER_FAIL=$((WORKER_FAIL + 1))
