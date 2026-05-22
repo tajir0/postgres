@@ -182,6 +182,10 @@ generate_reader_sql_single() {
 SET client_min_messages = warning;
 SET search_path = row_cache_correctness, public;
 SET jit = off;
+-- PG 14+: backend periodically checks if the client TCP socket is still
+-- alive.  Without this, a SIGKILL'd psql leaves the backend stuck in the
+-- DO loop until pg_terminate_backend is called manually.
+SET client_connection_check_interval = '5s';
 
 DO \$\$
 DECLARE
@@ -212,6 +216,10 @@ generate_reader_sql_composite() {
 SET client_min_messages = warning;
 SET search_path = row_cache_correctness, public;
 SET jit = off;
+-- PG 14+: backend periodically checks if the client TCP socket is still
+-- alive.  Without this, a SIGKILL'd psql leaves the backend stuck in the
+-- DO loop until pg_terminate_backend is called manually.
+SET client_connection_check_interval = '5s';
 
 DO \$\$
 DECLARE
@@ -268,6 +276,10 @@ generate_writer_sql() {
 SET client_min_messages = warning;
 SET search_path = row_cache_correctness, public;
 SET jit = off;
+-- PG 14+: backend periodically checks if the client TCP socket is still
+-- alive.  Without this, a SIGKILL'd psql leaves the backend stuck in the
+-- DO loop until pg_terminate_backend is called manually.
+SET client_connection_check_interval = '5s';
 SET lock_timeout = '500ms';
 SET deadlock_timeout = '50ms';
 
@@ -379,6 +391,10 @@ generate_controller_sql() {
 SET client_min_messages = warning;
 SET search_path = row_cache_correctness, public;
 SET jit = off;
+-- PG 14+: backend periodically checks if the client TCP socket is still
+-- alive.  Without this, a SIGKILL'd psql leaves the backend stuck in the
+-- DO loop until pg_terminate_backend is called manually.
+SET client_connection_check_interval = '5s';
 
 DO \$\$
 DECLARE
