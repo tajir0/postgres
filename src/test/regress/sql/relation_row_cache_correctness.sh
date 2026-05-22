@@ -104,8 +104,13 @@ EOSQL
 sleep 1
 
 echo " running setup (DROP SCHEMA + CREATE + INSERT + Load)..."
-run_psql <<EOSQL
+# Bounded-time DROP SCHEMA: if it can't get its AccessExclusiveLock
+# inside 15s, ALL the orphan-blockers are still alive somewhere — fail
+# fast with a useful diagnostic instead of hanging silently.
+SETUP_LOG="$OUT_DIR/setup.log"
+if ! "$PSQL" "${PSQL_OPTS[@]}" --echo-errors >"$SETUP_LOG" 2>&1 <<EOSQL
 SET client_min_messages = warning;
+SET lock_timeout = '15s';
 
 DROP SCHEMA IF EXISTS row_cache_correctness CASCADE;
 CREATE SCHEMA row_cache_correctness;
@@ -142,6 +147,20 @@ ANALYZE row_cache_correctness.composite_tbl;
 SELECT pg_load_relation_row_cache('row_cache_correctness.singlepk_tbl');
 SELECT pg_load_relation_row_cache('row_cache_correctness.composite_tbl');
 EOSQL
+then
+  echo " SETUP FAILED — see $SETUP_LOG"
+  echo "   most likely: an orphan psql / backend is still holding a lock on"
+  echo "   the row_cache_correctness schema.  In another psql run:"
+  echo
+  echo "     SELECT pg_terminate_backend(pid) FROM pg_stat_activity"
+  echo "      WHERE pid <> pg_backend_pid()"
+  echo "        AND state IN ('active','idle','idle in transaction',"
+  echo "                      'idle in transaction (aborted)');"
+  echo
+  echo "   then re-run this script.  setup.log tail:"
+  tail -20 "$SETUP_LOG" | sed 's/^/     /'
+  exit 1
+fi
 
 echo " setup OK"
 SINGLEPK_INITIAL=$(run_psql -c "SELECT count(*) FROM row_cache_correctness.singlepk_tbl;")
