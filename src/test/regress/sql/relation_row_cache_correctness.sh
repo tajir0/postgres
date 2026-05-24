@@ -379,10 +379,26 @@ BEGIN
             END;
         END IF;
 
+        -- Periodic COMMIT.  Without this, the entire FOR loop runs in
+        -- ONE transaction (DO blocks are single statements at the SQL
+        -- level), and when the controller TERMs the worker at the end
+        -- of DURATION_SEC, that single transaction rolls back —
+        -- meaning every UPDATE / DELETE+INSERT this writer did would
+        -- be undone, leaving version=0 across the table and the
+        -- invariant check trivially passing on the initial 'v0' state.
+        -- Committing every 100 iterations bounds the rollback window
+        -- to at most ~100 DML operations on shutdown and makes the
+        -- writer's effects continuously visible to concurrent readers
+        -- (which is what makes the cache-correctness test meaningful).
+        IF i % 100 = 0 THEN
+            COMMIT;
+        END IF;
+
         IF i % 50000 = 0 THEN
             RAISE NOTICE 'writer i=% ok=% conflict=%', i, n_ok, n_conflict;
         END IF;
     END LOOP;
+    COMMIT;
 END
 \$\$;
 EOSQL
