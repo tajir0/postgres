@@ -273,7 +273,11 @@ EOSQL
 #     "tuple update" failures and keep looping.
 generate_writer_sql() {
   cat <<EOSQL
-SET client_min_messages = warning;
+-- NOTE: 'notice' (NOT 'warning') so that RAISE NOTICE 'writer i=...'
+-- progress messages reach the client log.  PG severity order is
+-- NOTICE < WARNING < ERROR; with min_messages=warning the server
+-- silently drops NOTICEs and the log would appear empty.
+SET client_min_messages = notice;
 SET search_path = row_cache_correctness, public;
 SET jit = off;
 -- PG 14+: backend periodically checks if the client TCP socket is still
