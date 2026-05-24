@@ -33,6 +33,7 @@
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
 #include "utils/timeout.h"
+#include "lib/relation_row_cache.h"
 
 /*
  * The postmaster's list of registered background workers, in private memory.
@@ -132,6 +133,9 @@ static const struct
 	},
 	{
 		"TablesyncWorkerMain", TablesyncWorkerMain
+	},
+	{
+		"RowCacheGCMain", RowCacheGCMain
 	}
 };
 

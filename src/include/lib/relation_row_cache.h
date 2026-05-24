@@ -108,6 +108,15 @@ extern size_t RowCacheLocalRetireCount(void);
  */
 extern void RowCacheGCRegister(void);
 
+/*
+ * Background-worker entry point for the rowcache-gc worker.  Declared
+ * here (rather than only in the .c file) because bgworker.c's
+ * "internal function" lookup table (InternalBGWorkers[]) needs to take
+ * its address — otherwise the postmaster fails to start the worker
+ * with: ERROR: internal function "RowCacheGCMain" not found.
+ */
+extern void RowCacheGCMain(Datum main_arg);
+
 /* ----------------------------------------------------------------
  * Phase 3 (1/2): DML hooks — invalidate-only
  *
