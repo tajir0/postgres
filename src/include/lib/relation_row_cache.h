@@ -48,7 +48,6 @@
 #include "access/htup.h"
 #include "executor/tuptable.h"
 #include "port/atomics.h"
-#include "storage/proc.h"
 #include "utils/dsa.h"
 #include "utils/rel.h"
 #include "utils/snapshot.h"
@@ -57,55 +56,21 @@
 extern Size RowCacheShmemSize(void);
 extern void RowCacheShmemInit(void);
 
-/* ----------------------------------------------------------------
- * Phase 2: EBR (Epoch-Based Reclamation) primitives
- *
- * Read path declares its critical section with RowCacheEpochEnter/Exit.
- * Writers retire DSA blocks instead of dsa_free'ing immediately; the GC
- * worker (subsequent commit) computes safe_epoch = min over all backends'
- * rowcache_local_epoch and publishes it for retire-list reclamation.
- *
- * This commit only wires the counters + the enter/exit primitives.  The
- * retire list, GC bgworker, and read-path integration land in later
- * Phase 2 commits.
- * ---------------------------------------------------------------- */
-
-/* Accessors backed by the shmem RowCacheControl.  Defined in the .c file. */
-extern uint64 RowCacheGlobalEpochRead(void);
-extern uint64 RowCacheGlobalEpochBump(void);
-extern uint64 RowCacheSafeEpochRead(void);
-extern void   RowCacheSafeEpochPublish(uint64 safe);
-extern uint64 RowCacheComputeSafeEpoch(void);
-
 /*
- * Retire / reclaim API (Phase 2 2/4).
+ * Phase 5 (dml_lock) 4-5/8: removed all EBR (Epoch-Based Reclamation)
+ * primitives.  The read path now uses LW_SHARED partition locks and the
+ * write path dsa_free's synchronously under LW_EXCLUSIVE.  Deleted:
  *
- * Writers (DML / Drop / future LRU eviction) call RowCacheEpochRetire with
- * up to 3 DSA pointers — typically (payload, entry, pkey_buffer) — instead
- * of dsa_free'ing them directly.  Each retire snapshots the current
- * global_epoch and pushes a node onto a backend-local list.  Pass
- * InvalidDsaPointer for unused slots; passing all three Invalid is a no-op
- * (no allocation).
- *
- * RowCacheLocalGC walks this backend's retire list and dsa_free's every
- * node whose recorded epoch < safe_epoch_published (set by the future GC
- * bgworker; until then it remains 0 and LocalGC is effectively a no-op).
- *
- * RowCacheLocalRetireCount returns the current pending count for
- * diagnostics / pg_row_cache_stat (Phase 5).
- */
-extern void   RowCacheEpochRetire(dsa_pointer dp_a,
-								  dsa_pointer dp_b,
-								  dsa_pointer dp_c);
-extern void   RowCacheLocalGC(void);
-extern size_t RowCacheLocalRetireCount(void);
-
-/*
- * Phase 5 (dml_lock) 4/8: removed RowCacheGCRegister + RowCacheGCMain
- * declarations.  The synchronous dsa_free model installed in commits
- * 2-3 has no use for a safe_epoch publisher / orphan reaper; the
- * bgworker registration in postmaster.c + InternalBGWorkers[] entry
- * in bgworker.c are gone in the same commit.
+ *   - RowCacheGlobalEpoch{Read,Bump}, RowCacheSafeEpoch{Read,Publish},
+ *     RowCacheComputeSafeEpoch
+ *   - RowCacheEpochRetire, RowCacheLocalGC, RowCacheLocalRetireCount
+ *   - RowCacheEpochEnter / Exit static inlines
+ *   - RowCacheGCRegister, RowCacheGCMain
+ *   - PGPROC.rowcache_local_epoch field
+ *   - RowCacheControl shmem fields: global_epoch, safe_epoch_published,
+ *     orphan_list_lock, orphan_list_head_dp
+ *   - GlobalEntry.state field + ROW_CACHE_ENTRY_{FRESH,STALE,DELETED}
+ *     macros
  */
 
 /* ----------------------------------------------------------------
@@ -161,39 +126,6 @@ extern void RowCacheOnHeapDelete(Relation rel,
  * must gate on "this page actually produced LP_UNUSED items".
  */
 extern void RowCacheOnVacuumLPUnused(Relation rel);
-
-/*
- * Enter a row-cache read critical section.
- *
- * Snapshots the current global_epoch into MyProc->rowcache_local_epoch
- * with release-store semantics so any subsequent atomic_load(payload_dp)
- * inside the section is ordered after this store.
- *
- * Hot path: 1 atomic_load + 1 atomic_store + 1 memory barrier (~3-5 ns).
- * No RMW, no lock, no cache-line ping-pong (each backend writes its own
- * PGPROC cache line).
- */
-static inline void
-RowCacheEpochEnter(void)
-{
-	uint64		e = RowCacheGlobalEpochRead();
-
-	pg_atomic_write_u64(&MyProc->rowcache_local_epoch, e);
-	pg_memory_barrier();
-}
-
-/*
- * Exit a row-cache read critical section.
- *
- * Stores 0, telling the GC that this backend no longer holds a reference
- * to any retire-list block whose recorded epoch is <= the previously
- * observed value.
- */
-static inline void
-RowCacheEpochExit(void)
-{
-	pg_atomic_write_u64(&MyProc->rowcache_local_epoch, 0);
-}
 
 /* Load / Drop a relation's cache.  See lifetime contract above. */
 extern void RelationRowCacheLoadRelation(Relation rel);
