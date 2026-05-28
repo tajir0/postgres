@@ -124,7 +124,6 @@ typedef struct RelMeta
 {
 	Oid				relid;			/* InvalidOid = unused slot */
 	pg_atomic_uint32 state;			/* RELMETA_{DISABLED,LOADING,ENABLED} */
-	pg_atomic_uint64 rel_gen;		/* bumped on Drop / DDL invalidation */
 	LWLock			build_lock;		/* serializes Load / Drop; not on read path */
 
 	/*
@@ -169,7 +168,6 @@ typedef struct GlobalEntry
 	uint32			pkey_hash;
 	uint8			pkey_len;		/* serialized length, <= ROW_CACHE_PKEY_INLINE_BYTES */
 	uint8			pkey_buf[ROW_CACHE_PKEY_INLINE_BYTES];
-	uint64			rel_gen_at_load;
 	ItemPointerData	tid;			/* heap TID at load time (for slot fill) */
 	dsa_pointer		payload_dp;		/* FlatCachedTuple */
 	dsa_pointer		next_dp;		/* next GlobalEntry in this bucket */
@@ -319,13 +317,18 @@ rowcache_relcache_callback(Datum arg, Oid relid)
 		return;
 
 	/*
-	 * Two-step unpublish, atomic store + atomic add; safe to race
-	 * across backends.  The exact order doesn't matter for correctness
-	 * because readers fail on EITHER signal; we write state first so a
-	 * fast-fail reader bails before paying for EpochEnter.
+	 * Flip state to DISABLED.  Future readers short-circuit on the
+	 * state check before walking the bucket chain; entries linger in
+	 * the hash until manual Drop / re-Load / LRU eviction.
+	 *
+	 * Phase 5 (dml_lock) 6/8: removed the accompanying rel_gen bump.
+	 * Without rel_gen there is no per-entry gen check in the read
+	 * path, but DDL operations that fire this callback take
+	 * AccessExclusiveLock at the relation level, which prevents any
+	 * concurrent SELECT from running.  In-flight readers cannot race
+	 * with DDL, so flipping state alone is sufficient.
 	 */
 	pg_atomic_write_u32(&rm->state, RELMETA_DISABLED);
-	(void) pg_atomic_fetch_add_u64(&rm->rel_gen, 1);
 
 	/*
 	 * Invalidate this backend's sticky-lookup cache.  Other backends
@@ -399,7 +402,6 @@ RowCacheShmemInit(void)
 
 		rm->relid = InvalidOid;
 		pg_atomic_init_u32(&rm->state, RELMETA_DISABLED);
-		pg_atomic_init_u64(&rm->rel_gen, 0);
 		LWLockInitialize(&rm->build_lock, LWTRANCHE_ROW_CACHE_RELMETA);
 		rm->n_pkey_attrs = 0;
 		rm->pkey_total_len = 0;
@@ -921,7 +923,6 @@ RelationRowCacheLoadRelation(Relation rel)
 	TableScanDesc scan;
 	TupleTableSlot *slot;
 	bool		pushed_snapshot = false;
-	uint64		rel_gen_at_load;
 
 	if (RowCacheCtl == NULL)
 		elog(ERROR, "row cache shared memory not initialized");
@@ -946,7 +947,6 @@ RelationRowCacheLoadRelation(Relation rel)
 	if (pg_atomic_read_u32(&rm->state) == RELMETA_ENABLED)
 	{
 		pg_atomic_write_u32(&rm->state, RELMETA_DISABLED);
-		pg_atomic_fetch_add_u64(&rm->rel_gen, 1);
 		pg_memory_barrier();
 		DropAllEntriesForRelid(relid);
 	}
@@ -968,8 +968,6 @@ RelationRowCacheLoadRelation(Relation rel)
 		LWLockRelease(&rm->build_lock);
 		return;
 	}
-
-	rel_gen_at_load = pg_atomic_read_u64(&rm->rel_gen);
 
 	if (!ActiveSnapshotSet())
 	{
@@ -1019,7 +1017,6 @@ RelationRowCacheLoadRelation(Relation rel)
 		e->pkey_hash = pkey_hash;
 		e->pkey_len = (uint8) pkey_len;
 		memcpy(e->pkey_buf, pkey_buf, pkey_len);
-		e->rel_gen_at_load = rel_gen_at_load;
 		ItemPointerCopy(&slot->tts_tid, &e->tid);
 		e->payload_dp = payload_dp;
 		e->next_dp = InvalidDsaPointer;
@@ -1624,81 +1621,33 @@ RowCacheOnHeapDelete(Relation rel, HeapTuple oldtup)
 	InvalidateByHeapTuple(rel, oldtup);
 }
 
-/* ----------------------------------------------------------------
- * Phase 3 (4/4): VACUUM LP_UNUSED fallback
+/*
+ * Phase 5 (dml_lock) 6/8: removed RowCacheOnVacuumLPUnused.
  *
- * Called by lazy_vacuum_heap_page after it converts LP_DEAD line
- * pointers to LP_UNUSED (the point at which the (block, offnum) pair
- * becomes available for INSERT to reuse).
+ * The hook bumped RelMeta.rel_gen on every LP_UNUSED transition to
+ * "soft-invalidate" all cached entries for the relation, on the
+ * theory that VACUUM might clear up stale-content entries the DML
+ * hooks missed.  Analysis showed this was solving a phantom problem:
  *
- * Why we need this hook:
+ *   - Dead tuples never enter the cache (Load skips them; DML hooks
+ *     unlink + dsa_free on UPDATE / DELETE before VACUUM ever sees
+ *     the dead tuple).
+ *   - pkey-keyed cache is immune to TID reuse: a new INSERT into a
+ *     recycled (block,offnum) has a fresh pkey that doesn't collide
+ *     with any cached entry.
+ *   - VACUUM's tuple-freezing / hint-bit updates change heap layout
+ *     but not pkey value or cached payload visibility.
  *
- *   V4's cache key is (relid, pkey), so TID reuse — the silent
- *   stale-read bug that haunts the V1/V2 TID-keyed design — is NOT a
- *   correctness problem here.  A new INSERT into a recycled (block,
- *   offnum) has a brand-new pkey; a cache lookup by that pkey misses
- *   naturally (no entry exists; INSERT hook is intentionally absent).
+ * The hook's only observable effect was bulk soft-invalidating the
+ * entire table's cache on every autovacuum (default naptime 1 min),
+ * silently leaking memory of the soft-invalidated entries until the
+ * next manual Drop+Load.  Net result: cache hit rate periodically
+ * collapsed without anyone noticing.
  *
- *   What this hook DOES address is the secondary concern of stale
- *   cache-entry contents whose embedded HeapTupleHeader / t_self
- *   reference an (offnum) that has since been LP_UNUSED'd and possibly
- *   recycled.  Because read paths return FlatCachedTuple content
- *   directly (not via heap), this is not a correctness risk either —
- *   but the cached row is no longer reachable through the live heap,
- *   so its cache occupancy is effectively dead weight.
- *
- *   Bumping rel_gen makes every existing entry of this relation appear
- *   stale to future readers (rel_gen_at_load mismatch); they fall back
- *   to native btree.  Physical reclamation is deferred to the next
- *   explicit Drop, or to future LRU eviction.  This is the same
- *   "simple but heavy" design the V4 doc calls out.
- *
- * Cost / call shape:
- *   - One sticky relmeta lookup + one atomic_load + (if cached) one
- *     fetch_add_u64.  Tens of ns; well under the latency of one
- *     lazy_vacuum_heap_page invocation.
- *   - Idempotent: bumping rel_gen multiple times during a single
- *     VACUUM is fine, even desirable (each bump shifts the cutoff
- *     forward so concurrent readers re-evaluate).
- *
- * Caller contract (vacuumlazy.c):
- *   - Must be called only when nunused > 0 (page actually produced
- *     LP_UNUSED items).  Caller already gates on this.
- *   - Must be called AFTER END_CRIT_SECTION — fetch_add is safe in
- *     crit section but the sticky-cache update path would not be.
- *
- * Out of scope (deliberately not hooked):
- *   - heap_page_prune: HOT-chain compression rarely produces LP_UNUSED
- *     (mostly LP_REDIRECT).  When it does, the next VACUUM picks up
- *     the slack.  Adding the hook here would invalidate cache on
- *     ordinary SELECTs that trigger opportunistic pruning, which is
- *     too aggressive.
- *   - Toast vacuum: toast rels are not pkey-cached in V4 (no single
- *     byval pk).
+ * RelMeta.rel_gen and GlobalEntry.rel_gen_at_load are also deleted
+ * in this commit (no remaining caller bumps rel_gen — relcache
+ * callback now flips state=DISABLED only).
  */
-void
-RowCacheOnVacuumLPUnused(Relation rel)
-{
-	RelMeta	   *rm;
-
-	if (RowCacheCtl == NULL)
-		return;
-	if (rel == NULL)
-		return;
-
-	rm = FindRelMeta(RelationGetRelid(rel));
-	if (rm == NULL)
-		return;
-	if (pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
-		return;
-
-	/*
-	 * Bump rel_gen.  Readers will see the new value via atomic_load on
-	 * their next fetch and treat any entry with rel_gen_at_load != new
-	 * value as a miss, falling back to native btree.
-	 */
-	(void) pg_atomic_fetch_add_u64(&rm->rel_gen, 1);
-}
 
 void
 RelationRowCacheDropRelation(Oid relid)
@@ -1723,7 +1672,6 @@ RelationRowCacheDropRelation(Oid relid)
 	}
 
 	pg_atomic_write_u32(&rm->state, RELMETA_DISABLED);
-	pg_atomic_fetch_add_u64(&rm->rel_gen, 1);
 	pg_memory_barrier();
 
 	DropAllEntriesForRelid(relid);
@@ -1849,21 +1797,15 @@ DoPkeyFetchBytes(RelMeta *rm, Oid relid,
 		goto out;
 
 	/*
-	 * Validate entry against the relation's current rel_gen.
+	 * Phase 5 (dml_lock) 6/8: removed the rel_gen check.  No bulk
+	 * soft-invalidation channel exists anymore — VACUUM no longer
+	 * touches the cache, and DDL invalidates via state=DISABLED
+	 * (caught by the pre-lock fast-fail) plus AccessExclusiveLock
+	 * on the relation (which prevents concurrent SELECT).
 	 *
-	 * Note: the previous entry->state == FRESH check has been
-	 * removed in Phase 5 (dml_lock) commit 3/8.  The DELETED
-	 * tombstone write has been removed in the same commit because
-	 * the SHARED/EXCLUSIVE partition lock pairing already prevents
-	 * any reader from observing an unlinked entry — a writer that
-	 * unlinks holds EX, which only proceeds after all SHARED
-	 * readers have released, so no in-flight reader can hold a
-	 * pointer into a now-unlinked entry.  The rel_gen check
-	 * remains as VACUUM's bulk-invalidation channel (until commit
-	 * 6 removes that too).
+	 * The previous entry->state == FRESH check was removed in
+	 * commit 3/8 (no more DELETED tombstone writes).
 	 */
-	if (entry->rel_gen_at_load != pg_atomic_read_u64(&rm->rel_gen))
-		goto out;
 	pg_read_barrier();
 
 	if (!DsaPointerIsValid(entry->payload_dp))

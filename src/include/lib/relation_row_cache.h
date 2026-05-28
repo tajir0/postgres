@@ -108,24 +108,26 @@ extern void RowCacheOnHeapDelete(Relation rel,
 								 HeapTuple oldtup);
 
 /*
- * VACUUM LP_UNUSED fallback (Phase 3 (4/4)).
+ * Phase 5 (dml_lock) 6/8: removed RowCacheOnVacuumLPUnused hook.
  *
- * Called from lazy_vacuum_heap_page once it has converted at least one
- * LP_DEAD slot to LP_UNUSED.  Bumps the relation's rel_gen so any cache
- * entry whose recorded rel_gen_at_load no longer matches is treated as
- * a miss by future readers.
+ * The hook bumped RelMeta.rel_gen on every LP_UNUSED transition so
+ * future readers would treat all cached entries as soft-invalidated.
+ * Analysis showed this was solving a phantom problem: dead tuples
+ * never enter the cache (DML hooks catch UPDATE / DELETE on cached
+ * rows BEFORE VACUUM ever sees the dead tuple), and pkey-keyed cache
+ * is naturally immune to TID reuse.  The hook's only side effect
+ * was bulk-invalidating the entire table's cache on every autovacuum
+ * (default naptime 1 min), which silently leaked the memory of
+ * soft-invalidated entries until manual Drop+Load.
  *
- * Strictly a "defense in depth" hook for V4: pkey-keyed cache is
- * naturally immune to TID reuse (new INSERT into a recycled TID has a
- * fresh pkey and won't collide).  This hook prevents the secondary
- * issue of stale-content entries lingering after rows they describe
- * are gone from the live heap.
- *
- * Cost is ~tens of ns (sticky relmeta lookup + atomic_load + atomic_add)
- * for cache-enabled tables, and ~5-15 ns early-out otherwise.  Caller
- * must gate on "this page actually produced LP_UNUSED items".
+ * Deleted in this commit:
+ *   - RowCacheOnVacuumLPUnused function
+ *   - call site in lazy_vacuum_heap_page (vacuumlazy.c)
+ *   - RelMeta.rel_gen field
+ *   - GlobalEntry.rel_gen_at_load field
+ *   - read-path gen-mismatch check in DoPkeyFetchBytes
+ *   - rel_gen bumps in Drop, relcache_callback
  */
-extern void RowCacheOnVacuumLPUnused(Relation rel);
 
 /* Load / Drop a relation's cache.  See lifetime contract above. */
 extern void RelationRowCacheLoadRelation(Relation rel);
