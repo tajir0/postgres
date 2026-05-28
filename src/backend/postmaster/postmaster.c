@@ -106,7 +106,6 @@
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
 #include "postmaster/walsummarizer.h"
-#include "lib/relation_row_cache.h"
 #include "replication/logicallauncher.h"
 #include "replication/slotsync.h"
 #include "replication/walsender.h"
@@ -926,12 +925,6 @@ PostmasterMain(int argc, char *argv[])
 	 * before any modules had a chance to take the background worker slots.
 	 */
 	ApplyLauncherRegister();
-
-	/*
-	 * Register the row-cache EBR GC worker.  Same rationale as above:
-	 * reserve the slot before shared_preload_libraries can consume them.
-	 */
-	RowCacheGCRegister();
 
 	/*
 	 * process any libraries that should be preloaded at postmaster start

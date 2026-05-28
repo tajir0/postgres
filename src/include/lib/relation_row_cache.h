@@ -101,21 +101,12 @@ extern void   RowCacheLocalGC(void);
 extern size_t RowCacheLocalRetireCount(void);
 
 /*
- * Register the rowcache-gc background worker.  Called once from postmaster
- * startup (see src/backend/postmaster/postmaster.c) before
- * process_shared_preload_libraries runs, so the worker slot is reserved
- * before extensions get a chance to consume one.
+ * Phase 5 (dml_lock) 4/8: removed RowCacheGCRegister + RowCacheGCMain
+ * declarations.  The synchronous dsa_free model installed in commits
+ * 2-3 has no use for a safe_epoch publisher / orphan reaper; the
+ * bgworker registration in postmaster.c + InternalBGWorkers[] entry
+ * in bgworker.c are gone in the same commit.
  */
-extern void RowCacheGCRegister(void);
-
-/*
- * Background-worker entry point for the rowcache-gc worker.  Declared
- * here (rather than only in the .c file) because bgworker.c's
- * "internal function" lookup table (InternalBGWorkers[]) needs to take
- * its address — otherwise the postmaster fails to start the worker
- * with: ERROR: internal function "RowCacheGCMain" not found.
- */
-extern void RowCacheGCMain(Datum main_arg);
 
 /* ----------------------------------------------------------------
  * Phase 3 (1/2): DML hooks — invalidate-only
