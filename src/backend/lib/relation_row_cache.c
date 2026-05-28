@@ -1415,9 +1415,12 @@ BucketInsertHead(uint32 bucket, dsa_pointer entry_dp, GlobalEntry *entry)
  * Returns the entry pointer (via dsa_get_address) and stores the
  * dsa_pointer in *out_entry_dp when found; NULL otherwise.
  *
- * Read path: takes no lock; relies on EBR (Phase 3 (5/5)) to keep
- * chain-walked entries alive across concurrent writers.
- * Write path: caller holds the partition lock.
+ * Phase 5 (dml_lock) lock discipline: BOTH read and write paths now
+ * hold the bucket's partition lock while calling BucketLookup —
+ * SHARED on the read side, EXCLUSIVE on the write side.  EBR is
+ * still entered as a transitional double safety net, but the
+ * partition lock alone is now sufficient to bound the lifetime of
+ * any chain-walked entry / payload.
  */
 static GlobalEntry *
 BucketLookup(uint32 bucket, Oid relid, uint32 pkey_hash,
@@ -2268,21 +2271,36 @@ RelationRowCacheDropRelation(Oid relid)
  * Public API: PkeyFetch / PkeyFetchComposite
  * ----------------------------------------------------------------
  *
- * Shared protocol (Phase 3 (5/5) + Phase 4):
+ * Shared protocol (Phase 5 (dml_lock), transitional EBR retained):
  *
  *   1. Sticky lookup -> RelMeta.
- *   2. Out-of-EBR fast-fail atomic_load(state).
+ *   2. Out-of-lock fast-fail atomic_load(state).
  *   3. Caller serializes pkey from its own input shape (single Datum,
  *      Datum[], future byref bytes, ...) and verifies n_pkey_attrs.
- *   4. RowCacheEpochEnter (EBR critical section begins).
- *   5. Re-check state inside EBR (guards against Drop-after-fast-fail).
- *   6. Bucket lookup, validate entry FRESH + same rel_gen.
- *   7. dsa_get_address payload, MVCC visibility check, slot fill.
- *   8. RowCacheEpochExit (EBR critical section ends).
+ *   4. RowCacheEpochEnter (EBR retained as transitional double safety).
+ *   5. Re-check state (guards against Drop-after-fast-fail).
+ *   6. LWLockAcquire(partition, LW_SHARED) — bounds the read critical
+ *      section against concurrent writers (DML hook / Drop / Load
+ *      insert), all of which acquire LW_EXCLUSIVE on the same lock.
+ *   7. Bucket lookup, validate entry FRESH + same rel_gen.
+ *   8. dsa_get_address payload, MVCC visibility check, slot fill.
+ *   9. LWLockRelease(partition).
+ *  10. RowCacheEpochExit.
  *
- * Steps 4-8 are identical for single-col and composite paths; we
+ * Steps 4-10 are identical for single-col and composite paths; we
  * factor them into DoPkeyFetchBytes so the two public entry points
  * only differ in how they produce the serialized pkey buffer.
+ *
+ * Phase 5 lock discipline rationale: the previous design relied on
+ * EBR alone to keep chain-walked entries / payloads alive across
+ * concurrent writers, with readers walking lock-free.  Moving the
+ * read path under a SHARED partition lock lets subsequent commits
+ * in this branch retire DSA allocations synchronously (dsa_free at
+ * unlink time) and remove the GC bgworker + retire list entirely.
+ * The cost of LW_SHARED acquire/release (~30-50 ns on uncontended
+ * fast path) is a small fraction of total hook overhead and is
+ * paid back many times over by simpler memory management and
+ * lower steady-state DSA footprint.
  */
 
 /*
@@ -2310,6 +2328,7 @@ DoPkeyFetchBytes(RelMeta *rm, Oid relid,
 {
 	uint32			hash;
 	uint32			bucket;
+	LWLock		   *part;
 	GlobalEntry	   *entry;
 	FlatCachedTuple *flat;
 	HeapTupleData	htup;
@@ -2317,19 +2336,19 @@ DoPkeyFetchBytes(RelMeta *rm, Oid relid,
 	bool			result = false;
 
 	/*
-	 * Phase 3 (5/5) EBR enter.  Any GlobalEntry / FlatCachedTuple we
-	 * touch from this point on is guaranteed to remain physically
-	 * backed by DSA, even if Drop / DML / VACUUM retires it
-	 * concurrently — GC waits for safe_epoch > our local_epoch.
+	 * Phase 5 (dml_lock) transitional: keep EBR Enter/Exit as a
+	 * double safety net while the new partition-lock discipline is
+	 * being battle-tested.  Subsequent commits in this branch will
+	 * remove EBR entirely once the partition lock is proven
+	 * sufficient under load.
+	 *
+	 * Re-check state inside the EBR/lock window: a Drop that
+	 * completed between the caller's fast-fail and our entry here
+	 * must be observable so we don't walk a chain whose entries are
+	 * being unpublished.
 	 */
 	RowCacheEpochEnter();
 
-	/*
-	 * Re-check state inside EBR.  Without this, a Drop that completed
-	 * between the caller's fast-fail and our EpochEnter would have
-	 * pushed its retire batches at an epoch < our local_epoch; GC could
-	 * dsa_free the entries before we observe their unlinked state.
-	 */
 	if (pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
 		goto out;
 	pg_read_barrier();
@@ -2338,20 +2357,38 @@ DoPkeyFetchBytes(RelMeta *rm, Oid relid,
 
 	hash = ComputePkeyHashBytes(pkey_buf, pkey_len);
 	bucket = hash & ROW_CACHE_BUCKET_MASK;
+	part = PartitionLockForBucket(bucket);
+
+	/*
+	 * SHARED partition lock bounds the read critical section.  Once
+	 * acquired, no concurrent writer (DML hook / Drop / Load insert)
+	 * can mutate this bucket chain or free its entries / payloads,
+	 * because all writers acquire EXCLUSIVE on the same lock before
+	 * unlink / payload swap / dsa_free.
+	 *
+	 * Held across BucketLookup + entry validation + payload deref +
+	 * MVCC visibility check + slot fill.  This is intentionally a
+	 * wider critical section than the bucket walk alone — needed so
+	 * the FlatCachedTuple that `flat` points to cannot be freed
+	 * underneath the visibility check / slot fill (subsequent
+	 * commit makes writers dsa_free synchronously instead of via
+	 * EBR retire).
+	 */
+	LWLockAcquire(part, LW_SHARED);
 
 	entry = BucketLookup(bucket, relid, hash, pkey_buf, pkey_len, NULL);
 	if (entry == NULL)
-		goto out;
+		goto out_unlock;
 
 	/* Validate entry: must be FRESH and same rel_gen. */
 	if (pg_atomic_read_u32(&entry->state) != ROW_CACHE_ENTRY_FRESH)
-		goto out;
+		goto out_unlock;
 	if (entry->rel_gen_at_load != pg_atomic_read_u64(&rm->rel_gen))
-		goto out;
+		goto out_unlock;
 	pg_read_barrier();
 
 	if (!DsaPointerIsValid(entry->payload_dp))
-		goto out;
+		goto out_unlock;
 	flat = (FlatCachedTuple *) dsa_get_address(LocalDsa, entry->payload_dp);
 
 	ItemPointerCopy(&entry->tid, &tid);
@@ -2372,6 +2409,8 @@ DoPkeyFetchBytes(RelMeta *rm, Oid relid,
 
 	result = true;
 
+out_unlock:
+	LWLockRelease(part);
 out:
 	RowCacheEpochExit();
 	return result;
