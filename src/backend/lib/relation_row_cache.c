@@ -856,32 +856,45 @@ BucketHeads(void)
 
 /* ----------------------------------------------------------------
  * MVCC visibility check (lifted from V3)
+ *
+ * Hot-path fast check for committed-stable cached rows.  Marked
+ * always-inline so it folds into DoPkeyFetchBytes and the dominant
+ * case (XMIN_COMMITTED set, XMAX_INVALID set) collapses to a single
+ * mask compare with branch hint.
+ *
+ * Callers MUST have already verified IsMVCCSnapshot(snapshot); the
+ * two public entry points (RelationRowCachePkeyFetch / FetchComposite)
+ * do this once at the top, so the redundant per-row check is dropped
+ * here.  `snapshot` is kept in the signature for forward compatibility
+ * (a future xmin/xmax check against the snapshot can use it without
+ * touching call sites).
+ *
+ * Branch budget:
+ *   - Common case (xmin committed + xmax invalid): 1 branch, returns true.
+ *   - Rare cases (uncommitted / locked / deleted): up to 4 extra branches.
  * ---------------------------------------------------------------- */
 
-static bool
+static pg_attribute_always_inline bool
 RowCacheTupleVisibleMVCC(HeapTuple tuple, Snapshot snapshot)
 {
-	uint16		infomask;
-	HeapTupleHeaderData *thdr;
+	uint16		infomask = tuple->t_data->t_infomask;
+	const uint16 stable = HEAP_XMIN_COMMITTED | HEAP_XMAX_INVALID;
 
-	if (!IsMVCCSnapshot(snapshot))
+	(void) snapshot;			/* reserved for future xmin/xmax check */
+
+	/* Hot path: committed-stable row (the OLTP norm for cached data). */
+	if (likely((infomask & stable) == stable))
+		return true;
+
+	/* Cold path: rare combinations. */
+	if (infomask & HEAP_XMIN_INVALID)
 		return false;
-
-	thdr = tuple->t_data;
-	infomask = thdr->t_infomask;
-
-	if (HeapTupleHeaderXminInvalid(thdr))
+	if (!(infomask & HEAP_XMIN_COMMITTED))
 		return false;
-	if (!HeapTupleHeaderXminCommitted(thdr))
-		return false;
-
 	if (infomask & HEAP_XMAX_INVALID)
 		return true;
 	if (HEAP_XMAX_IS_LOCKED_ONLY(infomask))
 		return true;
-	if (infomask & HEAP_XMAX_COMMITTED)
-		return false;
-
 	return false;
 }
 
