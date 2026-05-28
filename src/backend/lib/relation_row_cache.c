@@ -1626,40 +1626,29 @@ RelationRowCacheLoadRelation(Relation rel)
  *     6. Invalidate per-backend sticky-lookup cache.
  *     7. Release build_lock.
  *
- * Concurrent-reader safety: once Phase 4 wires EpochEnter/Exit into
- * the read path, this Drop is safe under any number of in-flight
- * readers.  EBR keeps the freshly-unlinked entry's backing memory
- * alive until those readers leave their critical sections, and the
- * unpublish step guarantees no NEW reader can reach the entry through
- * the bucket chain.
+ * Concurrent-reader safety (Phase 5 dml_lock, commit 2/8):
  *
- * Until Phase 4 lands, the V3 caller contract (no readers concurrent
- * with Drop) still applies; Drop's behavior is observably identical
- * to the prior immediate-dsa_free implementation — just with the
- * actual free deferred by one GC tick.
+ * Each bucket is processed under its own LW_EXCLUSIVE partition
+ * lock.  Acquire(EX) waits for all in-flight LW_SHARED readers on
+ * the same partition to release; so once we hold EX, no reader is
+ * walking this bucket and no reader holds a pointer into any entry
+ * in this bucket's chain.  We can therefore unlink + dsa_free the
+ * matching entries synchronously, inside the lock, with no need
+ * for EBR retire / safe_epoch coordination.
  *
- * Phase 3 (3/3) upgrade:
- *   - Caller (RelationRowCacheDropRelation) has already set
- *     rel->state = DISABLED and bumped rel_gen, so any reader that
- *     enters the EBR critical section AFTER this point will either
- *     observe state != ENABLED (early miss) or load an entry whose
- *     rel_gen_at_load != current rel_gen (gen-mismatch miss).
- *   - Readers that were ALREADY inside an EBR critical section before
- *     the unpublish may still hold a pointer to a GlobalEntry we're
- *     about to unlink.  EBR-retiring the entry + payload (rather than
- *     dsa_free'ing) keeps their backing memory alive until safe_epoch
- *     exceeds the retire epoch, at which point all in-flight readers
- *     have left the critical section.
+ * Readers that walked into the bucket BEFORE we acquired EX have
+ * already released their SHARED on us; readers that race to acquire
+ * SHARED after our EX release will walk the post-unlink chain (the
+ * target entries are gone, so they either find a non-matching
+ * entry or fall through to BTree fallback).
  *
- * Net effect: Drop becomes safe under concurrent readers once Phase 4
- * wires EpochEnter/Exit into the read path.  Until then (i.e. through
- * Phase 1's caller contract), retire is just a slightly delayed
- * dsa_free with identical observable behavior.
- *
- * Each unlinked entry pushes (payload_dp, entry_dp, Invalid) onto this
- * backend's retire list.  RETIRE_NODE_SLOTS' third slot is reserved
- * for the per-entry pkey buffer that Phase 4 (composite / byref pk)
- * will introduce.
+ * The caller (RelationRowCacheDropRelation) has already set
+ * rm->state = DISABLED + bumped rel_gen + memory_barrier before
+ * calling us, which acts as a defense-in-depth unpublish: any
+ * reader that enters AFTER the unpublish step short-circuits on
+ * the state check before walking the chain.  But this is now
+ * redundant with the partition-lock discipline — Phase 5's later
+ * commits will simplify the unpublish protocol.
  */
 static void
 DropAllEntriesForRelid(Oid relid)
@@ -1697,22 +1686,32 @@ DropAllEntriesForRelid(Oid relid)
 					heads[b] = next_dp;
 
 				/*
-				 * Mark DELETED so any future-EBR reader that already
-				 * grabbed `e` from the bucket chain bails out instead
-				 * of using its payload.  Chain-unlink above prevents
-				 * NEW readers from finding it; this state flip protects
-				 * readers that already have the pointer in hand.
+				 * Mark DELETED.  Kept for now as a defensive flag for
+				 * any reader that somehow grabbed `e` before our
+				 * EXCLUSIVE acquire; commit 1's SHARED/EXCLUSIVE
+				 * pairing already guarantees no such reader exists
+				 * (EX waits for all SHARED to release).  Commit 3 in
+				 * this branch will delete the DELETED state machinery
+				 * together with the EBR Enter/Exit calls.
 				 */
 				victim_payload = e->payload_dp;
 				pg_atomic_write_u32(&e->state, ROW_CACHE_ENTRY_DELETED);
 
 				/*
-				 * Retire payload + entry via EBR instead of dsa_free.
-				 * GC bgworker (Phase 2 3/4) + backend-local reclaim
-				 * (Phase 2 2/4) will free them once safe_epoch passes.
+				 * Phase 5 (dml_lock) 2/8: synchronous dsa_free, no
+				 * retire list.  Safe because:
+				 *   - We hold partition[b] EXCLUSIVE, so no concurrent
+				 *     reader can be inside the SHARED critical section
+				 *     for this bucket.
+				 *   - The entry was just unlinked above, so no future
+				 *     reader can reach it via the chain.
+				 * dsa_free is called inside the lock for simplicity;
+				 * Drop is a cold path (manual SQL / DDL only) and the
+				 * per-bucket EX section is already short.
 				 */
-				RowCacheEpochRetire(victim_payload, cur_dp,
-									InvalidDsaPointer);
+				if (DsaPointerIsValid(victim_payload))
+					dsa_free(LocalDsa, victim_payload);
+				dsa_free(LocalDsa, cur_dp);
 
 				cur_dp = next_dp;
 				/* prev / prev_dp unchanged. */
@@ -1763,15 +1762,16 @@ DropAllEntriesForRelid(Oid relid)
  * Call-site contract (heapam.c):
  *   - Must be called BEFORE ReleaseBuffer(buffer) — we read tuple->t_data
  *     via heap_getattr which dereferences buffer memory.
- *   - Must be called AFTER END_CRIT_SECTION — we palloc inside
- *     RowCacheEpochRetire which can throw OOM.
+ *   - Must be called AFTER END_CRIT_SECTION — we may dsa_allocate /
+ *     dsa_free which can ereport on OOM.
  *   - The "between CacheInvalidateHeapTuple and ReleaseBuffer" slot in
  *     both heap_update and heap_delete satisfies both constraints.
  * ---------------------------------------------------------------- */
 
 /*
  * Internal: locate (relid, pkey_buf) in the global hash, unlink the entry,
- * and retire payload + entry via EBR.  No-op if not found.
+ * and dsa_free payload + entry synchronously (Phase 5 dml_lock 2/8).
+ * No-op if not found.
  *
  * Caller must already have determined that `rm` is the live RelMeta
  * for `relid` and that `pkey_buf` is a valid serialized pkey of length
@@ -1854,12 +1854,24 @@ InvalidateEntryByPkeyBytes(RelMeta *rm, Oid relid,
 	LWLockRelease(part);
 
 	/*
-	 * Retire OUTSIDE the partition lock.  EpochRetire may palloc and
-	 * could in theory ereport on OOM; holding the lock across it would
-	 * widen the critical section unnecessarily.
+	 * Phase 5 (dml_lock) 2/8: synchronous dsa_free OUTSIDE the
+	 * partition lock.  Safe for the same reason as in
+	 * DropAllEntriesForRelid: writer held EX while unlinking, so no
+	 * reader can have walked into `victim_dp` after the lock was
+	 * acquired; readers that walked it BEFORE the EX acquire have
+	 * since released their SHARED.  No EBR retire required.
+	 *
+	 * Keeping the free OUTSIDE the lock (instead of inside, as Drop
+	 * does) shortens the DML hook's critical section — heap_update /
+	 * heap_delete fire this on every row mutation, so per-row µs
+	 * savings add up.
 	 */
 	if (DsaPointerIsValid(victim_dp))
-		RowCacheEpochRetire(victim_payload_dp, victim_dp, InvalidDsaPointer);
+	{
+		if (DsaPointerIsValid(victim_payload_dp))
+			dsa_free(LocalDsa, victim_payload_dp);
+		dsa_free(LocalDsa, victim_dp);
+	}
 }
 
 /*
@@ -1923,9 +1935,12 @@ InvalidateByHeapTuple(Relation rel, HeapTuple tuple)
  *      The barrier guarantees any reader who loads the new pointer
  *      sees the fully-initialised FlatCachedTuple it points to.
  *   4. Release partition lock.
- *   5. RowCacheEpochRetire(old_dp) — outside the lock; lets the GC
- *      reclaim old payload once no EBR critical section can still hold
- *      a pointer into it.
+ *   5. dsa_free(old_dp) — outside the lock (Phase 5 dml_lock 2/8).
+ *      Safe because all readers that loaded old_dp held SHARED on
+ *      this partition; our EXCLUSIVE acquire in step 2 waited for
+ *      them to release, so by the time we release in step 4 no
+ *      reader holds the old pointer.  Post-step-3 readers will load
+ *      new_dp instead.
  *
  * Degraded paths (still correct, just less optimal):
  *
@@ -1939,9 +1954,8 @@ InvalidateByHeapTuple(Relation rel, HeapTuple tuple)
  *   the specific pkey is not in the bucket chain — e.g. concurrently
  *   evicted, or the row was inserted after Load):
  *     Walk completes without a match.  The freshly-flattened payload
- *     is dsa_free'd directly (no reader ever observed it, so EBR
- *     retire is unnecessary — direct free is safe and a tiny bit
- *     faster).
+ *     is dsa_free'd directly (no reader ever observed it, so direct
+ *     free is trivially safe).
  *
  *   flatten failure (OOM):
  *     RowCacheFlattenTuple ereports on dsa_allocate failure.  That's
@@ -1949,11 +1963,19 @@ InvalidateByHeapTuple(Relation rel, HeapTuple tuple)
  *     can abort cleanly.  Cache contents remain consistent (the entry
  *     keeps its previous payload).
  *
- * NOT bumping entry_gen: Phase 3 readers (added in Phase 4) tolerate
- * "saw old payload after writer swapped" via MVCC visibility check,
- * exactly as for in-heap stale reads.  If a future reader needs
- * stronger "did this entry get replaced under me" detection, add a
- * pg_atomic_fetch_add_u64 on entry->entry_gen here.
+ * NOT bumping entry_gen: readers tolerate "saw old payload after
+ * writer swapped" via MVCC visibility check, exactly as for in-heap
+ * stale reads.  If a future reader needs stronger "did this entry
+ * get replaced under me" detection, add a pg_atomic_fetch_add_u64
+ * on entry->entry_gen here.
+ *
+ * pg_write_barrier between the old payload_dp snapshot and the
+ * publish of new payload_dp is still useful even with the partition
+ * lock: it guarantees that any reader who acquires SHARED after our
+ * EX release and loads new_payload_dp sees the fully-initialised
+ * FlatCachedTuple at that address.  LWLock release/acquire pairing
+ * provides this barrier on most architectures, but we keep the
+ * explicit pg_write_barrier as belt-and-suspenders.
  * ---------------------------------------------------------------- */
 
 /*
@@ -2130,19 +2152,24 @@ RowCacheOnHeapUpdate(Relation rel, HeapTuple oldtup, HeapTuple newtup)
 
 	if (found)
 	{
-		/* Retire old payload — no reader who already loaded it can be
-		 * harmed because EBR keeps the dpts alive until safe_epoch. */
+		/*
+		 * Phase 5 (dml_lock) 2/8: synchronous dsa_free of old payload.
+		 * ReplaceEntryPayloadByPkeyBytes swapped entry->payload_dp
+		 * under EXCLUSIVE partition lock, so no reader can have
+		 * loaded old_payload_dp after that swap (post-swap readers
+		 * see new_payload_dp); pre-swap readers held SHARED and
+		 * have since released, so they no longer hold the pointer.
+		 * Direct free is safe.
+		 */
 		if (DsaPointerIsValid(old_payload_dp))
-			RowCacheEpochRetire(old_payload_dp,
-								InvalidDsaPointer,
-								InvalidDsaPointer);
+			dsa_free(LocalDsa, old_payload_dp);
 	}
 	else
 	{
 		/*
 		 * Entry not in cache (concurrent eviction / never loaded).  The
 		 * freshly-flattened payload was never published to any reader,
-		 * so direct dsa_free is safe and avoids one EBR cycle of delay.
+		 * so direct dsa_free is trivially safe.
 		 */
 		dsa_free(LocalDsa, new_payload_dp);
 	}
