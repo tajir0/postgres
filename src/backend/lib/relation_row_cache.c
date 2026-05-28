@@ -70,7 +70,40 @@
 
 #define ROW_CACHE_MAX_RELATIONS	64
 #define ROW_CACHE_NUM_PARTITIONS	128
-#define ROW_CACHE_HASH_BUCKETS	8192	/* must be a power of two */
+/*
+ * Bucket count: 2 << 22 = 8,388,608 (~8M).  Must be a power of two so
+ * `ROW_CACHE_BUCKET_MASK = N - 1` gives a clean low-bit mask.
+ *
+ * Sizing rationale (Phase 5 (dml_lock) 7/8):
+ *   Old value 8192 was catastrophically too small.  100-warehouse
+ *   TPC-C customer table has ~3M rows; with 8192 buckets the
+ *   average chain length was ~366 nodes, which turned each miss
+ *   into a ~50 us cache-walk before BTree fallback (observed:
+ *   load-after EXPLAIN 35x slower than load-before for a query
+ *   that 99.7% missed the cache).
+ *
+ *   8M buckets supports a working set up to ~30M entries with
+ *   average chain length < 4.  For TPC-C 1000-warehouse customer
+ *   (30M rows) that's the rough upper bound; smaller workloads
+ *   waste some bucket-head memory but pay no time cost.
+ *
+ *   Bucket-head array footprint:
+ *     8M * sizeof(dsa_pointer) = 8M * 8 B = 64 MB DSA reserved.
+ *   This is allocated lazily inside DSA on first Load; backends
+ *   that never touch the cache pay nothing.
+ *
+ *   Future work (out of scope for this commit): make this a
+ *   PGC_POSTMASTER GUC `row_cache.hash_buckets` so operators can
+ *   tune by workload.
+ *
+ * CRITICAL: the parentheses around `(1 << 23)` are mandatory.
+ * Without them the unparenthesised expansion of
+ * `(ROW_CACHE_HASH_BUCKETS - 1)` becomes `(1 << 23 - 1)` which C
+ * parses as `(1 << 22)` (operator precedence: `-` binds tighter
+ * than `<<`).  That would silently halve the mask and break
+ * bucket distribution.
+ */
+#define ROW_CACHE_HASH_BUCKETS	(1 << 23)	/* 2 << 22 = 8,388,608 */
 #define ROW_CACHE_BUCKET_MASK	(ROW_CACHE_HASH_BUCKETS - 1)
 
 StaticAssertDecl((ROW_CACHE_HASH_BUCKETS & ROW_CACHE_BUCKET_MASK) == 0,
