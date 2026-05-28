@@ -210,15 +210,38 @@ typedef struct RelMeta
  *   Future byref support would either spill pkey to DSA via a
  *   pkey_dp pointer or extend pkey_buf — both extension points are
  *   intentionally left clean here.
+ *
+ * Payload locality:
+ *   On initial Load, the FlatCachedTuple bytes are appended to the
+ *   entry's own dsa_allocate'd block at offset MAXALIGN(sizeof(GlobalEntry)),
+ *   and payload_dp is set to that interior dsa_pointer
+ *   (entry_dp + MAXALIGN(sizeof(GlobalEntry))).  Read path's
+ *   dsa_get_address(payload_dp) lands the FlatCachedTuple header in
+ *   the same (or adjacent) cache line as the entry — saving the
+ *   second cache-line miss that a separate payload allocation would
+ *   incur on every hit.  payload_owned = 0 marks this case.
+ *
+ *   On UPDATE write-through, a fresh standalone FlatCachedTuple is
+ *   dsa_allocate'd, payload_dp is atomic-swapped to it under EX lock,
+ *   and payload_owned is set to 1.  Subsequent updates allocate new
+ *   standalone payloads and free the prior standalone one.  The
+ *   originally-inlined bytes inside the entry's allocation become
+ *   orphaned space; that ~100-200 bytes of slack is released wholesale
+ *   when the entry itself is dsa_free'd at Drop / DELETE time.
+ *
+ *   Drop / DELETE: dsa_free(payload_dp) is called ONLY when
+ *   payload_owned == 1; dsa_free(entry_dp) is always called and frees
+ *   the inline payload along with the entry header.
  */
 typedef struct GlobalEntry
 {
 	Oid				relid;
 	uint32			pkey_hash;
 	uint8			pkey_len;		/* serialized length, <= ROW_CACHE_PKEY_INLINE_BYTES */
+	uint8			payload_owned;	/* 0: payload inline w/ entry; 1: standalone (must dsa_free) */
 	uint8			pkey_buf[ROW_CACHE_PKEY_INLINE_BYTES];
 	ItemPointerData	tid;			/* heap TID at load time (for slot fill) */
-	dsa_pointer		payload_dp;		/* FlatCachedTuple */
+	dsa_pointer		payload_dp;		/* FlatCachedTuple (interior if !payload_owned) */
 	dsa_pointer		next_dp;		/* next GlobalEntry in this bucket */
 } GlobalEntry;
 
@@ -1060,24 +1083,55 @@ RelationRowCacheLoadRelation(Relation rel)
 		pkey_hash = ComputePkeyHashBytes(pkey_buf, pkey_len);
 		bucket = pkey_hash & ROW_CACHE_BUCKET_MASK;
 
-		/* Flatten and allocate before taking the partition lock. */
-		payload_dp = RowCacheFlattenTuple(LocalDsa, slot);
-		if (!DsaPointerIsValid(payload_dp))
-			continue;
-
-		entry_dp = dsa_allocate(LocalDsa, sizeof(GlobalEntry));
-		if (!DsaPointerIsValid(entry_dp))
+		/*
+		 * Flatten the tuple into a temporary standalone DSA block first,
+		 * read its total_size, then allocate a combined entry+inline-flat
+		 * block and memcpy the flat into the inline area.  The temporary
+		 * standalone block is freed immediately.
+		 *
+		 * Extra alloc+memcpy+free at Load is one-time overhead (~hundreds
+		 * of ns per row) that's amortised to zero across the millions of
+		 * read hits the entry will subsequently serve; in exchange every
+		 * future read enjoys cache-line locality between the entry header
+		 * and the FlatCachedTuple it references.
+		 */
 		{
-			dsa_free(LocalDsa, payload_dp);
-			ereport(ERROR,
-					(errcode(ERRCODE_OUT_OF_MEMORY),
-					 errmsg("out of memory"),
-					 errdetail_internal("row cache: cannot allocate GlobalEntry")));
+			dsa_pointer	tmp_dp = RowCacheFlattenTuple(LocalDsa, slot);
+			FlatCachedTuple *tmp_flat;
+			Size		flat_size;
+			Size		combined_size;
+			char	   *inline_flat;
+
+			if (!DsaPointerIsValid(tmp_dp))
+				continue;
+
+			tmp_flat = (FlatCachedTuple *) dsa_get_address(LocalDsa, tmp_dp);
+			flat_size = tmp_flat->total_size;
+			combined_size = MAXALIGN(sizeof(GlobalEntry)) + flat_size;
+
+			entry_dp = dsa_allocate(LocalDsa, combined_size);
+			if (!DsaPointerIsValid(entry_dp))
+			{
+				dsa_free(LocalDsa, tmp_dp);
+				ereport(ERROR,
+						(errcode(ERRCODE_OUT_OF_MEMORY),
+						 errmsg("out of memory"),
+						 errdetail_internal("row cache: cannot allocate GlobalEntry")));
+			}
+
+			e = (GlobalEntry *) dsa_get_address(LocalDsa, entry_dp);
+			inline_flat = (char *) e + MAXALIGN(sizeof(GlobalEntry));
+			memcpy(inline_flat, tmp_flat, flat_size);
+			dsa_free(LocalDsa, tmp_dp);
+
+			/* payload_dp is an interior dsa_pointer; never pass to dsa_free. */
+			payload_dp = entry_dp + MAXALIGN(sizeof(GlobalEntry));
 		}
-		e = (GlobalEntry *) dsa_get_address(LocalDsa, entry_dp);
+
 		e->relid = relid;
 		e->pkey_hash = pkey_hash;
 		e->pkey_len = (uint8) pkey_len;
+		e->payload_owned = 0;	/* inline */
 		memcpy(e->pkey_buf, pkey_buf, pkey_len);
 		ItemPointerCopy(&slot->tts_tid, &e->tid);
 		e->payload_dp = payload_dp;
@@ -1207,8 +1261,19 @@ DropAllEntriesForRelid(Oid relid)
 				 * SHARED/EX pairing already guarantees no reader holds
 				 * a pointer into a freshly-unlinked entry.
 				 */
+				/*
+				 * Conditional payload free: standalone payloads
+				 * (payload_owned=1, attached by post-Load write-through)
+				 * must be dsa_free'd explicitly.  Inline payloads
+				 * (payload_owned=0, the Load default) live inside
+				 * cur_dp's allocation and are released wholesale by
+				 * the dsa_free(cur_dp) below; calling dsa_free on
+				 * their interior dsa_pointer would corrupt the DSA
+				 * area.
+				 */
 				victim_payload = e->payload_dp;
-				if (DsaPointerIsValid(victim_payload))
+				if (e->payload_owned &&
+					DsaPointerIsValid(victim_payload))
 					dsa_free(LocalDsa, victim_payload);
 				dsa_free(LocalDsa, cur_dp);
 
@@ -1289,6 +1354,7 @@ InvalidateEntryByPkeyBytes(RelMeta *rm, Oid relid,
 	GlobalEntry	   *prev;
 	dsa_pointer		victim_dp = InvalidDsaPointer;
 	dsa_pointer		victim_payload_dp = InvalidDsaPointer;
+	uint8			victim_payload_owned = 0;
 
 	Assert(rm != NULL);
 
@@ -1334,6 +1400,7 @@ InvalidateEntryByPkeyBytes(RelMeta *rm, Oid relid,
 
 			victim_dp = cur_dp;
 			victim_payload_dp = e->payload_dp;
+			victim_payload_owned = e->payload_owned;
 
 			/*
 			 * Phase 5 (dml_lock) 3/8: removed the
@@ -1370,7 +1437,15 @@ InvalidateEntryByPkeyBytes(RelMeta *rm, Oid relid,
 	 */
 	if (DsaPointerIsValid(victim_dp))
 	{
-		if (DsaPointerIsValid(victim_payload_dp))
+		/*
+		 * Conditional payload free: only standalone payloads (attached
+		 * by write-through) get freed here.  Inline payloads live
+		 * inside victim_dp's allocation and are released wholesale by
+		 * dsa_free(victim_dp).  Calling dsa_free on an interior
+		 * dsa_pointer would corrupt the DSA area.
+		 */
+		if (victim_payload_owned &&
+			DsaPointerIsValid(victim_payload_dp))
 			dsa_free(LocalDsa, victim_payload_dp);
 		dsa_free(LocalDsa, victim_dp);
 	}
@@ -1509,17 +1584,28 @@ FlattenHeapTupleToDsa(Relation rel, HeapTuple htup)
 
 /*
  * Find entry by (relid, pkey_buf) and atomically swap its payload_dp to
- * `new_payload_dp`.  On success returns the previous payload_dp (which
- * the caller must retire) and sets *found=true.  On miss returns
- * InvalidDsaPointer and *found=false; caller should dsa_free the
- * wasted new payload directly.
+ * `new_payload_dp` (which the caller has just dsa_allocate'd as a
+ * standalone FlatCachedTuple).  On success returns the previous
+ * payload_dp and sets *found=true; *out_old_was_owned is set to true
+ * iff the previous payload was a standalone allocation (and therefore
+ * the caller must dsa_free it).  On miss returns InvalidDsaPointer,
+ * sets *found=false and *out_old_was_owned=false; the caller should
+ * dsa_free the wasted new_payload_dp itself.
+ *
+ * After a successful swap the entry's payload_owned flag is unconditionally
+ * 1 (the freshly-attached payload is always a standalone allocation).
+ * The previous payload may have been either inline (Load default,
+ * payload_owned was 0 — leave the interior bytes orphaned inside the
+ * entry's allocation) or a prior standalone (payload_owned was 1 —
+ * caller must free it).
  *
  * Uses the same lock + walk discipline as InvalidateEntryByPkeyBytes.
  */
 static dsa_pointer
 ReplaceEntryPayloadByPkeyBytes(RelMeta *rm, Oid relid,
 							   const uint8 *pkey_buf, int pkey_len,
-							   dsa_pointer new_payload_dp, bool *found)
+							   dsa_pointer new_payload_dp, bool *found,
+							   bool *out_old_was_owned)
 {
 	uint32			pkey_hash;
 	uint32			bucket;
@@ -1528,8 +1614,9 @@ ReplaceEntryPayloadByPkeyBytes(RelMeta *rm, Oid relid,
 	dsa_pointer		cur_dp;
 	dsa_pointer		old_payload_dp = InvalidDsaPointer;
 
-	Assert(rm != NULL && found != NULL);
+	Assert(rm != NULL && found != NULL && out_old_was_owned != NULL);
 	*found = false;
+	*out_old_was_owned = false;
 
 	EnsureRowCacheDsa();
 
@@ -1558,6 +1645,7 @@ ReplaceEntryPayloadByPkeyBytes(RelMeta *rm, Oid relid,
 			memcmp(e->pkey_buf, pkey_buf, pkey_len) == 0)
 		{
 			old_payload_dp = e->payload_dp;
+			*out_old_was_owned = (e->payload_owned != 0);
 			/*
 			 * write_barrier before publishing the new pointer so a
 			 * reader that loads new_payload_dp afterwards sees the
@@ -1565,6 +1653,7 @@ ReplaceEntryPayloadByPkeyBytes(RelMeta *rm, Oid relid,
 			 */
 			pg_write_barrier();
 			e->payload_dp = new_payload_dp;
+			e->payload_owned = 1;	/* freshly-attached standalone */
 			*found = true;
 			break;
 		}
@@ -1597,6 +1686,7 @@ RowCacheOnHeapUpdate(Relation rel, HeapTuple oldtup, HeapTuple newtup)
 	dsa_pointer		new_payload_dp;
 	dsa_pointer		old_payload_dp;
 	bool			found;
+	bool			old_was_owned = false;
 
 	if (RowCacheCtl == NULL)
 		return;
@@ -1650,7 +1740,8 @@ RowCacheOnHeapUpdate(Relation rel, HeapTuple oldtup, HeapTuple newtup)
 
 	old_payload_dp = ReplaceEntryPayloadByPkeyBytes(rm, relid,
 													old_buf, old_len,
-													new_payload_dp, &found);
+													new_payload_dp, &found,
+													&old_was_owned);
 
 	if (found)
 	{
@@ -1662,8 +1753,19 @@ RowCacheOnHeapUpdate(Relation rel, HeapTuple oldtup, HeapTuple newtup)
 		 * see new_payload_dp); pre-swap readers held SHARED and
 		 * have since released, so they no longer hold the pointer.
 		 * Direct free is safe.
+		 *
+		 * inline-payload optimisation: dsa_free ONLY when the prior
+		 * payload was a standalone allocation (old_was_owned == true).
+		 * For a freshly-loaded entry whose initial payload was inline
+		 * (the Load default), old_payload_dp is an interior dsa_pointer
+		 * into the entry's allocation — passing it to dsa_free would
+		 * corrupt the area.  The orphaned inline bytes remain inside
+		 * the entry's allocation (~100-200 B slack) until the entry
+		 * itself is freed; a steady stream of UPDATEs on the same row
+		 * leaks only that one-time inline slack, not the per-update
+		 * standalone payloads (those are freed here).
 		 */
-		if (DsaPointerIsValid(old_payload_dp))
+		if (old_was_owned && DsaPointerIsValid(old_payload_dp))
 			dsa_free(LocalDsa, old_payload_dp);
 	}
 	else
