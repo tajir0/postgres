@@ -1,29 +1,45 @@
 /*-------------------------------------------------------------------------
  *
  * relation_row_cache.c
- *	  V4 Phase 1 implementation of the shared row cache.
+ *	  V4 row cache (dml_lock branch): partition-locked global hash of
+ *	  (relid, pkey) -> flattened tuple.
  *
- * Architecture (see V4设计文档 sections 2-5):
+ * Architecture:
  *
  *   GlobalCache: a single DSA-resident chained hash table keyed by
  *                (relid, pkey).  Bucket heads live in a flat
- *                dsa_pointer[ROW_CACHE_HASH_BUCKETS] array; each chain
- *                element is a GlobalEntry holding the pkey, hash, payload
- *                pointer and a `next_dp` to the next entry in the bucket.
+ *                dsa_pointer[ROW_CACHE_HASH_BUCKETS] array ((1<<23) = 8M
+ *                buckets).  Each chain element is a GlobalEntry holding
+ *                the pkey, hash, payload pointer, and next_dp link.
  *
- *   RelMeta[64]: fixed shmem array indexing per-relation metadata
- *                (state machine + pkey descriptor + rel_gen + build_lock).
+ *   RelMeta[64]: fixed shmem array for per-relation metadata
+ *                (DISABLED/LOADING/ENABLED state, pkey descriptor,
+ *                build_lock).  No rel_gen field; DDL invalidation flips
+ *                state=DISABLED directly under the build_lock.
  *
- *   Concurrency:
- *     - Write side (Load / Drop) takes the per-relation build_lock and
- *       the per-bucket partition lock as needed.
- *     - Read side takes NO locks; it relies on the V3 caller contract
- *       (no concurrent Load/Drop with readers).  Phase 2 will introduce
- *       EBR; until then, callers must serialize externally.
+ *   Concurrency model (dml_lock branch):
+ *     - 128 LWLock partitions, one per group of buckets.
+ *     - Read path: acquire LW_SHARED on the bucket's partition lock,
+ *       walk the chain, copy payload, release.  Concurrent readers on
+ *       any key in the same partition are fully parallel (SHARED does
+ *       not block SHARED).
+ *     - Write path (Load / Drop / DML invalidate): acquire LW_EXCLUSIVE
+ *       on the bucket's partition lock, unlink entry, dsa_free payload
+ *       and entry synchronously, release.  EX waits for all in-flight
+ *       SHARED readers to drain, so dsa_free is safe without deferred GC.
+ *     - Load / Drop serialized against each other via per-RelMeta
+ *       build_lock (LWLock, not partition lock).
  *
- *   Phase 1 limits: single-column byval pk (int2/int4/int8/oid).  Tables
- *   with composite or pass-by-reference pks are silently skipped by
- *   RelationRowCacheLoadRelation (no error, no entries created).
+ *   What is NOT in this implementation:
+ *     - EBR / retire list / GC bgworker (removed in dml_lock commits 4-5)
+ *     - VACUUM hook / rel_gen soft invalidation (removed in commit 6)
+ *     - INSERT hook (no LRU/population strategy for new rows)
+ *     - LRU eviction (future work)
+ *     - Composite / byref pkey (future work)
+ *
+ *   Pkey limits: 1..ROW_CACHE_PKEY_MAX_ATTS pass-by-value columns.
+ *   Tables with pass-by-reference pkeys are silently skipped at Load
+ *   time (no error, no entries created).
  *
  *-------------------------------------------------------------------------
  */

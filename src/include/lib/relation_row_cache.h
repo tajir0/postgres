@@ -1,41 +1,47 @@
 /*-------------------------------------------------------------------------
  *
  * relation_row_cache.h
- *	  V4 Phase 1 row cache: single flat global hash (relid, pkey) -> entry
- *	  + fixed-size RelMeta array for per-relation metadata.
+ *	  V4 row cache (dml_lock branch): partition-locked global hash of
+ *	  (relid, pkey) -> flattened tuple + fixed-size RelMeta array for
+ *	  per-relation metadata.
  *
- * Phase 1 scope:
- *   - Global chained hash in DSA, 128 partition locks for write serialization.
+ * Architecture:
+ *   - Single flat global hash in DSA, (1 << 23) = 8,388,608 buckets.
+ *   - 128 LWLock partitions; readers hold LW_SHARED, writers hold
+ *     LW_EXCLUSIVE.  LW_EXCLUSIVE waits for all in-flight SHARED readers
+ *     to drain, making synchronous dsa_free safe — no deferred GC needed.
  *   - RelMeta array (64 slots) with DISABLED / LOADING / ENABLED state.
- *   - Pkey serialization: single-column, pass-by-value only (int2/int4/int8/oid).
- *     Composite / byref pks bail out at Load time; design leaves room for
- *     Phase 4 extensions.
- *   - IndexNext hook (in nodeIndexscan.c) calls RelationRowCachePkeyFetch.
- *   - FlatCachedTuple (from tid_row_cache.{c,h}) is reused as the payload.
+ *     No rel_gen field; DDL invalidation flips state=DISABLED directly
+ *     under the per-relation build_lock.
+ *   - Pkey: 1..ROW_CACHE_PKEY_MAX_ATTS pass-by-value columns.
+ *     Pass-by-reference pkeys bail out silently at Load time.
+ *   - IndexNext hook (nodeIndexscan.c) calls RelationRowCachePkeyFetch /
+ *     RelationRowCachePkeyFetchComposite.
+ *   - FlatCachedTuple (tid_row_cache.{c,h}) reused as payload.
  *
- * Concurrent-reader safety (as of Phase 3 (5/5)):
- *   The Phase 1 lifetime contract that required "no readers concurrent
- *   with Load / Drop" has been LIFTED.  Drop now goes through unpublish
- *   (state=DISABLED + rel_gen bump) + EBR-retire (Phase 3 (3/4)), and
- *   the read path (RelationRowCachePkeyFetch) wraps its critical
- *   section with RowCacheEpochEnter/Exit (Phase 3 (5/5)).  Together
- *   these guarantee that any reader in flight when Drop / DML / DDL
- *   fires keeps a valid view of its already-loaded GlobalEntry /
- *   FlatCachedTuple until it exits the EBR critical section; physical
- *   reclamation by the rowcache-gc worker is gated on safe_epoch
- *   advancing past every in-flight reader's local_epoch.
+ * What is NOT in this implementation:
+ *   - EBR / retire list / GC bgworker (removed; partition locks suffice)
+ *   - VACUUM hook / rel_gen soft invalidation (removed; pkey-keyed cache
+ *     is immune to TID reuse, and DML hooks handle UPDATE/DELETE before
+ *     VACUUM can see the dead tuple)
+ *   - INSERT hook (no LRU / population strategy for new rows)
+ *   - LRU eviction (future work)
+ *   - Composite / byref pkey (future work)
  *
- *   Load remains serialized with itself and with Drop via per-RelMeta
- *   build_lock; concurrent readers see either "old, fully-published
- *   state" or "new, fully-published state" but never an intermediate.
+ * Concurrent safety:
+ *   Read path: acquire LW_SHARED on bucket's partition lock, walk chain,
+ *   copy payload, release.  Multiple readers on any key in the same
+ *   partition are fully parallel (SHARED does not block SHARED).
  *
- * Phase 1 OUT of scope (left as stubs):
- *   - EBR / retire-list / bgworker GC (Phase 2)
- *   - DML hooks (heap_insert/update/delete) (Phase 3)
- *   - Composite / byref pk (Phase 4)
+ *   Write path (Drop / DML invalidate): acquire LW_EXCLUSIVE on bucket's
+ *   partition lock, unlink entry, dsa_free synchronously, release.
  *
- * Legacy V1/V2 TID-keyed API: RelationRowCacheFillSlot /
- * RelationRowCacheFetchWithVisibility are kept as stubs returning false so
+ *   Load serialized against itself and Drop via per-RelMeta build_lock.
+ *   Concurrent readers see either the old or the new fully-published
+ *   state, never an intermediate.
+ *
+ * Legacy TID-keyed API: RelationRowCacheFillSlot /
+ * RelationRowCacheFetchWithVisibility are stubs returning false so
  * existing tableam.h call sites compile unchanged.
  *
  *-------------------------------------------------------------------------
@@ -56,25 +62,8 @@
 extern Size RowCacheShmemSize(void);
 extern void RowCacheShmemInit(void);
 
-/*
- * Phase 5 (dml_lock) 4-5/8: removed all EBR (Epoch-Based Reclamation)
- * primitives.  The read path now uses LW_SHARED partition locks and the
- * write path dsa_free's synchronously under LW_EXCLUSIVE.  Deleted:
- *
- *   - RowCacheGlobalEpoch{Read,Bump}, RowCacheSafeEpoch{Read,Publish},
- *     RowCacheComputeSafeEpoch
- *   - RowCacheEpochRetire, RowCacheLocalGC, RowCacheLocalRetireCount
- *   - RowCacheEpochEnter / Exit static inlines
- *   - RowCacheGCRegister, RowCacheGCMain
- *   - PGPROC.rowcache_local_epoch field
- *   - RowCacheControl shmem fields: global_epoch, safe_epoch_published,
- *     orphan_list_lock, orphan_list_head_dp
- *   - GlobalEntry.state field + ROW_CACHE_ENTRY_{FRESH,STALE,DELETED}
- *     macros
- */
-
 /* ----------------------------------------------------------------
- * Phase 3 (1/2): DML hooks — invalidate-only
+ * DML hooks — invalidate-only
  *
  * Called from heap_update / heap_delete after END_CRIT_SECTION +
  * CacheInvalidateHeapTuple but BEFORE ReleaseBuffer (so oldtup->t_data
@@ -86,16 +75,13 @@ extern void RowCacheShmemInit(void);
  *   - its RelMeta is not ENABLED, or
  *   - the relation's pkey is not a single byval column.
  *
- * When invalidation actually fires, the old GlobalEntry is unlinked from
- * its bucket chain (under partition lock EXCLUSIVE) and its payload +
- * entry are pushed to the EBR retire list (under no lock).  Cache
- * content is never refreshed by DML; subsequent reads for the same pkey
- * miss the cache and fall back to the native btree path until the next
- * explicit Drop+Load (or, post Phase 4 / 5, LRU eviction triggers).
- *
- * The newtup parameter on RowCacheOnHeapUpdate is reserved for a future
- * write-through strategy and is ignored under the invalidate-only path
- * shipped in this commit.
+ * When invalidation fires, the old GlobalEntry is unlinked from its
+ * bucket chain under partition lock EXCLUSIVE, then its payload and
+ * entry are dsa_free'd synchronously (safe because LW_EXCLUSIVE waits
+ * for all in-flight LW_SHARED readers to drain before proceeding).
+ * Cache content is never refreshed by DML; subsequent reads for the
+ * same pkey miss and fall back to the native btree path until the next
+ * explicit Drop+Load.
  *
  * INSERT is intentionally not hooked: with no LRU / population strategy
  * for newly inserted rows, an INSERT hook would only add overhead with
@@ -107,29 +93,7 @@ extern void RowCacheOnHeapUpdate(Relation rel,
 extern void RowCacheOnHeapDelete(Relation rel,
 								 HeapTuple oldtup);
 
-/*
- * Phase 5 (dml_lock) 6/8: removed RowCacheOnVacuumLPUnused hook.
- *
- * The hook bumped RelMeta.rel_gen on every LP_UNUSED transition so
- * future readers would treat all cached entries as soft-invalidated.
- * Analysis showed this was solving a phantom problem: dead tuples
- * never enter the cache (DML hooks catch UPDATE / DELETE on cached
- * rows BEFORE VACUUM ever sees the dead tuple), and pkey-keyed cache
- * is naturally immune to TID reuse.  The hook's only side effect
- * was bulk-invalidating the entire table's cache on every autovacuum
- * (default naptime 1 min), which silently leaked the memory of
- * soft-invalidated entries until manual Drop+Load.
- *
- * Deleted in this commit:
- *   - RowCacheOnVacuumLPUnused function
- *   - call site in lazy_vacuum_heap_page (vacuumlazy.c)
- *   - RelMeta.rel_gen field
- *   - GlobalEntry.rel_gen_at_load field
- *   - read-path gen-mismatch check in DoPkeyFetchBytes
- *   - rel_gen bumps in Drop, relcache_callback
- */
-
-/* Load / Drop a relation's cache.  See lifetime contract above. */
+/* Load / Drop a relation's cache. */
 extern void RelationRowCacheLoadRelation(Relation rel);
 extern void RelationRowCacheDropRelation(Oid relid);
 
@@ -185,9 +149,9 @@ extern int RelationRowCachePkeyDescriptor(Oid relid,
 										   int max_attnos);
 
 /*
- * Legacy TID-keyed API.  V4 Phase 1 has no TID-keyed path; these are
- * stubs returning false so existing tableam.h hook sites compile and
- * harmlessly fall through to the native path.
+ * Legacy TID-keyed API.  These are stubs returning false so existing
+ * tableam.h hook sites compile and harmlessly fall through to the
+ * native path.
  */
 extern bool RelationRowCacheFillSlot(TupleTableSlot *slot);
 extern bool RelationRowCacheFetchWithVisibility(Oid relid,
