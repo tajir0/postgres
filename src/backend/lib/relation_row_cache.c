@@ -1609,17 +1609,14 @@ RelationRowCacheLoadRelation(Relation rel)
  *     1. Find RelMeta; bail out if none.
  *     2. build_lock EXCLUSIVE (serialise concurrent Load / Drop / Drop).
  *     3. Atomic-store state -> DISABLED + fetch_add rel_gen + memory
- *        barrier.  Any reader that enters the EBR critical section
- *        AFTER this point either sees state != ENABLED (early miss)
- *        or grabs an entry whose rel_gen_at_load mismatches (gen miss).
+ *        barrier.  Any reader that enters AFTER this point either sees
+ *        state != ENABLED (early miss) or grabs an entry whose
+ *        rel_gen_at_load mismatches (gen miss).
  *
- *   Retire (deferred reclaim, runs under EBR safe_epoch):
- *     4. Sweep every bucket; under partition lock, unlink each entry
- *        whose relid matches, atomic-store entry->state=DELETED,
- *        push (payload_dp, entry_dp) onto this backend's EBR retire
- *        list.  Backend-local LocalGC (Phase 2 2/4) + the rowcache-gc
- *        worker (Phase 2 3/4) actually dsa_free them once safe_epoch
- *        exceeds the retire epoch.
+ *   Reclaim (synchronous, Phase 5 dml_lock commits 2-3 of 8):
+ *     4. Sweep every bucket; under partition lock EXCLUSIVE, unlink
+ *        each entry whose relid matches and dsa_free its payload +
+ *        entry synchronously.  No retire list, no GC bgworker.
  *     5. Clear RelMeta pkey descriptor (allows the slot to be reused
  *        by a future Load of a different relation or a re-Load with
  *        a different pkey shape).
@@ -1686,18 +1683,6 @@ DropAllEntriesForRelid(Oid relid)
 					heads[b] = next_dp;
 
 				/*
-				 * Mark DELETED.  Kept for now as a defensive flag for
-				 * any reader that somehow grabbed `e` before our
-				 * EXCLUSIVE acquire; commit 1's SHARED/EXCLUSIVE
-				 * pairing already guarantees no such reader exists
-				 * (EX waits for all SHARED to release).  Commit 3 in
-				 * this branch will delete the DELETED state machinery
-				 * together with the EBR Enter/Exit calls.
-				 */
-				victim_payload = e->payload_dp;
-				pg_atomic_write_u32(&e->state, ROW_CACHE_ENTRY_DELETED);
-
-				/*
 				 * Phase 5 (dml_lock) 2/8: synchronous dsa_free, no
 				 * retire list.  Safe because:
 				 *   - We hold partition[b] EXCLUSIVE, so no concurrent
@@ -1708,7 +1693,13 @@ DropAllEntriesForRelid(Oid relid)
 				 * dsa_free is called inside the lock for simplicity;
 				 * Drop is a cold path (manual SQL / DDL only) and the
 				 * per-bucket EX section is already short.
+				 *
+				 * Phase 5 (dml_lock) 3/8: removed the
+				 * ROW_CACHE_ENTRY_DELETED tombstone store.  The
+				 * SHARED/EX pairing already guarantees no reader holds
+				 * a pointer into a freshly-unlinked entry.
 				 */
+				victim_payload = e->payload_dp;
 				if (DsaPointerIsValid(victim_payload))
 					dsa_free(LocalDsa, victim_payload);
 				dsa_free(LocalDsa, cur_dp);
@@ -1837,12 +1828,15 @@ InvalidateEntryByPkeyBytes(RelMeta *rm, Oid relid,
 			victim_payload_dp = e->payload_dp;
 
 			/*
-			 * Mark DELETED so any reader that already grabbed `e` (under
-			 * EBR) bails out instead of using its payload.  Plain atomic
-			 * store; the bucket-chain unlink above makes the entry
-			 * unreachable to new readers.
+			 * Phase 5 (dml_lock) 3/8: removed the
+			 * ROW_CACHE_ENTRY_DELETED tombstone store.  The
+			 * SHARED/EX partition lock pairing already guarantees no
+			 * reader can hold a pointer into a freshly-unlinked
+			 * entry — a writer holds EX while unlinking, which only
+			 * proceeds after all SHARED readers have released.  The
+			 * chain-unlink above prevents new readers from reaching
+			 * the entry.
 			 */
-			pg_atomic_write_u32(&e->state, ROW_CACHE_ENTRY_DELETED);
 			break;
 		}
 
@@ -2298,36 +2292,41 @@ RelationRowCacheDropRelation(Oid relid)
  * Public API: PkeyFetch / PkeyFetchComposite
  * ----------------------------------------------------------------
  *
- * Shared protocol (Phase 5 (dml_lock), transitional EBR retained):
+ * Shared protocol (Phase 5 (dml_lock) commit 3/8 — EBR removed
+ * from read path):
  *
  *   1. Sticky lookup -> RelMeta.
  *   2. Out-of-lock fast-fail atomic_load(state).
  *   3. Caller serializes pkey from its own input shape (single Datum,
  *      Datum[], future byref bytes, ...) and verifies n_pkey_attrs.
- *   4. RowCacheEpochEnter (EBR retained as transitional double safety).
- *   5. Re-check state (guards against Drop-after-fast-fail).
- *   6. LWLockAcquire(partition, LW_SHARED) — bounds the read critical
+ *   4. Re-check state (guards against Drop-after-fast-fail).
+ *   5. LWLockAcquire(partition, LW_SHARED) — bounds the read critical
  *      section against concurrent writers (DML hook / Drop / Load
  *      insert), all of which acquire LW_EXCLUSIVE on the same lock.
- *   7. Bucket lookup, validate entry FRESH + same rel_gen.
- *   8. dsa_get_address payload, MVCC visibility check, slot fill.
- *   9. LWLockRelease(partition).
- *  10. RowCacheEpochExit.
+ *   6. Bucket lookup, validate same rel_gen.
+ *   7. dsa_get_address payload, MVCC visibility check, slot fill.
+ *   8. LWLockRelease(partition).
  *
- * Steps 4-10 are identical for single-col and composite paths; we
+ * Steps 4-8 are identical for single-col and composite paths; we
  * factor them into DoPkeyFetchBytes so the two public entry points
  * only differ in how they produce the serialized pkey buffer.
  *
- * Phase 5 lock discipline rationale: the previous design relied on
- * EBR alone to keep chain-walked entries / payloads alive across
- * concurrent writers, with readers walking lock-free.  Moving the
- * read path under a SHARED partition lock lets subsequent commits
- * in this branch retire DSA allocations synchronously (dsa_free at
- * unlink time) and remove the GC bgworker + retire list entirely.
- * The cost of LW_SHARED acquire/release (~30-50 ns on uncontended
- * fast path) is a small fraction of total hook overhead and is
- * paid back many times over by simpler memory management and
- * lower steady-state DSA footprint.
+ * Phase 5 lock discipline rationale: the read path now relies
+ * solely on the partition lock for concurrent-writer safety.  A
+ * writer that wants to unlink / dsa_free an entry must acquire
+ * LW_EXCLUSIVE on the partition lock, which blocks until all
+ * SHARED readers have released.  No reader can therefore observe
+ * a freed entry / payload.  The previous EBR retire +
+ * safe_epoch + GC bgworker machinery has been removed in
+ * commits 2-5 of this branch.  The previous entry->state ==
+ * FRESH check has been removed in this commit because the
+ * DELETED tombstone write it guarded against is gone (writers
+ * unlink + dsa_free synchronously under EX lock).
+ *
+ * Cost of LW_SHARED acquire/release on uncontended fast path is
+ * ~30-50 ns, a small fraction of total hook overhead and paid
+ * back by simpler memory management and lower steady-state DSA
+ * footprint.
  */
 
 /*
@@ -2363,21 +2362,19 @@ DoPkeyFetchBytes(RelMeta *rm, Oid relid,
 	bool			result = false;
 
 	/*
-	 * Phase 5 (dml_lock) transitional: keep EBR Enter/Exit as a
-	 * double safety net while the new partition-lock discipline is
-	 * being battle-tested.  Subsequent commits in this branch will
-	 * remove EBR entirely once the partition lock is proven
-	 * sufficient under load.
-	 *
-	 * Re-check state inside the EBR/lock window: a Drop that
-	 * completed between the caller's fast-fail and our entry here
-	 * must be observable so we don't walk a chain whose entries are
-	 * being unpublished.
+	 * Re-check state right before the lock acquire.  A Drop that
+	 * flipped state to DISABLED between the caller's fast-fail and
+	 * here will be caught; if state is still ENABLED we proceed
+	 * under the partition lock, which is sufficient by itself to
+	 * keep the chain-walked entry / payload alive across concurrent
+	 * writers (Phase 5 dml_lock).  Even if state flips to DISABLED
+	 * mid-flight, a concurrent Drop must acquire the same partition
+	 * lock EXCLUSIVE to unlink entries — it will block until we
+	 * release SHARED, so anything we observe under the lock is
+	 * physically valid.
 	 */
-	RowCacheEpochEnter();
-
 	if (pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
-		goto out;
+		return false;
 	pg_read_barrier();
 
 	EnsureRowCacheDsa();
@@ -2394,28 +2391,34 @@ DoPkeyFetchBytes(RelMeta *rm, Oid relid,
 	 * unlink / payload swap / dsa_free.
 	 *
 	 * Held across BucketLookup + entry validation + payload deref +
-	 * MVCC visibility check + slot fill.  This is intentionally a
-	 * wider critical section than the bucket walk alone — needed so
-	 * the FlatCachedTuple that `flat` points to cannot be freed
-	 * underneath the visibility check / slot fill (subsequent
-	 * commit makes writers dsa_free synchronously instead of via
-	 * EBR retire).
+	 * MVCC visibility check + slot fill.
 	 */
 	LWLockAcquire(part, LW_SHARED);
 
 	entry = BucketLookup(bucket, relid, hash, pkey_buf, pkey_len, NULL);
 	if (entry == NULL)
-		goto out_unlock;
+		goto out;
 
-	/* Validate entry: must be FRESH and same rel_gen. */
-	if (pg_atomic_read_u32(&entry->state) != ROW_CACHE_ENTRY_FRESH)
-		goto out_unlock;
+	/*
+	 * Validate entry against the relation's current rel_gen.
+	 *
+	 * Note: the previous entry->state == FRESH check has been
+	 * removed in Phase 5 (dml_lock) commit 3/8.  The DELETED
+	 * tombstone write has been removed in the same commit because
+	 * the SHARED/EXCLUSIVE partition lock pairing already prevents
+	 * any reader from observing an unlinked entry — a writer that
+	 * unlinks holds EX, which only proceeds after all SHARED
+	 * readers have released, so no in-flight reader can hold a
+	 * pointer into a now-unlinked entry.  The rel_gen check
+	 * remains as VACUUM's bulk-invalidation channel (until commit
+	 * 6 removes that too).
+	 */
 	if (entry->rel_gen_at_load != pg_atomic_read_u64(&rm->rel_gen))
-		goto out_unlock;
+		goto out;
 	pg_read_barrier();
 
 	if (!DsaPointerIsValid(entry->payload_dp))
-		goto out_unlock;
+		goto out;
 	flat = (FlatCachedTuple *) dsa_get_address(LocalDsa, entry->payload_dp);
 
 	ItemPointerCopy(&entry->tid, &tid);
@@ -2436,10 +2439,8 @@ DoPkeyFetchBytes(RelMeta *rm, Oid relid,
 
 	result = true;
 
-out_unlock:
-	LWLockRelease(part);
 out:
-	RowCacheEpochExit();
+	LWLockRelease(part);
 	return result;
 }
 
