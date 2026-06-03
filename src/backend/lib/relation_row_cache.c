@@ -214,38 +214,28 @@ typedef struct RelMeta
  *   pkey_dp pointer or extend pkey_buf — both extension points are
  *   intentionally left clean here.
  *
- * Payload locality:
- *   On initial Load, the FlatCachedTuple bytes are appended to the
- *   entry's own dsa_allocate'd block at offset MAXALIGN(sizeof(GlobalEntry)),
- *   and payload_dp is set to that interior dsa_pointer
- *   (entry_dp + MAXALIGN(sizeof(GlobalEntry))).  Read path's
- *   dsa_get_address(payload_dp) lands the FlatCachedTuple header in
- *   the same (or adjacent) cache line as the entry — saving the
- *   second cache-line miss that a separate payload allocation would
- *   incur on every hit.  payload_owned = 0 marks this case.
+ * Payload 布局(载荷永远内联):
+ *   Load 时把 FlatCachedTuple 字节追加到 entry 自己 dsa_allocate 的同一
+ *   块内,偏移 MAXALIGN(sizeof(GlobalEntry)) 处;payload_dp 设为该内部
+ *   dsa_pointer(entry_dp + MAXALIGN(sizeof(GlobalEntry)))。读路径
+ *   dsa_get_address(payload_dp) 落到与 entry 同一(或相邻)cache line,
+ *   省掉独立分配载荷会带来的第二次 cache 缺失。
  *
- *   On UPDATE write-through, a fresh standalone FlatCachedTuple is
- *   dsa_allocate'd, payload_dp is atomic-swapped to it under EX lock,
- *   and payload_owned is set to 1.  Subsequent updates allocate new
- *   standalone payloads and free the prior standalone one.  The
- *   originally-inlined bytes inside the entry's allocation become
- *   orphaned space; that ~100-200 bytes of slack is released wholesale
- *   when the entry itself is dsa_free'd at Drop / DELETE time.
- *
- *   Drop / DELETE: dsa_free(payload_dp) is called ONLY when
- *   payload_owned == 1; dsa_free(entry_dp) is always called and frees
- *   the inline payload along with the entry header.
+ *   去掉写穿透(write-through)后,载荷不再有"独立分配"这一形态——
+ *   UPDATE/DELETE 一律走行级失效(unlink + 整块 dsa_free),不再单独
+ *   分配/替换/释放载荷。因此 payload_dp 始终是内部指针,绝不能对它单独
+ *   调 dsa_free(那会破坏 DSA 区);释放只整块 dsa_free(entry_dp),
+ *   内联载荷随之一并回收。
  */
 typedef struct GlobalEntry
 {
 	Oid				relid;
 	uint32			pkey_hash;
-	uint8			pkey_len;		/* serialized length, <= ROW_CACHE_PKEY_INLINE_BYTES */
-	uint8			payload_owned;	/* 0: payload inline w/ entry; 1: standalone (must dsa_free) */
+	uint8			pkey_len;		/* 序列化长度, <= ROW_CACHE_PKEY_INLINE_BYTES */
 	uint8			pkey_buf[ROW_CACHE_PKEY_INLINE_BYTES];
-	ItemPointerData	tid;			/* heap TID at load time (for slot fill) */
-	dsa_pointer		payload_dp;		/* FlatCachedTuple (interior if !payload_owned) */
-	dsa_pointer		next_dp;		/* next GlobalEntry in this bucket */
+	ItemPointerData	tid;			/* Load 时的 heap TID(填 slot 用) */
+	dsa_pointer		payload_dp;		/* FlatCachedTuple(永远是块内内部指针) */
+	dsa_pointer		next_dp;		/* 桶链上的下一个 GlobalEntry */
 } GlobalEntry;
 
 /*
@@ -443,7 +433,8 @@ static bool CheckEligiblePkey(Relation rel, RelMeta *rm);
 static int SerializePkeyFromSlot(TupleTableSlot *slot, RelMeta *rm,
 								 uint8 *out_buf);
 static int SerializePkeyFromTuple(HeapTuple tuple, TupleDesc desc,
-								  RelMeta *rm, uint8 *out_buf);
+								  int n_pkey_attrs, const AttrNumber *attnos,
+								  const int16 *typlens, uint8 *out_buf);
 static int SerializePkeyFromDatum(Datum d, RelMeta *rm, uint8 *out_buf);
 static int SerializePkeyFromDatumArray(const Datum *vals, int nvals,
 									   RelMeta *rm, uint8 *out_buf);
@@ -804,16 +795,22 @@ SerializePkeyFromSlot(TupleTableSlot *slot, RelMeta *rm, uint8 *out_buf)
 	return total;
 }
 
+/*
+ * 从 HeapTuple 序列化 pkey。schema(列数 / attno / typlen)由调用方
+ * 显式传入,而不是从 RelMeta 读——DML 钩子据此可直接用 RelationData
+ * 上的本地快照(rd_rowcache_pkey_*)序列化,无需触碰 shmem RelMeta。
+ */
 static int
-SerializePkeyFromTuple(HeapTuple tuple, TupleDesc desc, RelMeta *rm,
-					   uint8 *out_buf)
+SerializePkeyFromTuple(HeapTuple tuple, TupleDesc desc,
+					   int n_pkey_attrs, const AttrNumber *attnos,
+					   const int16 *typlens, uint8 *out_buf)
 {
 	int			total = 0;
 
-	for (int i = 0; i < rm->n_pkey_attrs; i++)
+	for (int i = 0; i < n_pkey_attrs; i++)
 	{
-		AttrNumber	attno = rm->pkey_attnos[i];
-		int16		typlen = rm->pkey_typlens[i];
+		AttrNumber	attno = attnos[i];
+		int16		typlen = typlens[i];
 		Datum		d;
 		bool		isnull;
 
@@ -1146,14 +1143,13 @@ RelationRowCacheLoadRelation(Relation rel)
 			memcpy(inline_flat, tmp_flat, flat_size);
 			dsa_free(LocalDsa, tmp_dp);
 
-			/* payload_dp is an interior dsa_pointer; never pass to dsa_free. */
+			/* payload_dp 是块内内部指针,绝不能单独传给 dsa_free。 */
 			payload_dp = entry_dp + MAXALIGN(sizeof(GlobalEntry));
 		}
 
 		e->relid = relid;
 		e->pkey_hash = pkey_hash;
 		e->pkey_len = (uint8) pkey_len;
-		e->payload_owned = 0;	/* inline */
 		memcpy(e->pkey_buf, pkey_buf, pkey_len);
 		ItemPointerCopy(&slot->tts_tid, &e->tid);
 		e->payload_dp = payload_dp;
@@ -1276,49 +1272,27 @@ DropAllEntriesForRelid(Oid relid)
 
 			if (e->relid == relid)
 			{
-				dsa_pointer	victim_payload;
-
-				/* Unlink. */
+				/* 摘链。 */
 				if (DsaPointerIsValid(prev_dp))
 					prev->next_dp = next_dp;
 				else
 					heads[b] = next_dp;
 
 				/*
-				 * Phase 5 (dml_lock) 2/8: synchronous dsa_free, no
-				 * retire list.  Safe because:
-				 *   - We hold partition[b] EXCLUSIVE, so no concurrent
-				 *     reader can be inside the SHARED critical section
-				 *     for this bucket.
-				 *   - The entry was just unlinked above, so no future
-				 *     reader can reach it via the chain.
-				 * dsa_free is called inside the lock for simplicity;
-				 * Drop is a cold path (manual SQL / DDL only) and the
-				 * per-bucket EX section is already short.
+				 * 同步 dsa_free,无 retire list。安全性:
+				 *   - 持有 partition[b] EXCLUSIVE,没有并发 reader 在该
+				 *     桶的 SHARED 临界区里。
+				 *   - 上面刚把 entry 摘链,后续 reader 走链也到不了它。
+				 * 为简洁在锁内释放;Drop 是冷路径(手动 SQL / DDL),
+				 * 每桶 EX 临界区本就很短。
 				 *
-				 * Phase 5 (dml_lock) 3/8: removed the
-				 * ROW_CACHE_ENTRY_DELETED tombstone store.  The
-				 * SHARED/EX pairing already guarantees no reader holds
-				 * a pointer into a freshly-unlinked entry.
+				 * 载荷永远内联(写穿透已删除),随 entry 整块释放,
+				 * 不再对 payload_dp 单独 dsa_free。
 				 */
-				/*
-				 * Conditional payload free: standalone payloads
-				 * (payload_owned=1, attached by post-Load write-through)
-				 * must be dsa_free'd explicitly.  Inline payloads
-				 * (payload_owned=0, the Load default) live inside
-				 * cur_dp's allocation and are released wholesale by
-				 * the dsa_free(cur_dp) below; calling dsa_free on
-				 * their interior dsa_pointer would corrupt the DSA
-				 * area.
-				 */
-				victim_payload = e->payload_dp;
-				if (e->payload_owned &&
-					DsaPointerIsValid(victim_payload))
-					dsa_free(LocalDsa, victim_payload);
 				dsa_free(LocalDsa, cur_dp);
 
 				cur_dp = next_dp;
-				/* prev / prev_dp unchanged. */
+				/* prev / prev_dp 不变。 */
 			}
 			else
 			{
@@ -1373,17 +1347,14 @@ DropAllEntriesForRelid(Oid relid)
  * ---------------------------------------------------------------- */
 
 /*
- * Internal: locate (relid, pkey_buf) in the global hash, unlink the entry,
- * and dsa_free payload + entry synchronously (Phase 5 dml_lock 2/8).
- * No-op if not found.
+ * 行级失效:在全局哈希里定位 (relid, pkey_buf),把 entry 摘链并同步
+ * dsa_free 整块。找不到则 no-op。
  *
- * Caller must already have determined that `rm` is the live RelMeta
- * for `relid` and that `pkey_buf` is a valid serialized pkey of length
- * `pkey_len`.
+ * 调用方需保证 pkey_buf 是长度 pkey_len 的有效序列化 pkey。不再需要
+ * RelMeta 指针——失效只按 (relid, pkey) 定位 entry。
  */
 static void
-InvalidateEntryByPkeyBytes(RelMeta *rm, Oid relid,
-						   const uint8 *pkey_buf, int pkey_len)
+InvalidateEntryByPkeyBytes(Oid relid, const uint8 *pkey_buf, int pkey_len)
 {
 	uint32			pkey_hash;
 	uint32			bucket;
@@ -1393,16 +1364,11 @@ InvalidateEntryByPkeyBytes(RelMeta *rm, Oid relid,
 	dsa_pointer		cur_dp;
 	GlobalEntry	   *prev;
 	dsa_pointer		victim_dp = InvalidDsaPointer;
-	dsa_pointer		victim_payload_dp = InvalidDsaPointer;
-	uint8			victim_payload_owned = 0;
-
-	Assert(rm != NULL);
 
 	/*
-	 * EnsureRowCacheDsa needs to have run at least once for this backend
-	 * so that LocalDsa is valid and BucketHeads can be resolved.  In the
-	 * DML hook path we may be the first to touch the cache from this
-	 * backend; attach lazily.
+	 * 本 backend 至少要跑过一次 EnsureRowCacheDsa,LocalDsa 才有效、
+	 * BucketHeads 才能解析。DML 钩子路径可能是本 backend 第一次碰
+	 * 缓存,这里惰性 attach。
 	 */
 	EnsureRowCacheDsa();
 
@@ -1439,18 +1405,12 @@ InvalidateEntryByPkeyBytes(RelMeta *rm, Oid relid,
 				heads[bucket] = e->next_dp;
 
 			victim_dp = cur_dp;
-			victim_payload_dp = e->payload_dp;
-			victim_payload_owned = e->payload_owned;
 
 			/*
-			 * Phase 5 (dml_lock) 3/8: removed the
-			 * ROW_CACHE_ENTRY_DELETED tombstone store.  The
-			 * SHARED/EX partition lock pairing already guarantees no
-			 * reader can hold a pointer into a freshly-unlinked
-			 * entry — a writer holds EX while unlinking, which only
-			 * proceeds after all SHARED readers have released.  The
-			 * chain-unlink above prevents new readers from reaching
-			 * the entry.
+			 * 无墓碑标记:SHARED/EX 分区锁配对已保证没有 reader 持有
+			 * 指向刚摘链 entry 的指针——writer 持 EX 摘链,而获取 EX
+			 * 必须等所有 SHARED reader 释放;上面的摘链又挡住后来的
+			 * reader 经链表到达它。
 			 */
 			break;
 		}
@@ -1463,44 +1423,36 @@ InvalidateEntryByPkeyBytes(RelMeta *rm, Oid relid,
 	LWLockRelease(part);
 
 	/*
-	 * Phase 5 (dml_lock) 2/8: synchronous dsa_free OUTSIDE the
-	 * partition lock.  Safe for the same reason as in
-	 * DropAllEntriesForRelid: writer held EX while unlinking, so no
-	 * reader can have walked into `victim_dp` after the lock was
-	 * acquired; readers that walked it BEFORE the EX acquire have
-	 * since released their SHARED.  No EBR retire required.
+	 * 在分区锁之外同步 dsa_free。安全理由同 DropAllEntriesForRelid:
+	 * writer 持 EX 期间摘链,所以没有 reader 能在我们拿到锁之后还走进
+	 * victim_dp;在 EX 获取之前走进它的 reader 此刻早已释放 SHARED。
+	 * 无需 EBR retire。
 	 *
-	 * Keeping the free OUTSIDE the lock (instead of inside, as Drop
-	 * does) shortens the DML hook's critical section — heap_update /
-	 * heap_delete fire this on every row mutation, so per-row µs
-	 * savings add up.
+	 * 放在锁外释放(而非像 Drop 那样在锁内)是为了缩短 DML 钩子的临界
+	 * 区——heap_update / heap_delete 每改一行就触发一次,每行省下的
+	 * 微秒会累积。
+	 *
+	 * 载荷永远内联,随 entry 整块释放,不再单独 free。
 	 */
 	if (DsaPointerIsValid(victim_dp))
-	{
-		/*
-		 * Conditional payload free: only standalone payloads (attached
-		 * by write-through) get freed here.  Inline payloads live
-		 * inside victim_dp's allocation and are released wholesale by
-		 * dsa_free(victim_dp).  Calling dsa_free on an interior
-		 * dsa_pointer would corrupt the DSA area.
-		 */
-		if (victim_payload_owned &&
-			DsaPointerIsValid(victim_payload_dp))
-			dsa_free(LocalDsa, victim_payload_dp);
 		dsa_free(LocalDsa, victim_dp);
-	}
 }
 
 /*
- * Shared front-end used by RowCacheOnHeapUpdate / RowCacheOnHeapDelete.
+ * RowCacheOnHeapUpdate / RowCacheOnHeapDelete 的共用前端:把 tuple 的
+ * pkey 对应的缓存 entry 行级失效掉。
  *
- * Steps:
- *   1. Cheap pre-checks (RowCacheCtl set, relmeta enabled, has pkey).
- *      Sticky-relmeta friendly.
- *   2. Serialize the composite (or single) pkey columns from `tuple`
- *      using rel's tuple descriptor.  Bail if any column is null
- *      (defensive; pkeys are NOT NULL by definition).
- *   3. Defer to InvalidateEntryByPkeyBytes.
+ * 走 RelationData 快照(rd_rowcache_meta + rd_rowcache_pkey_*),不再扫
+ * 全局 RelMeta 数组:
+ *
+ *   - rd_rowcache_meta == NULL / ROWCACHE_NOT_CACHED:本 backend 视该表
+ *     未缓存,直接返回(~2ns 单指针拒绝)。这是"信任 reldata"模型——
+ *     运维上必须保证在任何 backend 对某表发起 DML 之前就完成 Load,
+ *     否则陈旧的 NOT_CACHED 会让本 backend 漏掉对刚加载 entry 的失效。
+ *   - 否则 rd_rowcache_meta 是活的 RelMeta 指针:复检 state(挡住已被
+ *     Drop / DDL 禁用的情况),再用本地 pkey schema 快照序列化 pkey。
+ *
+ * 第 1/3 步只解一个指针 + 一次 atomic state 读,绝不访问 RelMeta 数组。
  */
 static void
 InvalidateByHeapTuple(Relation rel, HeapTuple tuple)
@@ -1515,310 +1467,75 @@ InvalidateByHeapTuple(Relation rel, HeapTuple tuple)
 	if (rel == NULL || tuple == NULL || tuple->t_data == NULL)
 		return;
 
-	relid = RelationGetRelid(rel);
-	rm = FindRelMeta(relid);
-	if (rm == NULL)
+	/* 直接读 RelationData 上绑定的快照,信任之(运维约束见上)。 */
+	rm = rel->rd_rowcache_meta;
+	if (rm == NULL || rm == ROWCACHE_NOT_CACHED)
 		return;
 	if (pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
 		return;
-	if (rm->n_pkey_attrs <= 0)
+	if (rel->rd_rowcache_pkey_n <= 0)
 		return;
 
+	relid = RelationGetRelid(rel);
+
+	/* 用 reldata 的本地 pkey schema 快照序列化,不触碰 shmem RelMeta。 */
 	pkey_len = SerializePkeyFromTuple(tuple, RelationGetDescr(rel),
-									  rm, pkey_buf);
+									  rel->rd_rowcache_pkey_n,
+									  rel->rd_rowcache_pkey_attnos,
+									  rel->rd_rowcache_pkey_typlens,
+									  pkey_buf);
 	if (pkey_len < 0)
 		return;
 
-	InvalidateEntryByPkeyBytes(rm, relid, pkey_buf, pkey_len);
+	InvalidateEntryByPkeyBytes(relid, pkey_buf, pkey_len);
 }
 
 /* ----------------------------------------------------------------
- * Phase 3 (2/2): write-through for UPDATE
+ * 公开 DML 钩子(纯行级失效,无写穿透)
+ * ----------------------------------------------------------------
  *
- * Replaces the prior invalidate-only handling of heap_update so that
- * the cached payload stays in sync with the heap.  Keeps the cache
- * "hot" across a stream of UPDATEs to the same pkey — the typical OLTP
- * pattern for warehouse / district / customer / profile-table rows.
+ * 由 heap_update / heap_delete 在 END_CRIT_SECTION +
+ * CacheInvalidateHeapTuple 之后、ReleaseBuffer 之前调用。
  *
- * Steps for the common case (non-key-update on a cached row):
- *   1. Flatten newtup to a fresh DSA block (allocations happen OUTSIDE
- *      the partition lock; slot-create / flatten / dsa_allocate are
- *      the expensive bits).
- *   2. Acquire partition lock EXCLUSIVE for the target bucket.
- *   3. Walk bucket chain; on (relid, pkey_hash, pkey_val) match:
- *        old_dp = e->payload_dp;
- *        pg_write_barrier();
- *        e->payload_dp = new_dp;     -- atomic, single-word
- *      The barrier guarantees any reader who loads the new pointer
- *      sees the fully-initialised FlatCachedTuple it points to.
- *   4. Release partition lock.
- *   5. dsa_free(old_dp) — outside the lock (Phase 5 dml_lock 2/8).
- *      Safe because all readers that loaded old_dp held SHARED on
- *      this partition; our EXCLUSIVE acquire in step 2 waited for
- *      them to release, so by the time we release in step 4 no
- *      reader holds the old pointer.  Post-step-3 readers will load
- *      new_dp instead.
+ * 策略:UPDATE 和 DELETE 都只做"行级失效"——把旧行 pkey 对应的缓存
+ * entry 摘链并整块 dsa_free,不做任何载荷拷贝 / 替换 / 单独释放。
+ * (此前的 UPDATE 写穿透 + FlattenHeapTupleToDsa +
+ * ReplaceEntryPayloadByPkeyBytes 已整体删除。)
  *
- * Degraded paths (still correct, just less optimal):
+ * 调用约定(heapam.c):
+ *   - 必须在 ReleaseBuffer(buffer) 之前——我们经 heap_getattr 读
+ *     tuple->t_data,要解引用 buffer 内存。
+ *   - 必须在 END_CRIT_SECTION 之后——失效路径会 dsa_free,理论上可
+ *     ereport。
+ *   - heap_update / heap_delete 里"CacheInvalidateHeapTuple 与
+ *     ReleaseBuffer 之间"那个位置同时满足这两个约束。
  *
- *   key-update (old_pkey != new_pkey):
- *     Cannot write-through because the new pkey has no entry to update
- *     (no INSERT hook in this phase).  Falls back to invalidate-only on
- *     the OLD pkey.  Both old and new pkey will miss cache thereafter
- *     until Drop+Load; safe but cache-miss.
- *
- *   entry-not-cached (UPDATE to a relation that's cache-enabled but
- *   the specific pkey is not in the bucket chain — e.g. concurrently
- *   evicted, or the row was inserted after Load):
- *     Walk completes without a match.  The freshly-flattened payload
- *     is dsa_free'd directly (no reader ever observed it, so direct
- *     free is trivially safe).
- *
- *   flatten failure (OOM):
- *     RowCacheFlattenTuple ereports on dsa_allocate failure.  That's
- *     fine: heap_update is past END_CRIT_SECTION and the transaction
- *     can abort cleanly.  Cache contents remain consistent (the entry
- *     keeps its previous payload).
- *
- * NOT bumping entry_gen: readers tolerate "saw old payload after
- * writer swapped" via MVCC visibility check, exactly as for in-heap
- * stale reads.  If a future reader needs stronger "did this entry
- * get replaced under me" detection, add a pg_atomic_fetch_add_u64
- * on entry->entry_gen here.
- *
- * pg_write_barrier between the old payload_dp snapshot and the
- * publish of new payload_dp is still useful even with the partition
- * lock: it guarantees that any reader who acquires SHARED after our
- * EX release and loads new_payload_dp sees the fully-initialised
- * FlatCachedTuple at that address.  LWLock release/acquire pairing
- * provides this barrier on most architectures, but we keep the
- * explicit pg_write_barrier as belt-and-suspenders.
+ * HOT update 也走 heap_update,故本钩子对 HOT 也会触发——这是有意的:
+ * HOT 改了 tuple 内容(即便 btree 未动),缓存载荷同样过期。
  * ---------------------------------------------------------------- */
 
 /*
- * Wrap RowCacheFlattenTuple so callers that hold only a HeapTuple
- * (heap_update / heap_delete hooks) can flatten without manually
- * setting up a slot.
+ * UPDATE 钩子:只按"旧行 pkey"失效。
  *
- * Allocates a single-tuple slot in CurrentMemoryContext (caller
- * guarantees we're not in a CRIT_SECTION; allocation may ereport on
- * OOM).  Slot is dropped before return so we never leak across calls.
- */
-static dsa_pointer
-FlattenHeapTupleToDsa(Relation rel, HeapTuple htup)
-{
-	TupleTableSlot *slot;
-	dsa_pointer		dp;
-
-	Assert(rel != NULL && htup != NULL);
-
-	EnsureRowCacheDsa();
-
-	slot = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsHeapTuple);
-	ExecStoreHeapTuple(htup, slot, false);
-	dp = RowCacheFlattenTuple(LocalDsa, slot);
-	ExecDropSingleTupleTableSlot(slot);
-
-	return dp;
-}
-
-/*
- * Find entry by (relid, pkey_buf) and atomically swap its payload_dp to
- * `new_payload_dp` (which the caller has just dsa_allocate'd as a
- * standalone FlatCachedTuple).  On success returns the previous
- * payload_dp and sets *found=true; *out_old_was_owned is set to true
- * iff the previous payload was a standalone allocation (and therefore
- * the caller must dsa_free it).  On miss returns InvalidDsaPointer,
- * sets *found=false and *out_old_was_owned=false; the caller should
- * dsa_free the wasted new_payload_dp itself.
+ *   - 非键更新(pkey 不变):旧 pkey == 行的 pkey,失效它即可,后续读
+ *     落空走 btree。
+ *   - 键更新(pkey 变了):旧 pkey 的缓存 entry 已过期,失效它;新 pkey
+ *     本就没有缓存 entry(无 INSERT 钩子),无需处理。pkey 唯一,所以
+ *     新 pkey 之前不可能有活行 entry,不会有遗漏。
  *
- * After a successful swap the entry's payload_owned flag is unconditionally
- * 1 (the freshly-attached payload is always a standalone allocation).
- * The previous payload may have been either inline (Load default,
- * payload_owned was 0 — leave the interior bytes orphaned inside the
- * entry's allocation) or a prior standalone (payload_owned was 1 —
- * caller must free it).
- *
- * Uses the same lock + walk discipline as InvalidateEntryByPkeyBytes.
- */
-static dsa_pointer
-ReplaceEntryPayloadByPkeyBytes(RelMeta *rm, Oid relid,
-							   const uint8 *pkey_buf, int pkey_len,
-							   dsa_pointer new_payload_dp, bool *found,
-							   bool *out_old_was_owned)
-{
-	uint32			pkey_hash;
-	uint32			bucket;
-	LWLock		   *part;
-	dsa_pointer	   *heads;
-	dsa_pointer		cur_dp;
-	dsa_pointer		old_payload_dp = InvalidDsaPointer;
-
-	Assert(rm != NULL && found != NULL && out_old_was_owned != NULL);
-	*found = false;
-	*out_old_was_owned = false;
-
-	EnsureRowCacheDsa();
-
-	pkey_hash = ComputePkeyHashBytes(pkey_buf, pkey_len);
-	bucket = pkey_hash & ROW_CACHE_BUCKET_MASK;
-	part = PartitionLockForBucket(bucket);
-
-	LWLockAcquire(part, LW_EXCLUSIVE);
-
-	if (!DsaPointerIsValid(RowCacheCtl->hash_buckets_dp))
-	{
-		LWLockRelease(part);
-		return InvalidDsaPointer;
-	}
-
-	heads = BucketHeads();
-	cur_dp = heads[bucket];
-
-	while (DsaPointerIsValid(cur_dp))
-	{
-		GlobalEntry *e = (GlobalEntry *) dsa_get_address(LocalDsa, cur_dp);
-
-		if (e->relid == relid &&
-			e->pkey_hash == pkey_hash &&
-			e->pkey_len == pkey_len &&
-			memcmp(e->pkey_buf, pkey_buf, pkey_len) == 0)
-		{
-			old_payload_dp = e->payload_dp;
-			*out_old_was_owned = (e->payload_owned != 0);
-			/*
-			 * write_barrier before publishing the new pointer so a
-			 * reader that loads new_payload_dp afterwards sees the
-			 * fully-initialised FlatCachedTuple at that address.
-			 */
-			pg_write_barrier();
-			e->payload_dp = new_payload_dp;
-			e->payload_owned = 1;	/* freshly-attached standalone */
-			*found = true;
-			break;
-		}
-		cur_dp = e->next_dp;
-	}
-
-	LWLockRelease(part);
-
-	return old_payload_dp;
-}
-
-/*
- * Public DML hooks.  Called from heap_update / heap_delete after
- * END_CRIT_SECTION + CacheInvalidateHeapTuple but before ReleaseBuffer.
- *
- * UPDATE uses write-through (Phase 3 (2/2)); DELETE uses invalidate-
- * only (Phase 3 (1/2) — DELETE removes the entry entirely, so write-
- * through is not meaningful).
+ * 两种情况都归结为"失效旧 pkey",因此 newtup 不再需要,直接复用
+ * InvalidateByHeapTuple(rel, oldtup)。
  */
 void
 RowCacheOnHeapUpdate(Relation rel, HeapTuple oldtup, HeapTuple newtup)
 {
-	RelMeta		   *rm;
-	Oid				relid;
-	uint8			old_buf[ROW_CACHE_PKEY_INLINE_BYTES];
-	uint8			new_buf[ROW_CACHE_PKEY_INLINE_BYTES];
-	int				old_len;
-	int				new_len;
-	TupleDesc		desc;
-	dsa_pointer		new_payload_dp;
-	dsa_pointer		old_payload_dp;
-	bool			found;
-	bool			old_was_owned = false;
-
-	if (RowCacheCtl == NULL)
-		return;
-	if (rel == NULL || oldtup == NULL || oldtup->t_data == NULL)
-		return;
-	if (newtup == NULL || newtup->t_data == NULL)
-		return;
-
-	relid = RelationGetRelid(rel);
-	rm = FindRelMeta(relid);
-	if (rm == NULL)
-		return;
-	if (pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
-		return;
-	if (rm->n_pkey_attrs <= 0)
-		return;
-
-	desc = RelationGetDescr(rel);
-
-	old_len = SerializePkeyFromTuple(oldtup, desc, rm, old_buf);
-	if (old_len < 0)
-		return;					/* defensive */
-
-	new_len = SerializePkeyFromTuple(newtup, desc, rm, new_buf);
-	if (new_len < 0)
-	{
-		/* Defensive: new pkey null shouldn't happen.  Fall back to
-		 * invalidating the old. */
-		InvalidateEntryByPkeyBytes(rm, relid, old_buf, old_len);
-		return;
-	}
-
-	/*
-	 * Key-update degrade path: pkey columns changed.  Without an INSERT
-	 * hook we cannot populate the new pkey, so the most-consistent
-	 * thing we can do is evict the old entry and leave both old and
-	 * new pkey to fall back to native btree.  For composite pkeys we
-	 * compare both length and bytes since either could change in
-	 * principle (though length usually doesn't).
-	 */
-	if (old_len != new_len || memcmp(old_buf, new_buf, old_len) != 0)
-	{
-		InvalidateEntryByPkeyBytes(rm, relid, old_buf, old_len);
-		return;
-	}
-
-	/* Non-key-update: write-through. */
-	new_payload_dp = FlattenHeapTupleToDsa(rel, newtup);
-	if (!DsaPointerIsValid(new_payload_dp))
-		return;					/* unlikely; flatten ereports on OOM */
-
-	old_payload_dp = ReplaceEntryPayloadByPkeyBytes(rm, relid,
-													old_buf, old_len,
-													new_payload_dp, &found,
-													&old_was_owned);
-
-	if (found)
-	{
-		/*
-		 * Phase 5 (dml_lock) 2/8: synchronous dsa_free of old payload.
-		 * ReplaceEntryPayloadByPkeyBytes swapped entry->payload_dp
-		 * under EXCLUSIVE partition lock, so no reader can have
-		 * loaded old_payload_dp after that swap (post-swap readers
-		 * see new_payload_dp); pre-swap readers held SHARED and
-		 * have since released, so they no longer hold the pointer.
-		 * Direct free is safe.
-		 *
-		 * inline-payload optimisation: dsa_free ONLY when the prior
-		 * payload was a standalone allocation (old_was_owned == true).
-		 * For a freshly-loaded entry whose initial payload was inline
-		 * (the Load default), old_payload_dp is an interior dsa_pointer
-		 * into the entry's allocation — passing it to dsa_free would
-		 * corrupt the area.  The orphaned inline bytes remain inside
-		 * the entry's allocation (~100-200 B slack) until the entry
-		 * itself is freed; a steady stream of UPDATEs on the same row
-		 * leaks only that one-time inline slack, not the per-update
-		 * standalone payloads (those are freed here).
-		 */
-		if (old_was_owned && DsaPointerIsValid(old_payload_dp))
-			dsa_free(LocalDsa, old_payload_dp);
-	}
-	else
-	{
-		/*
-		 * Entry not in cache (concurrent eviction / never loaded).  The
-		 * freshly-flattened payload was never published to any reader,
-		 * so direct dsa_free is trivially safe.
-		 */
-		dsa_free(LocalDsa, new_payload_dp);
-	}
+	(void) newtup;				/* 行级失效不需要新行 */
+	InvalidateByHeapTuple(rel, oldtup);
 }
 
+/*
+ * DELETE 钩子:失效被删行 pkey 对应的缓存 entry。
+ */
 void
 RowCacheOnHeapDelete(Relation rel, HeapTuple oldtup)
 {
