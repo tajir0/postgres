@@ -31,6 +31,16 @@
 
 
 /*
+ * Row-cache pkey descriptor sizing.  Kept here (rather than in
+ * lib/relation_row_cache.h, which includes this header and would create a
+ * cycle) so RelationData can embed a backend-local snapshot of the cache's
+ * pkey schema.  Must match the canonical use in lib/relation_row_cache.c,
+ * which StaticAsserts ROW_CACHE_PKEY_MAX_ATTS <= INDEX_MAX_KEYS.
+ */
+#define ROW_CACHE_PKEY_MAX_ATTS		8
+
+
+/*
  * LockRelId and LockInfo really belong to lmgr.h, but it's more convenient
  * to declare them here so we can have a LockInfoData field in a Relation.
  */
@@ -253,6 +263,31 @@ typedef struct RelationData
 	bool		pgstat_enabled; /* should relation stats be counted */
 	/* use "struct" here to avoid needing to include pgstat.h: */
 	struct PgStat_TableStatus *pgstat_info; /* statistics collection area */
+
+	/*
+	 * Row-cache binding: a backend-local snapshot of this relation's shared
+	 * RelMeta, so the executor / DML hooks can reach the cache without
+	 * scanning the global RelMeta array on every access.
+	 *
+	 * rd_rowcache_meta encodes three states:
+	 *   NULL                 -- not bound yet (lazily filled on first use, or
+	 *                           eagerly at RelationBuildDesc time)
+	 *   ROWCACHE_NOT_CACHED  -- bound, confirmed this relation has no cache
+	 *                           (the common case: fast 1-pointer reject)
+	 *   else                 -- points at the live shmem RelMeta slot
+	 *
+	 * rd_rowcache_pkey_* mirror the cache's pkey descriptor (column count,
+	 * heap attnos in load/index order, and per-column byval typlens) captured
+	 * at bind time.  Because the swap in RelationClearRelation does NOT keep
+	 * these fields, an SI-driven rebuild automatically refreshes them from the
+	 * freshly-built descriptor (RelationBuildDesc re-binds).  See
+	 * RelationRowCacheBindRelation().  Use "struct" to avoid including
+	 * lib/relation_row_cache.h (which includes this header).
+	 */
+	struct RelMeta *rd_rowcache_meta;
+	int			rd_rowcache_pkey_n;
+	AttrNumber	rd_rowcache_pkey_attnos[ROW_CACHE_PKEY_MAX_ATTS];
+	int16		rd_rowcache_pkey_typlens[ROW_CACHE_PKEY_MAX_ATTS];
 } RelationData;
 
 

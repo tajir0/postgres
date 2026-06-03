@@ -147,7 +147,11 @@ StaticAssertDecl((ROW_CACHE_HASH_BUCKETS & ROW_CACHE_BUCKET_MASK) == 0,
  * ROW_CACHE_PKEY_MAX_ATTS  — max # of pkey columns we accept at Load
  *                            eligibility.  TPC-C uses up to 4 columns
  *                            (bmsql_order_line); we round up to 8 for
- *                            headroom without bloating RelMeta.
+ *                            headroom without bloating RelMeta.  The
+ *                            canonical definition now lives in utils/rel.h
+ *                            (so RelationData can embed a pkey snapshot);
+ *                            it is included transitively via
+ *                            lib/relation_row_cache.h -> utils/rel.h.
  *
  * ROW_CACHE_PKEY_INLINE_BYTES — max byte length of the serialized
  *                            (concatenated) pkey we'll embed in
@@ -163,7 +167,6 @@ StaticAssertDecl((ROW_CACHE_HASH_BUCKETS & ROW_CACHE_BUCKET_MASK) == 0,
  *                            scope for this commit (still rejected at
  *                            Load time, same as before).
  */
-#define ROW_CACHE_PKEY_MAX_ATTS		8
 #define ROW_CACHE_PKEY_INLINE_BYTES	32
 
 StaticAssertDecl(ROW_CACHE_PKEY_MAX_ATTS <= INDEX_MAX_KEYS,
@@ -278,6 +281,19 @@ typedef struct RowCacheControl
 
 static RowCacheControl *RowCacheCtl = NULL;
 static dsa_area *LocalDsa = NULL;
+
+/*
+ * Backend-local cache of the bucket-head array's process-local address.
+ *
+ * The bucket-head array (dsa_pointer[ROW_CACHE_HASH_BUCKETS]) is allocated
+ * once at shmem init and never reallocated (Drop/Load only unlink/insert
+ * entries, never touch hash_buckets_dp), so dsa_get_address on it returns a
+ * stable address for the lifetime of this backend's DSA attachment.  We
+ * resolve it once and reuse, saving a dsa_get_address (segment-map lookup +
+ * add) on every cache probe.  Reset to NULL whenever LocalDsa is (re)set in
+ * EnsureRowCacheDsa so a fresh attachment recomputes it.
+ */
+static dsa_pointer *MyBucketHeads = NULL;
 
 /*
  * Phase 5 (dml_lock) 5/8: deleted backend-local retire list +
@@ -529,11 +545,13 @@ EnsureRowCacheDsa(void)
 		RowCacheCtl->global_dsa_handle = dsa_get_handle(dsa);
 		RowCacheCtl->hash_buckets_dp = dp;
 		LocalDsa = dsa;
+		MyBucketHeads = NULL;	/* recompute against the new attachment */
 	}
 	else
 	{
 		LocalDsa = dsa_attach(RowCacheCtl->global_dsa_handle);
 		dsa_pin_mapping(LocalDsa);
+		MyBucketHeads = NULL;	/* recompute against the new attachment */
 	}
 
 	LWLockRelease(&RowCacheCtl->control_lock);
@@ -873,8 +891,12 @@ PartitionLockForBucket(uint32 bucket)
 static inline dsa_pointer *
 BucketHeads(void)
 {
-	return (dsa_pointer *) dsa_get_address(LocalDsa,
-										   RowCacheCtl->hash_buckets_dp);
+	if (likely(MyBucketHeads != NULL))
+		return MyBucketHeads;
+
+	MyBucketHeads = (dsa_pointer *) dsa_get_address(LocalDsa,
+												   RowCacheCtl->hash_buckets_dp);
+	return MyBucketHeads;
 }
 
 /* ----------------------------------------------------------------
@@ -1158,6 +1180,24 @@ RelationRowCacheLoadRelation(Relation rel)
 	LastLookupRelid = InvalidOid;
 
 	LWLockRelease(&rm->build_lock);
+
+	/*
+	 * Refresh THIS backend's RelationData binding so the loading session
+	 * sees the cache on its next query without waiting for a relcache
+	 * rebuild.  We deliberately do NOT broadcast a relcache invalidation:
+	 * the row cache already registers rowcache_relcache_callback, which
+	 * treats any invalidation as "DDL happened, disable" and would flip the
+	 * state we just set back to DISABLED.  Other backends bind lazily on
+	 * their first access after this Load (fresh sessions see ENABLED in
+	 * shmem); a session that previously bound ROWCACHE_NOT_CACHED simply
+	 * keeps using the btree path (correct, just not accelerated) until its
+	 * RelationData is next rebuilt.
+	 *
+	 * Resetting rd_rowcache_meta to NULL forces RelationRowCacheBindRelation
+	 * to re-evaluate (it early-returns when already bound).
+	 */
+	rel->rd_rowcache_meta = NULL;
+	RelationRowCacheBindRelation(rel);
 }
 
 /* ----------------------------------------------------------------
@@ -1847,6 +1887,16 @@ RelationRowCacheDropRelation(Oid relid)
 	LastLookupRelid = InvalidOid;
 
 	LWLockRelease(&rm->build_lock);
+
+	/*
+	 * No relcache invalidation broadcast here (it would collide with
+	 * rowcache_relcache_callback, same as in Load).  Backends holding a live
+	 * rd_rowcache_meta pointer to this now-DISABLED slot stay correct: every
+	 * probe re-checks rm->state under the partition lock and falls through to
+	 * btree once it observes DISABLED.  The stale pointer also remains valid
+	 * across a future Drop+reLoad because the slot is reused for the same
+	 * relid, so no dangling reference can arise.
+	 */
 }
 
 /* ----------------------------------------------------------------
@@ -2112,6 +2162,142 @@ RelationRowCachePkeyFetchComposite(Oid relid,
 		return false;
 
 	return DoPkeyFetchBytes(rm, relid, pkey_buf, pkey_len,
+							snapshot, slot, is_visible, has_hot_chain);
+}
+
+/* ----------------------------------------------------------------
+ * Public API: Relation-bound fast path
+ * ----------------------------------------------------------------
+ *
+ * These two entry points let the executor reach the cache through a
+ * RelationData snapshot (rel->rd_rowcache_*) instead of the global
+ * RelMeta-array scan + sticky lookup.  RelationBuildDesc binds the
+ * snapshot once (refreshed automatically on SI rebuild); IndexNext then
+ * carries the live RelMeta pointer in its IndexScanState and probes via
+ * RelationRowCachePkeyFetchBound, which never touches the RelMeta array.
+ */
+
+/*
+ * Bind (or confirm-not-cached) a relation's rd_rowcache_* snapshot.
+ * Idempotent: returns immediately once rd_rowcache_meta is set (either a
+ * live pointer or the ROWCACHE_NOT_CACHED sentinel).
+ *
+ * Safe to call before EnsureRowCacheDsa — it touches only the shmem
+ * RelMeta array, never the DSA.  A no-op (leaves the field NULL) when the
+ * cache control segment is not yet attached, so the very early bootstrap
+ * relation builds pay nothing and get bound on their next rebuild.
+ */
+void
+RelationRowCacheBindRelation(Relation rel)
+{
+	Oid			relid;
+	RelMeta	   *rm;
+	int			n;
+
+	if (rel == NULL)
+		return;
+
+	/* Already bound (live pointer or known-not-cached). */
+	if (rel->rd_rowcache_meta != NULL)
+		return;
+
+	/* Cache module not initialised in this backend yet (bootstrap). */
+	if (RowCacheCtl == NULL)
+		return;
+
+	relid = RelationGetRelid(rel);
+	if (!OidIsValid(relid))
+	{
+		rel->rd_rowcache_meta = ROWCACHE_NOT_CACHED;
+		return;
+	}
+
+	rm = FindRelMeta(relid);
+	if (rm == NULL ||
+		pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
+	{
+		/*
+		 * No slot, or slot present but DISABLED/LOADING.  Record
+		 * not-cached; a later Load fires CacheInvalidateRelcacheByRelid,
+		 * which rebuilds this RelationData and re-binds with the live
+		 * descriptor.
+		 */
+		rel->rd_rowcache_meta = ROWCACHE_NOT_CACHED;
+		return;
+	}
+	pg_read_barrier();
+
+	/*
+	 * Snapshot the pkey descriptor.  It is written once under build_lock at
+	 * Load and stays immutable until the next Drop (which first flips state
+	 * to DISABLED — caught above).  Reading it under an observed ENABLED
+	 * state with a read barrier is therefore consistent.
+	 */
+	n = rm->n_pkey_attrs;
+	if (n <= 0 || n > ROW_CACHE_PKEY_MAX_ATTS)
+	{
+		rel->rd_rowcache_meta = ROWCACHE_NOT_CACHED;
+		return;
+	}
+
+	rel->rd_rowcache_pkey_n = n;
+	for (int i = 0; i < n; i++)
+	{
+		rel->rd_rowcache_pkey_attnos[i] = rm->pkey_attnos[i];
+		rel->rd_rowcache_pkey_typlens[i] = rm->pkey_typlens[i];
+	}
+
+	/* Publish the live pointer last (backend-local; no cross-proc barrier). */
+	rel->rd_rowcache_meta = rm;
+}
+
+/*
+ * Probe the cache using a RelMeta pointer the caller already holds (taken
+ * from rd_rowcache_meta and carried in IndexScanState).  Skips
+ * LookupRelMetaForFetch entirely — no FindRelMeta scan, no sticky cache —
+ * and resolves the bucket-head array through the backend-local cached
+ * pointer (BucketHeads()).  Equivalent in result to
+ * RelationRowCachePkeyFetchComposite(rm->relid, ...).
+ */
+bool
+RelationRowCachePkeyFetchBound(RelMeta *rm,
+							   const Datum *vals,
+							   int nvals,
+							   Snapshot snapshot,
+							   TupleTableSlot *slot,
+							   bool *is_visible,
+							   bool *has_hot_chain)
+{
+	uint8		pkey_buf[ROW_CACHE_PKEY_INLINE_BYTES];
+	int			pkey_len;
+
+	Assert(is_visible != NULL && has_hot_chain != NULL);
+	*is_visible = false;
+	*has_hot_chain = false;
+
+	if (rm == NULL || rm == ROWCACHE_NOT_CACHED)
+		return false;
+	if (vals == NULL || nvals <= 0)
+		return false;
+	if (!IsMVCCSnapshot(snapshot))
+		return false;
+
+	/*
+	 * State fast-fail via the bound pointer (a single deref, not an array
+	 * scan).  DoPkeyFetchBytes re-checks state under the partition lock; this
+	 * early check just avoids hashing + locking for a dropped relation.
+	 */
+	if (pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
+		return false;
+
+	if (rm->n_pkey_attrs != nvals)
+		return false;
+
+	pkey_len = SerializePkeyFromDatumArray(vals, nvals, rm, pkey_buf);
+	if (pkey_len < 0)
+		return false;
+
+	return DoPkeyFetchBytes(rm, rm->relid, pkey_buf, pkey_len,
 							snapshot, slot, is_visible, has_hot_chain);
 }
 

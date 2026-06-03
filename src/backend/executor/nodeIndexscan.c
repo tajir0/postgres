@@ -94,68 +94,47 @@ IndexNext(IndexScanState *node)
 	slot = node->ss.ss_ScanTupleSlot;
 
 	/*
-	 * Row-cache pkey fast path (V4 Phase 4 (2/2): composite-aware).
+	 * Row-cache pkey fast path (relation-bound).
 	 *
-	 * Static shape eligibility is decided at ExecInit; whether the cache
-	 * actually has a pkey index loaded — and with what shape — is
-	 * queried dynamically here so a Load that happens after ExecInit
-	 * (but before query execution) takes effect immediately.
+	 * iss_RowCacheMeta was resolved once at ExecInitIndexScan from the scan
+	 * relation's rd_rowcache_meta snapshot: non-NULL means this relation has
+	 * a loaded cache whose pkey columns match this index position-for-
+	 * position, so we can probe the global hash directly through the bound
+	 * RelMeta pointer + backend-local bucket-head array — no RelMeta-array
+	 * scan, no sticky lookup, no per-tuple descriptor query.  NULL means the
+	 * relation is not cached (or its shape doesn't match), so we fall
+	 * straight through to the btree path.
 	 *
 	 * On hit + visible we emit exactly one tuple and mark the scan
 	 * exhausted, mimicking unique btree equality semantics.  On miss /
 	 * not-visible / HOT chain we fall through to the regular btree path;
-	 * iss_PkeyAttempted ensures we don't re-consult the cache after
-	 * falling through within the same scan instance.
+	 * iss_PkeyAttempted ensures we don't re-consult the cache after falling
+	 * through within the same scan instance (reset on rescan).
 	 */
-	if (node->iss_RowCachePkeyShapeOk && !node->iss_PkeyAttempted)
+	if (node->iss_RowCacheMeta != NULL && !node->iss_PkeyAttempted)
 	{
-		AttrNumber	cache_attnos[INDEX_MAX_KEYS];
-		int			cache_natts;
-		Oid			relid;
+		Datum		vals[INDEX_MAX_KEYS];
+		int			natts = node->iss_RowCachePkeyNatts;
 		bool		visible = false;
 		bool		has_hot_chain = false;
 
 		node->iss_PkeyAttempted = true;
 
-		/*
-		 * Dynamic gate.  Two conditions must hold:
-		 *
-		 *   (a) The cache currently has a pkey descriptor for this
-		 *       relation.  cache_natts == 0 means "no, fall through".
-		 *
-		 *   (b) The cache's attno list matches the index's attno list
-		 *       column-for-column.  Most TPC-C-style schemas satisfy
-		 *       this trivially because the IndexScan is on the primary-
-		 *       key index that defined the cache's pkey.  If a query
-		 *       happens to use a different index whose columns coincide
-		 *       in shape but not in position, fall through safely.
-		 *
-		 *   (c) All runtime ScanKeys are ready (NestLoop inner scans
-		 *       set this between rescans).
-		 */
-		relid = RelationGetRelid(node->ss.ss_currentRelation);
-		cache_natts = RelationRowCachePkeyDescriptor(relid,
-													 cache_attnos,
-													 INDEX_MAX_KEYS);
-
-		if (cache_natts > 0 &&
-			cache_natts == node->iss_RowCachePkeyIndexNatts &&
-			(node->iss_NumRuntimeKeys == 0 || node->iss_RuntimeKeysReady))
+		/* All runtime ScanKeys must be ready (NestLoop inner scans). */
+		if (node->iss_NumRuntimeKeys == 0 || node->iss_RuntimeKeysReady)
 		{
-			Datum	vals[INDEX_MAX_KEYS];
-			bool	keys_ok = true;
+			bool		keys_ok = true;
 
 			/*
-			 * Match cache attno list to index attno list and gather one
-			 * Datum per cache column from the corresponding ScanKey.
-			 * Any null-flag or attno mismatch aborts the fast path.
+			 * Gather one Datum per cached pkey column from the equality
+			 * ScanKeys.  The attno match was verified once at ExecInit, so
+			 * here we only reject a null search key.
 			 */
-			for (int i = 0; i < cache_natts; i++)
+			for (int i = 0; i < natts; i++)
 			{
-				ScanKey	sk = &node->iss_ScanKeys[i];
+				ScanKey		sk = &node->iss_ScanKeys[i];
 
-				if (cache_attnos[i] != node->iss_RowCachePkeyIndexHeapAttnos[i] ||
-					(sk->sk_flags & SK_ISNULL) != 0)
+				if ((sk->sk_flags & SK_ISNULL) != 0)
 				{
 					keys_ok = false;
 					break;
@@ -165,45 +144,25 @@ IndexNext(IndexScanState *node)
 
 			if (keys_ok)
 			{
-				bool	hit;
+				bool		hit;
 
-				/*
-				 * Single-column dispatches via the legacy Fetch API
-				 * (slightly cheaper: no Datum-array stack), composite
-				 * via PkeyFetchComposite.  Both paths reduce to the
-				 * same EBR-wrapped DoPkeyFetchBytes inside the cache.
-				 */
-				if (cache_natts == 1)
-					hit = RelationRowCachePkeyFetch(relid,
-													vals[0],
-													estate->es_snapshot,
-													slot,
-													&visible,
-													&has_hot_chain);
-				else
-					hit = RelationRowCachePkeyFetchComposite(relid,
-															 vals,
-															 cache_natts,
-															 estate->es_snapshot,
-															 slot,
-															 &visible,
-															 &has_hot_chain);
+				hit = RelationRowCachePkeyFetchBound(node->iss_RowCacheMeta,
+													 vals, natts,
+													 estate->es_snapshot,
+													 slot, &visible,
+													 &has_hot_chain);
 
-				if (hit)
+				if (hit && visible && !has_hot_chain)
 				{
-					if (visible && !has_hot_chain)
-					{
-						node->iss_ReachedEnd = true;
-						return slot;
-					}
-					/*
-					 * Cache held the tuple but it was invisible to our
-					 * snapshot or sat at the head of a HOT chain.
-					 * Either way we cannot trust the cache copy alone;
-					 * fall through to btree which walks the live HOT
-					 * chain and re-checks visibility against the heap.
-					 */
+					node->iss_ReachedEnd = true;
+					return slot;
 				}
+				/*
+				 * Miss, or the cache held a tuple that was invisible to our
+				 * snapshot or sat at the head of a HOT chain.  Fall through
+				 * to btree, which walks the live HOT chain and re-checks
+				 * visibility against the heap.
+				 */
 			}
 		}
 		/* Fall through to btree path below. */
@@ -1240,6 +1199,8 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
 	indexstate->iss_RowCachePkeyShapeOk = false;
 	indexstate->iss_RowCachePkeyIndexNatts = 0;
 	indexstate->iss_PkeyAttempted = false;
+	indexstate->iss_RowCacheMeta = NULL;
+	indexstate->iss_RowCachePkeyNatts = 0;
 
 	if (indexstate->iss_NumScanKeys >= 1 &&
 		indexstate->iss_NumScanKeys <= INDEX_MAX_KEYS &&
@@ -1281,6 +1242,55 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
 		{
 			indexstate->iss_RowCachePkeyShapeOk = true;
 			indexstate->iss_RowCachePkeyIndexNatts = indexstate->iss_NumScanKeys;
+		}
+	}
+
+	/*
+	 * Bind the relation-scoped row-cache fast path.
+	 *
+	 * When the static shape is eligible, resolve the scan relation's
+	 * rd_rowcache_meta snapshot (binding it on demand if the relation was
+	 * built before the cache module attached) and verify the cache's pkey
+	 * attno list matches this index's key columns position-for-position.
+	 * On a match we stash the live RelMeta pointer so IndexNext can probe
+	 * the hash via the backend-local bucket-head pointer without ever
+	 * scanning the global RelMeta array.  On any mismatch / not-cached the
+	 * pointer stays NULL and IndexNext goes straight to the btree path.
+	 *
+	 * Any row-cache Load/Drop fires a relcache invalidation (processed at
+	 * the next command boundary, i.e. before this query starts executing),
+	 * so binding here rather than per-tuple loses no Loads that are visible
+	 * to this query.
+	 */
+	if (indexstate->iss_RowCachePkeyShapeOk)
+	{
+		Relation	scanRel = indexstate->ss.ss_currentRelation;
+		struct RelMeta *rm;
+
+		if (scanRel->rd_rowcache_meta == NULL)
+			RelationRowCacheBindRelation(scanRel);
+
+		rm = scanRel->rd_rowcache_meta;
+		if (rm != NULL && rm != ROWCACHE_NOT_CACHED &&
+			scanRel->rd_rowcache_pkey_n == indexstate->iss_RowCachePkeyIndexNatts)
+		{
+			bool		attnos_match = true;
+
+			for (int i = 0; i < scanRel->rd_rowcache_pkey_n; i++)
+			{
+				if (scanRel->rd_rowcache_pkey_attnos[i] !=
+					indexstate->iss_RowCachePkeyIndexHeapAttnos[i])
+				{
+					attnos_match = false;
+					break;
+				}
+			}
+
+			if (attnos_match)
+			{
+				indexstate->iss_RowCacheMeta = rm;
+				indexstate->iss_RowCachePkeyNatts = scanRel->rd_rowcache_pkey_n;
+			}
 		}
 	}
 

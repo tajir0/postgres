@@ -135,6 +135,42 @@ extern bool RelationRowCachePkeyFetchComposite(Oid relid,
 extern AttrNumber RelationRowCachePkeyAttno(Oid relid);
 
 /*
+ * Relation-bound fast path.
+ *
+ * ROWCACHE_NOT_CACHED is the sentinel stored in RelationData.rd_rowcache_meta
+ * once a relation has been checked and confirmed to have no cache.  It lets a
+ * single pointer test ("== NULL ? not bound : == NOT_CACHED ? reject : use")
+ * cover both "never looked" and "looked, nothing there" without a second
+ * field.  Any non-NULL, non-sentinel value is a live shmem RelMeta pointer.
+ */
+#define ROWCACHE_NOT_CACHED		((struct RelMeta *) 0x1)
+
+/*
+ * Bind (or refresh) rel->rd_rowcache_{meta,pkey_*} from the shared RelMeta
+ * array.  Idempotent and cheap when already bound (rd_rowcache_meta != NULL
+ * returns immediately).  Called from RelationBuildDesc so an SI-driven
+ * rebuild refreshes the snapshot, and lazily from executor / DML hooks the
+ * first time a freshly built relation is touched.  No-op (leaves the field
+ * NULL) when the cache module is not yet initialised (e.g. bootstrap).
+ */
+extern void RelationRowCacheBindRelation(Relation rel);
+
+/*
+ * Bound composite/single fetch: probe the cache for a relation whose live
+ * RelMeta pointer the caller already holds (from rd_rowcache_meta), skipping
+ * the global RelMeta-array scan and sticky lookup entirely.  vals[0..nvals-1]
+ * are the pkey column Datums in cache attno order; nvals must equal the
+ * cache's n_pkey_attrs.  Semantics otherwise match RelationRowCachePkeyFetch.
+ */
+extern bool RelationRowCachePkeyFetchBound(struct RelMeta *rm,
+										   const Datum *vals,
+										   int nvals,
+										   Snapshot snapshot,
+										   TupleTableSlot *slot,
+										   bool *is_visible,
+										   bool *has_hot_chain);
+
+/*
  * Snapshot the relation's cached pkey descriptor: writes the cache's
  * full attno list (in load-time / index order) into out_attnos[] and
  * returns the count.  Returns 0 when the relation is not cached, not

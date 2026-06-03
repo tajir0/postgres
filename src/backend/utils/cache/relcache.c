@@ -68,6 +68,7 @@
 #include "commands/publicationcmds.h"
 #include "commands/trigger.h"
 #include "common/int.h"
+#include "lib/relation_row_cache.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -1277,6 +1278,17 @@ retry:
 
 	/* make sure relation is marked as having no open file yet */
 	relation->rd_smgr = NULL;
+
+	/*
+	 * Bind the row-cache snapshot (rd_rowcache_meta + pkey descriptor) from
+	 * the shared RelMeta array.  No-op when the cache module is not attached
+	 * (bootstrap) or the relation has no cache.  Touches only shared memory,
+	 * never the system catalogs, so it is safe in the catalog-read-free zone
+	 * that follows.  Because RelationClearRelation's rebuild swaps these
+	 * fields in from the freshly built descriptor, an SI invalidation (which
+	 * a row-cache Load/Drop broadcasts) automatically refreshes the binding.
+	 */
+	RelationRowCacheBindRelation(relation);
 
 	/*
 	 * now we can free the memory allocated for pg_class_tuple
