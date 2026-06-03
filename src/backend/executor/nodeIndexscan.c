@@ -1177,24 +1177,27 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
 	}
 
 	/*
-	 * Decide whether this IndexScan's STATIC shape is eligible for the
-	 * row-cache pkey fast path (V4 Phase 4 (2/2): composite-aware).  We
-	 * only check plan-tree-derived properties here:
+	 * 绑定关系级行缓存快路径。
 	 *
-	 *   - NumScanKeys >= 1 and equals index's indnkeyatts
-	 *   - no ORDER BY clauses
-	 *   - every ScanKey is btree equality, no disqualifying flags
-	 *   - ScanKeys[i].sk_attno == i+1 (i.e. ScanKeys are in index-attno
-	 *     order, so we can pair them with index keys position-for-
-	 *     position at runtime without needing a sort/permute step)
-	 *   - every index key column maps to a real heap attno (>0)
+	 * 优化(#1):先解析 scan 关系的 rd_rowcache_meta 快照,只有这张表
+	 * "确实被行缓存"时才继续做下面的静态 shape 资格计算 + attno 对位
+	 * 匹配。TPC-C 里绝大多数索引扫描打在未缓存的表上(NewOrder 一笔
+	 * ~23 次点查只有 ~10 次是 item),让它们在这里一个指针判断就早退,
+	 * 行缓存对未缓存表近乎零成本——既省掉每次 ExecInit 的 shape 循环,
+	 * 也避免行缓存的存在拖累未缓存表的索引路径。
 	 *
-	 * We do NOT require iss_NumScanKeys == 1 anymore; a composite-pkey
-	 * IndexScan with N equality ScanKeys on all N index columns is
-	 * eligible.  The cache's actual pkey shape (single-col vs composite)
-	 * is queried dynamically in IndexNext via
-	 * RelationRowCachePkeyDescriptor, so a Load that happens after
-	 * ExecInit (or a re-Load with a different shape) still takes effect.
+	 * shape 资格(只看 plan 树派生属性,运行期不变):
+	 *   - NumScanKeys >= 1 且等于索引的 indnkeyatts
+	 *   - 无 ORDER BY
+	 *   - 每个 ScanKey 都是 btree 等值、无 disqualifying 标志
+	 *   - ScanKeys[i].sk_attno == i+1(与索引键列按位对齐,运行期无需
+	 *     重排即可逐列配对)
+	 *   - 每个索引键列都映射到真实 heap attno(>0)
+	 *
+	 * rd_rowcache_meta 在 RelationBuildDesc 时已绑定;若该关系在缓存模块
+	 * attach 之前就建好(字段仍为 NULL),这里按需补绑一次(幂等)。
+	 * 绑定/Drop 都会经 relcache 失效在命令边界刷新,故在此绑定不会漏掉
+	 * 对本查询可见的 Load。
 	 */
 	indexstate->iss_RowCachePkeyShapeOk = false;
 	indexstate->iss_RowCachePkeyIndexNatts = 0;
@@ -1202,94 +1205,83 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
 	indexstate->iss_RowCacheMeta = NULL;
 	indexstate->iss_RowCachePkeyNatts = 0;
 
-	if (indexstate->iss_NumScanKeys >= 1 &&
-		indexstate->iss_NumScanKeys <= INDEX_MAX_KEYS &&
-		indexstate->iss_NumOrderByKeys == 0)
-	{
-		const int	disqualifying =
-			SK_ROW_HEADER | SK_ROW_MEMBER | SK_ROW_END |
-			SK_SEARCHARRAY | SK_SEARCHNULL | SK_SEARCHNOTNULL |
-			SK_ORDER_BY;
-		Relation	indexRel = indexstate->iss_RelationDesc;
-		bool		shape_ok = true;
-
-		if (indexRel->rd_index->indnkeyatts != indexstate->iss_NumScanKeys)
-			shape_ok = false;
-
-		for (int i = 0; shape_ok && i < indexstate->iss_NumScanKeys; i++)
-		{
-			ScanKey		sk = &indexstate->iss_ScanKeys[i];
-			AttrNumber	heap_attno;
-
-			if (sk->sk_strategy != BTEqualStrategyNumber ||
-				(sk->sk_flags & disqualifying) != 0 ||
-				sk->sk_attno != i + 1)
-			{
-				shape_ok = false;
-				break;
-			}
-
-			heap_attno = indexRel->rd_index->indkey.values[i];
-			if (heap_attno <= 0)
-			{
-				shape_ok = false;
-				break;
-			}
-			indexstate->iss_RowCachePkeyIndexHeapAttnos[i] = heap_attno;
-		}
-
-		if (shape_ok)
-		{
-			indexstate->iss_RowCachePkeyShapeOk = true;
-			indexstate->iss_RowCachePkeyIndexNatts = indexstate->iss_NumScanKeys;
-		}
-	}
-
-	/*
-	 * Bind the relation-scoped row-cache fast path.
-	 *
-	 * When the static shape is eligible, resolve the scan relation's
-	 * rd_rowcache_meta snapshot (binding it on demand if the relation was
-	 * built before the cache module attached) and verify the cache's pkey
-	 * attno list matches this index's key columns position-for-position.
-	 * On a match we stash the live RelMeta pointer so IndexNext can probe
-	 * the hash via the backend-local bucket-head pointer without ever
-	 * scanning the global RelMeta array.  On any mismatch / not-cached the
-	 * pointer stays NULL and IndexNext goes straight to the btree path.
-	 *
-	 * Any row-cache Load/Drop fires a relcache invalidation (processed at
-	 * the next command boundary, i.e. before this query starts executing),
-	 * so binding here rather than per-tuple loses no Loads that are visible
-	 * to this query.
-	 */
-	if (indexstate->iss_RowCachePkeyShapeOk)
 	{
 		Relation	scanRel = indexstate->ss.ss_currentRelation;
 		struct RelMeta *rm;
 
+		/* 先解析绑定:未缓存的表到此为止,不做任何 shape 计算。 */
 		if (scanRel->rd_rowcache_meta == NULL)
 			RelationRowCacheBindRelation(scanRel);
-
 		rm = scanRel->rd_rowcache_meta;
-		if (rm != NULL && rm != ROWCACHE_NOT_CACHED &&
-			scanRel->rd_rowcache_pkey_n == indexstate->iss_RowCachePkeyIndexNatts)
-		{
-			bool		attnos_match = true;
 
-			for (int i = 0; i < scanRel->rd_rowcache_pkey_n; i++)
+		if (rm != NULL && rm != ROWCACHE_NOT_CACHED &&
+			indexstate->iss_NumScanKeys >= 1 &&
+			indexstate->iss_NumScanKeys <= INDEX_MAX_KEYS &&
+			indexstate->iss_NumOrderByKeys == 0)
+		{
+			const int	disqualifying =
+				SK_ROW_HEADER | SK_ROW_MEMBER | SK_ROW_END |
+				SK_SEARCHARRAY | SK_SEARCHNULL | SK_SEARCHNOTNULL |
+				SK_ORDER_BY;
+			Relation	indexRel = indexstate->iss_RelationDesc;
+			bool		shape_ok = true;
+
+			if (indexRel->rd_index->indnkeyatts != indexstate->iss_NumScanKeys)
+				shape_ok = false;
+
+			for (int i = 0; shape_ok && i < indexstate->iss_NumScanKeys; i++)
 			{
-				if (scanRel->rd_rowcache_pkey_attnos[i] !=
-					indexstate->iss_RowCachePkeyIndexHeapAttnos[i])
+				ScanKey		sk = &indexstate->iss_ScanKeys[i];
+				AttrNumber	heap_attno;
+
+				if (sk->sk_strategy != BTEqualStrategyNumber ||
+					(sk->sk_flags & disqualifying) != 0 ||
+					sk->sk_attno != i + 1)
 				{
-					attnos_match = false;
+					shape_ok = false;
 					break;
 				}
+
+				heap_attno = indexRel->rd_index->indkey.values[i];
+				if (heap_attno <= 0)
+				{
+					shape_ok = false;
+					break;
+				}
+				indexstate->iss_RowCachePkeyIndexHeapAttnos[i] = heap_attno;
 			}
 
-			if (attnos_match)
+			if (shape_ok)
 			{
-				indexstate->iss_RowCacheMeta = rm;
-				indexstate->iss_RowCachePkeyNatts = scanRel->rd_rowcache_pkey_n;
+				indexstate->iss_RowCachePkeyShapeOk = true;
+				indexstate->iss_RowCachePkeyIndexNatts = indexstate->iss_NumScanKeys;
+
+				/*
+				 * shape 合格,再校验 cache 的 pkey 列与本索引键列逐列
+				 * 对位匹配;匹配则锁定活 RelMeta 指针,IndexNext 即可
+				 * 经 backend 本地桶头指针探测,全程不扫 RelMeta 数组。
+				 */
+				if (scanRel->rd_rowcache_pkey_n == indexstate->iss_NumScanKeys)
+				{
+					bool		attnos_match = true;
+
+					for (int i = 0; i < scanRel->rd_rowcache_pkey_n; i++)
+					{
+						if (scanRel->rd_rowcache_pkey_attnos[i] !=
+							indexstate->iss_RowCachePkeyIndexHeapAttnos[i])
+						{
+							attnos_match = false;
+							break;
+						}
+					}
+
+					if (attnos_match)
+					{
+						indexstate->iss_RowCacheMeta = rm;
+						indexstate->iss_RowCachePkeyNatts =
+							scanRel->rd_rowcache_pkey_n;
+					}
+				}
 			}
 		}
 	}
