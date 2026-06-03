@@ -1762,6 +1762,22 @@ typedef struct IndexScanState
 	AttrNumber	iss_RowCachePkeyIndexHeapAttnos[INDEX_MAX_KEYS];
 	int			iss_RowCachePkeyIndexNatts;
 	bool		iss_PkeyAttempted;
+
+	/*
+	 * Bound row-cache fast path.  Resolved once at ExecInitIndexScan from
+	 * the scan relation's rd_rowcache_meta snapshot when (a) the static
+	 * shape is eligible (iss_RowCachePkeyShapeOk) and (b) the cache's pkey
+	 * attno list matches this index's key columns position-for-position.
+	 *
+	 * iss_RowCacheMeta != NULL means the bound fast path is armed: IndexNext
+	 * gathers iss_RowCachePkeyNatts Datums from the equality ScanKeys and
+	 * probes via RelationRowCachePkeyFetchBound(iss_RowCacheMeta, ...),
+	 * which never scans the global RelMeta array.  NULL means "no usable
+	 * cache for this scan" — fall straight through to the btree path.  Use
+	 * "struct" to avoid pulling lib/relation_row_cache.h into execnodes.h.
+	 */
+	struct RelMeta *iss_RowCacheMeta;
+	int			iss_RowCachePkeyNatts;
 } IndexScanState;
 
 /* ----------------
