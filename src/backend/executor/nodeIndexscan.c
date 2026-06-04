@@ -1209,9 +1209,14 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
 		Relation	scanRel = indexstate->ss.ss_currentRelation;
 		struct RelMeta *rm;
 
-		/* 先解析绑定:未缓存的表到此为止,不做任何 shape 计算。 */
-		if (scanRel->rd_rowcache_meta == NULL)
-			RelationRowCacheBindRelation(scanRel);
+		/*
+		 * 代数感知绑定:无条件调用(不再只在 NULL 时调)。稳态只是一次
+		 * 廉价的 global_gen 原子读 + 比较就早退;若此前有 backend Load/Drop
+		 * 过缓存(代数变了),则重绑——这让"先碰过表、绑了 NOT_CACHED"的
+		 * backend 也能感知到别人后来的 Load,不会"明明已 Load 却回落原生"。
+		 * 未缓存的表刷新后仍是 NOT_CACHED,到此为止,不做任何 shape 计算。
+		 */
+		RelationRowCacheBindRelation(scanRel);
 		rm = scanRel->rd_rowcache_meta;
 
 		if (rm != NULL && rm != ROWCACHE_NOT_CACHED &&

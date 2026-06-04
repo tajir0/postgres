@@ -288,6 +288,15 @@ typedef struct RelationData
 	int			rd_rowcache_pkey_n;
 	AttrNumber	rd_rowcache_pkey_attnos[ROW_CACHE_PKEY_MAX_ATTS];
 	int16		rd_rowcache_pkey_typlens[ROW_CACHE_PKEY_MAX_ATTS];
+
+	/*
+	 * 绑定时拍下的全局代数快照(RowCacheControl.global_gen)。
+	 * RelationRowCacheBindRelation 用它判断这份 rd_rowcache_* 是否最新:
+	 * 若 != 当前 global_gen,说明此后有 backend Load/Drop 过缓存,需要重绑。
+	 * 这让"先碰过表、绑了 NOT_CACHED 的 backend"也能在别人 Load 后及时
+	 * 感知(避免 DML 漏失效 / 读路径明明已 Load 却回落原生)。
+	 */
+	uint32		rd_rowcache_gen;
 } RelationData;
 
 

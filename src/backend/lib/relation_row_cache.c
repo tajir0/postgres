@@ -239,20 +239,45 @@ typedef struct GlobalEntry
 } GlobalEntry;
 
 /*
+ * 全局代数计数器,用 cache line padding 包成独占一条 line。
+ *
+ * 每次 Load / Drop 对它 +1(冷路径);每次读 / DML 在 RelationRowCacheBindRelation
+ * 里对它做一次原子 *读* + 比较——纯 load,稳态下所有核持 S 态、L1 命中、
+ * 不 bouncing。padding 保证它绝不与热写的 partition_locks[] 共享 cache line
+ * (否则锁的原子写会连带作废它那条 line,把廉价的纯读变成 miss)。
+ *
+ * 用 uint32(非 u64):全平台廉价对齐 load;只做相等比较,回绕无害
+ * (要在某 backend 两次检查之间正好绕满 2^32 次 Load/Drop 才有 ABA,
+ * 天文数字不可能)。
+ */
+typedef union RowCacheGenPadded
+{
+	pg_atomic_uint32 value;
+	char			pad[PG_CACHE_LINE_SIZE];
+} RowCacheGenPadded;
+
+/*
  * RowCacheControl: top-level shmem segment.
  */
 typedef struct RowCacheControl
 {
 	dsa_handle		global_dsa_handle;
-	LWLock			control_lock;			/* protects DSA init */
-	LWLock			relmeta_alloc_lock;		/* protects RelMeta slot allocation */
-	LWLock			partition_locks[ROW_CACHE_NUM_PARTITIONS];
 
 	/*
 	 * Bucket-head array (length ROW_CACHE_HASH_BUCKETS) lives in DSA;
-	 * pointer below is published after dsa_create.
+	 * pointer below is published after dsa_create.  Read-mostly (set once).
 	 */
 	dsa_pointer		hash_buckets_dp;
+
+	/*
+	 * 全局代数:热读冷写,放在 read-mostly 区并 cache-line 对齐,远离下面
+	 * 热写的 partition_locks[]。见 RowCacheGenPadded 注释。
+	 */
+	RowCacheGenPadded global_gen pg_attribute_aligned(PG_CACHE_LINE_SIZE);
+
+	LWLock			control_lock;			/* protects DSA init */
+	LWLock			relmeta_alloc_lock;		/* protects RelMeta slot allocation */
+	LWLock			partition_locks[ROW_CACHE_NUM_PARTITIONS];
 
 	/*
 	 * Phase 5 (dml_lock) 5/8: removed EBR (Epoch-Based Reclamation)
@@ -466,6 +491,7 @@ RowCacheShmemInit(void)
 
 	RowCacheCtl->global_dsa_handle = DSA_HANDLE_INVALID;
 	RowCacheCtl->hash_buckets_dp = InvalidDsaPointer;
+	pg_atomic_init_u32(&RowCacheCtl->global_gen.value, 0);
 
 	LWLockInitialize(&RowCacheCtl->control_lock, LWTRANCHE_ROW_CACHE_CTL);
 	LWLockInitialize(&RowCacheCtl->relmeta_alloc_lock,
@@ -1178,21 +1204,19 @@ RelationRowCacheLoadRelation(Relation rel)
 	LWLockRelease(&rm->build_lock);
 
 	/*
-	 * Refresh THIS backend's RelationData binding so the loading session
-	 * sees the cache on its next query without waiting for a relcache
-	 * rebuild.  We deliberately do NOT broadcast a relcache invalidation:
-	 * the row cache already registers rowcache_relcache_callback, which
-	 * treats any invalidation as "DDL happened, disable" and would flip the
-	 * state we just set back to DISABLED.  Other backends bind lazily on
-	 * their first access after this Load (fresh sessions see ENABLED in
-	 * shmem); a session that previously bound ROWCACHE_NOT_CACHED simply
-	 * keeps using the btree path (correct, just not accelerated) until its
-	 * RelationData is next rebuilt.
+	 * 推进全局代数,让所有 backend(包括"先碰过表、绑了 NOT_CACHED"的)
+	 * 在下次读 / DML 调 RelationRowCacheBindRelation 时因代数不匹配而重绑,
+	 * 从而感知到这次 Load。必须在本地重绑之前 +1,这样下面的重绑会拍下
+	 * 新代数。
 	 *
-	 * Resetting rd_rowcache_meta to NULL forces RelationRowCacheBindRelation
-	 * to re-evaluate (it early-returns when already bound).
+	 * 我们仍然刻意不广播 relcache 失效:行缓存注册的
+	 * rowcache_relcache_callback 会把任何失效当作"DDL→禁用",把刚设的
+	 * ENABLED 又翻回 DISABLED。代数机制不经过 relcache 失效通道,绕开了
+	 * 这个冲突。
 	 */
-	rel->rd_rowcache_meta = NULL;
+	pg_atomic_fetch_add_u32(&RowCacheCtl->global_gen.value, 1);
+
+	/* 顺手刷新本 backend 对该 rel 的绑定(代数已变 -> 重绑成活指针)。 */
 	RelationRowCacheBindRelation(rel);
 }
 
@@ -1445,14 +1469,15 @@ InvalidateEntryByPkeyBytes(Oid relid, const uint8 *pkey_buf, int pkey_len)
  * 走 RelationData 快照(rd_rowcache_meta + rd_rowcache_pkey_*),不再扫
  * 全局 RelMeta 数组:
  *
- *   - rd_rowcache_meta == NULL / ROWCACHE_NOT_CACHED:本 backend 视该表
- *     未缓存,直接返回(~2ns 单指针拒绝)。这是"信任 reldata"模型——
- *     运维上必须保证在任何 backend 对某表发起 DML 之前就完成 Load,
- *     否则陈旧的 NOT_CACHED 会让本 backend 漏掉对刚加载 entry 的失效。
- *   - 否则 rd_rowcache_meta 是活的 RelMeta 指针:复检 state(挡住已被
- *     Drop / DDL 禁用的情况),再用本地 pkey schema 快照序列化 pkey。
- *
- * 第 1/3 步只解一个指针 + 一次 atomic state 读,绝不访问 RelMeta 数组。
+ *   - 入口先调 RelationRowCacheBindRelation 做"代数感知"刷新:稳态只是
+ *     一次廉价的 global_gen 原子读 + 比较;若此前有 backend Load/Drop 过
+ *     缓存(代数变了),则重绑。这彻底消除了"本 backend 先碰过表、绑了
+ *     陈旧 NOT_CACHED,别人后来 Load,本 backend DML 漏失效导致脏读"的
+ *     问题——不再依赖"先 Load 后开 DML"的运维约束。
+ *   - 刷新后 rd_rowcache_meta == NULL / ROWCACHE_NOT_CACHED:该表确实
+ *     未缓存,直接返回(~2ns 单指针拒绝)。
+ *   - 否则是活的 RelMeta 指针:复检 state(挡住已被 Drop / DDL 禁用),
+ *     再用本地 pkey schema 快照序列化 pkey。
  */
 static void
 InvalidateByHeapTuple(Relation rel, HeapTuple tuple)
@@ -1467,7 +1492,9 @@ InvalidateByHeapTuple(Relation rel, HeapTuple tuple)
 	if (rel == NULL || tuple == NULL || tuple->t_data == NULL)
 		return;
 
-	/* 直接读 RelationData 上绑定的快照,信任之(运维约束见上)。 */
+	/* 代数感知刷新:稳态一次原子读早退,代数变了才重绑。 */
+	RelationRowCacheBindRelation(rel);
+
 	rm = rel->rd_rowcache_meta;
 	if (rm == NULL || rm == ROWCACHE_NOT_CACHED)
 		return;
@@ -1606,14 +1633,14 @@ RelationRowCacheDropRelation(Oid relid)
 	LWLockRelease(&rm->build_lock);
 
 	/*
-	 * No relcache invalidation broadcast here (it would collide with
-	 * rowcache_relcache_callback, same as in Load).  Backends holding a live
-	 * rd_rowcache_meta pointer to this now-DISABLED slot stay correct: every
-	 * probe re-checks rm->state under the partition lock and falls through to
-	 * btree once it observes DISABLED.  The stale pointer also remains valid
-	 * across a future Drop+reLoad because the slot is reused for the same
-	 * relid, so no dangling reference can arise.
+	 * 推进全局代数,让持有该表 live 指针的 backend 在下次 bind 时因代数
+	 * 不匹配而重绑成 NOT_CACHED,恢复 ~2ns 的单指针快速拒绝(不再每次都
+	 * 走 state 检查)。正确性本就不依赖它(陈旧 live 指针会被每次的 state
+	 * 检查拦下),但保持"缓存拓扑一变,代数就变"的不变式更干净。
+	 *
+	 * 同样不广播 relcache 失效(理由同 Load:会触发 disable 回调)。
 	 */
+	pg_atomic_fetch_add_u32(&RowCacheCtl->global_gen.value, 1);
 }
 
 /* ----------------------------------------------------------------
@@ -1895,14 +1922,22 @@ RelationRowCachePkeyFetchComposite(Oid relid,
  */
 
 /*
- * Bind (or confirm-not-cached) a relation's rd_rowcache_* snapshot.
- * Idempotent: returns immediately once rd_rowcache_meta is set (either a
- * live pointer or the ROWCACHE_NOT_CACHED sentinel).
+ * 绑定(或确认未缓存)一个关系的 rd_rowcache_* 快照,并按全局代数
+ * (global_gen)保持最新。
  *
- * Safe to call before EnsureRowCacheDsa — it touches only the shmem
- * RelMeta array, never the DSA.  A no-op (leaves the field NULL) when the
- * cache control segment is not yet attached, so the very early bootstrap
- * relation builds pay nothing and get bound on their next rebuild.
+ * 代数协议:每次进来先读 global_gen。若 rd_rowcache_meta 已绑定且其
+ * rd_rowcache_gen 等于当前 global_gen,说明自上次绑定以来没有任何
+ * backend Load/Drop 过缓存 —— 这份快照仍然有效,直接早退(稳态下就是
+ * 一次廉价的原子 *读* + 比较,见 RowCacheGenPadded 注释)。否则(从未
+ * 绑过 / 代数变了)重新绑定。
+ *
+ * 这把"先碰过表、绑了 NOT_CACHED 的 backend 感知不到别人后来 Load"的
+ * 问题彻底解决:读路径(ExecInitIndexScan)与 DML 路径(InvalidateBy-
+ * HeapTuple)都无条件调本函数,代数一变就重绑成活指针,既不会"明明
+ * 已 Load 却回落原生",也不会"DML 漏失效导致脏读"。
+ *
+ * 只读 shmem RelMeta 数组,不碰 DSA,故 EnsureRowCacheDsa 之前调用也
+ * 安全;缓存控制段尚未 attach(bootstrap)时 no-op(留 NULL,下次重试)。
  */
 void
 RelationRowCacheBindRelation(Relation rel)
@@ -1910,17 +1945,27 @@ RelationRowCacheBindRelation(Relation rel)
 	Oid			relid;
 	RelMeta	   *rm;
 	int			n;
+	uint32		cur_gen;
 
 	if (rel == NULL)
-		return;
-
-	/* Already bound (live pointer or known-not-cached). */
-	if (rel->rd_rowcache_meta != NULL)
 		return;
 
 	/* Cache module not initialised in this backend yet (bootstrap). */
 	if (RowCacheCtl == NULL)
 		return;
+
+	cur_gen = pg_atomic_read_u32(&RowCacheCtl->global_gen.value);
+
+	/* 已绑定且代数最新 —— 这份快照仍有效,直接用。 */
+	if (rel->rd_rowcache_meta != NULL && rel->rd_rowcache_gen == cur_gen)
+		return;
+
+	/*
+	 * 需要(重)绑定。先记下本次快照对应的代数(在读 RelMeta 之前):
+	 * 若绑定过程中又发生 Load/Drop 把 global_gen 推到更新值,下次代数
+	 * 比对会再触发一次重绑,绝不会把"新代数"配上"旧状态"。
+	 */
+	rel->rd_rowcache_gen = cur_gen;
 
 	relid = RelationGetRelid(rel);
 	if (!OidIsValid(relid))
@@ -1933,22 +1978,16 @@ RelationRowCacheBindRelation(Relation rel)
 	if (rm == NULL ||
 		pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
 	{
-		/*
-		 * No slot, or slot present but DISABLED/LOADING.  Record
-		 * not-cached; a later Load fires CacheInvalidateRelcacheByRelid,
-		 * which rebuilds this RelationData and re-binds with the live
-		 * descriptor.
-		 */
+		/* 无槽,或槽存在但 DISABLED/LOADING —— 记为未缓存。 */
 		rel->rd_rowcache_meta = ROWCACHE_NOT_CACHED;
 		return;
 	}
 	pg_read_barrier();
 
 	/*
-	 * Snapshot the pkey descriptor.  It is written once under build_lock at
-	 * Load and stays immutable until the next Drop (which first flips state
-	 * to DISABLED — caught above).  Reading it under an observed ENABLED
-	 * state with a read barrier is therefore consistent.
+	 * 拍下 pkey 描述符快照。它在 Load 时于 build_lock 下一次性写入,直到
+	 * 下次 Drop(Drop 先把 state 翻 DISABLED,已被上面拦住)才变。故在
+	 * 观察到 ENABLED + read barrier 下读取是一致的。
 	 */
 	n = rm->n_pkey_attrs;
 	if (n <= 0 || n > ROW_CACHE_PKEY_MAX_ATTS)
@@ -1964,7 +2003,7 @@ RelationRowCacheBindRelation(Relation rel)
 		rel->rd_rowcache_pkey_typlens[i] = rm->pkey_typlens[i];
 	}
 
-	/* Publish the live pointer last (backend-local; no cross-proc barrier). */
+	/* 最后发布活指针(backend 本地,无需跨进程屏障)。 */
 	rel->rd_rowcache_meta = rm;
 }
 
