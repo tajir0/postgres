@@ -51,6 +51,7 @@
 #include "common/file_utils.h"
 #include "common/scram-common.h"
 #include "jit/jit.h"
+#include "lib/relation_row_cache.h"
 #include "libpq/auth.h"
 #include "libpq/libpq.h"
 #include "libpq/oauth.h"
@@ -2383,6 +2384,17 @@ struct config_int ConfigureNamesInt[] =
 		&NBuffers,
 		16384, 16, INT_MAX / 2,
 		NULL, NULL, NULL
+	},
+
+	{
+		{"row_cache_hash_buckets", PGC_POSTMASTER, RESOURCES_MEM,
+			gettext_noop("Sets the number of hash buckets for the relation row cache."),
+			gettext_noop("Must be a power of two.  The bucket-head array is allocated once in dynamic shared memory on first use."),
+			0
+		},
+		&row_cache_hash_buckets,
+		ROW_CACHE_DEFAULT_HASH_BUCKETS, ROW_CACHE_MIN_HASH_BUCKETS, ROW_CACHE_MAX_HASH_BUCKETS,
+		check_row_cache_hash_buckets, NULL, NULL
 	},
 
 	{

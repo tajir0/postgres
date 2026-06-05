@@ -326,6 +326,9 @@ extern TupleTableSlot *ExecStoreHeapTuple(HeapTuple tuple,
 extern void ExecForceStoreHeapTuple(HeapTuple tuple,
 									TupleTableSlot *slot,
 									bool shouldFree);
+extern void ExecForceStoreHeapTupleNoCopy(HeapTuple tuple,
+										  TupleTableSlot *slot,
+										  bool shouldFree);
 extern TupleTableSlot *ExecStoreBufferHeapTuple(HeapTuple tuple,
 												TupleTableSlot *slot,
 												Buffer buffer);

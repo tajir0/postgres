@@ -135,6 +135,8 @@
 					# (change requires restart)
 #huge_page_size = 0			# zero for system default
 					# (change requires restart)
+#row_cache_hash_buckets = 8388608	# min 1024, must be a power of two
+					# (change requires restart)
 #temp_buffers = 8MB			# min 800kB
 #max_prepared_transactions = 0		# zero disables the feature
 					# (change requires restart)

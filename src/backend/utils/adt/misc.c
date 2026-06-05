@@ -23,6 +23,7 @@
 
 #include "access/sysattr.h"
 #include "access/table.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
 #include "catalog/system_fk_info.h"
@@ -40,6 +41,8 @@
 #include "storage/fd.h"
 #include "storage/latch.h"
 #include "tcop/tcopprot.h"
+#include "lib/relation_row_cache.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -64,6 +67,150 @@ typedef struct ValidIOData
 static bool pg_input_is_valid_common(FunctionCallInfo fcinfo,
 									 text *txt, text *typname,
 									 ErrorSaveContext *escontext);
+static bool load_relation_row_cache_internal(Oid relid);
+static bool drop_relation_row_cache_internal(Oid relid);
+
+/*
+ * 根据 relid 加载关系到后端两级行缓存。
+ *
+ * 返回 true 表示成功；返回 false 表示关系不存在、关系类型不支持
+ * 或权限不足。
+ */
+static bool
+load_relation_row_cache_internal(Oid relid)
+{
+	Relation	rel;
+
+	if (!OidIsValid(relid))
+		return false;
+
+	rel = try_table_open(relid, AccessShareLock);
+	if (rel == NULL)
+		return false;
+
+	if (!RELKIND_HAS_TABLE_AM(rel->rd_rel->relkind))
+	{
+		table_close(rel, AccessShareLock);
+		return false;
+	}
+
+	if (pg_class_aclcheck(relid, GetUserId(), ACL_SELECT) != ACLCHECK_OK)
+	{
+		table_close(rel, AccessShareLock);
+		return false;
+	}
+
+	RelationRowCacheLoadRelation(rel);
+	table_close(rel, AccessShareLock);
+	return true;
+}
+
+/*
+ * pg_load_relation_row_cache(oid)
+ * 按 table oid 加载关系到后端两级行缓存。
+ */
+Datum
+pg_load_relation_row_cache_oid(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+
+	PG_RETURN_BOOL(load_relation_row_cache_internal(relid));
+}
+
+/*
+ * pg_load_relation_row_cache(text)
+ * 按表名加载关系到后端两级行缓存。
+ *
+ * 入参通过 regclassin 解析，支持 schema.table 以及带引号标识符。
+ */
+Datum
+pg_load_relation_row_cache_name(PG_FUNCTION_ARGS)
+{
+	char	   *class_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	Datum		relid_datum;
+	Oid			relid;
+	ErrorSaveContext escontext = {T_ErrorSaveContext};
+
+	if (!DirectInputFunctionCallSafe(regclassin, class_name,
+									 InvalidOid, -1,
+									 (Node *) &escontext,
+									 &relid_datum))
+		PG_RETURN_BOOL(false);
+
+	relid = DatumGetObjectId(relid_datum);
+	PG_RETURN_BOOL(load_relation_row_cache_internal(relid));
+}
+
+/*
+ * 根据 relid 从后端两级行缓存中清除关系。
+ *
+ * 返回 true 表示成功；返回 false 表示关系不存在、关系类型不支持
+ * 或权限不足。
+ */
+static bool
+drop_relation_row_cache_internal(Oid relid)
+{
+	Relation	rel;
+
+	if (!OidIsValid(relid))
+		return false;
+
+	rel = try_table_open(relid, AccessShareLock);
+	if (rel == NULL)
+		return false;
+
+	if (!RELKIND_HAS_TABLE_AM(rel->rd_rel->relkind))
+	{
+		table_close(rel, AccessShareLock);
+		return false;
+	}
+
+	if (pg_class_aclcheck(relid, GetUserId(), ACL_SELECT) != ACLCHECK_OK)
+	{
+		table_close(rel, AccessShareLock);
+		return false;
+	}
+
+	table_close(rel, AccessShareLock);
+	RelationRowCacheDropRelation(relid);
+	return true;
+}
+
+/*
+ * pg_drop_relation_row_cache(oid)
+ * 按 table oid 从后端两级行缓存中清除关系。
+ */
+Datum
+pg_drop_relation_row_cache_oid(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+
+	PG_RETURN_BOOL(drop_relation_row_cache_internal(relid));
+}
+
+/*
+ * pg_drop_relation_row_cache(text)
+ * 按表名从后端两级行缓存中清除关系。
+ *
+ * 入参通过 regclassin 解析，支持 schema.table 以及带引号标识符。
+ */
+Datum
+pg_drop_relation_row_cache_name(PG_FUNCTION_ARGS)
+{
+	char	   *class_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	Datum		relid_datum;
+	Oid			relid;
+	ErrorSaveContext escontext = {T_ErrorSaveContext};
+
+	if (!DirectInputFunctionCallSafe(regclassin, class_name,
+									 InvalidOid, -1,
+									 (Node *) &escontext,
+									 &relid_datum))
+		PG_RETURN_BOOL(false);
+
+	relid = DatumGetObjectId(relid_datum);
+	PG_RETURN_BOOL(drop_relation_row_cache_internal(relid));
+}
 
 
 /*
@@ -1122,3 +1269,4 @@ any_value_transfn(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_DATUM(PG_GETARG_DATUM(0));
 }
+

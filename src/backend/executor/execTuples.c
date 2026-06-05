@@ -1694,6 +1694,42 @@ ExecForceStoreHeapTuple(HeapTuple tuple,
 }
 
 /*
+ * 行缓存快路径:把 HeapTuple 存入任意 slot,对 BufferHeapTuple slot 不额外
+ * 拷贝一份。
+ */
+void
+ExecForceStoreHeapTupleNoCopy(HeapTuple tuple,
+							  TupleTableSlot *slot,
+							  bool shouldFree)
+{
+	if (TTS_IS_HEAPTUPLE(slot))
+	{
+		ExecStoreHeapTuple(tuple, slot, shouldFree);
+	}
+	else if (TTS_IS_BUFFERTUPLE(slot))
+	{
+		tts_buffer_heap_store_tuple(slot, tuple, InvalidBuffer, false);
+		if (shouldFree)
+			slot->tts_flags |= TTS_FLAG_SHOULDFREE;
+		else
+			slot->tts_flags &= ~TTS_FLAG_SHOULDFREE;
+	}
+	else
+	{
+		ExecClearTuple(slot);
+		heap_deform_tuple(tuple, slot->tts_tupleDescriptor,
+						  slot->tts_values, slot->tts_isnull);
+		ExecStoreVirtualTuple(slot);
+
+		if (shouldFree)
+		{
+			ExecMaterializeSlot(slot);
+			pfree(tuple);
+		}
+	}
+}
+
+/*
  * Store a MinimalTuple into any kind of slot, performing conversion if
  * necessary.
  */

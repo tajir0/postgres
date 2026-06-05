@@ -1722,6 +1722,51 @@ typedef struct IndexScanState
 	bool	   *iss_OrderByTypByVals;
 	int16	   *iss_OrderByTypLens;
 	Size		iss_PscanLen;
+
+	/*
+	 * 行缓存 pkey 快路径状态(支持复合)。
+	 *
+	 * iss_RowCachePkeyShapeOk:在 ExecInitIndexScan 时设置一次,当本 IndexScan
+	 *   的静态形态是缓存快路径的候选时为 true:
+	 *     - NumScanKeys >= 1 且等于 indnkeyatts
+	 *     - 每个 ScanKey 都是 btree 等值、无 disqualifying 标志
+	 *     - 无 ORDER BY
+	 *     - ScanKey 按索引 attno 顺序(即 ScanKeys[i].sk_attno == i+1),
+	 *       这样运行期无需额外映射就能把它们与索引键位置配对
+	 *     - 每个索引键列都映射到真实 heap attno(>0)
+	 *   这只取决于 plan 树,执行期间从不改变。
+	 *
+	 * iss_RowCachePkeyIndexHeapAttnos:索引的 iss_RowCachePkeyIndexNatts 个
+	 *   键列各自的 heap attno(1-based),在 ExecInit 时捕获,使 IndexNext
+	 *   每次调用不必再从索引关系重新推导。ScanKeys[i].sk_argument 对应
+	 *   iss_RowCachePkeyIndexHeapAttnos[i]。仅当 iss_RowCachePkeyShapeOk 为
+	 *   true 时有效。
+	 *
+	 * iss_RowCachePkeyIndexNatts:索引的键列数(对上面的资格检查而言
+	 *   == iss_NumScanKeys)。
+	 *
+	 * iss_PkeyAttempted:per-scan 标志,在本扫描实例的第一次 IndexNext 查过
+	 *   缓存后为 true。rescan 时重置,使 NestedLoop 内层扫描对每个新外层
+	 *   tuple 重新查缓存。
+	 */
+	bool		iss_RowCachePkeyShapeOk;
+	AttrNumber	iss_RowCachePkeyIndexHeapAttnos[INDEX_MAX_KEYS];
+	int			iss_RowCachePkeyIndexNatts;
+	bool		iss_PkeyAttempted;
+
+	/*
+	 * 绑定的行缓存快路径。在 ExecInitIndexScan 时从扫描关系的 rd_rowcache_meta
+	 * 快照解析一次,前提是 (a) 静态形态合格(iss_RowCachePkeyShapeOk)且
+	 * (b) 缓存的 pkey attno 列表与本索引的键列逐位对应。
+	 *
+	 * iss_RowCacheMeta != NULL 表示绑定快路径已武装:IndexNext 从等值 ScanKey
+	 * 收集 iss_RowCachePkeyNatts 个 Datum,经
+	 * RelationRowCachePkeyFetchBound(iss_RowCacheMeta, ...) 探测——后者从不扫
+	 * 全局 RelMeta 数组。NULL 表示"本扫描无可用缓存"——直接落到 btree 路径。
+	 * 用 "struct" 是为避免把 lib/relation_row_cache.h 拉进 execnodes.h。
+	 */
+	struct RelMeta *iss_RowCacheMeta;
+	int			iss_RowCachePkeyNatts;
 } IndexScanState;
 
 /* ----------------

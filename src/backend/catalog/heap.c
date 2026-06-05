@@ -57,6 +57,7 @@
 #include "commands/tablecmds.h"
 #include "commands/typecmds.h"
 #include "common/int.h"
+#include "lib/relation_row_cache.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
@@ -1787,6 +1788,13 @@ heap_drop_with_catalog(Oid relid)
 	HeapTuple	tuple;
 	Oid			parentOid = InvalidOid,
 				defaultPartOid = InvalidOid;
+
+	/*
+	 * 行缓存:表即将被删除,主动清掉它在共享行缓存里的全部 entry 并释放
+	 * RelMeta 槽(同步 dsa_free)。否则该 relid 的缓存会一直残留到实例重启
+	 * ——relcache 失效回调只清 backend 本地 sticky,不动共享状态。
+	 */
+	RelationRowCacheDropRelation(relid);
 
 	/*
 	 * To drop a partition safely, we must grab exclusive lock on its parent,

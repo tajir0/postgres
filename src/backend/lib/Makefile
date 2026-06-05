@@ -21,6 +21,7 @@ OBJS = \
 	integerset.o \
 	knapsack.o \
 	pairingheap.o \
+	relation_row_cache.o \
 	rbtree.o \
 
 include $(top_srcdir)/src/backend/common.mk
