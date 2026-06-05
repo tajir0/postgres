@@ -147,6 +147,7 @@ IndexNext(IndexScanState *node)
 				bool		hit;
 
 				hit = RelationRowCachePkeyFetchBound(node->iss_RowCacheMeta,
+													 RelationGetRelid(node->ss.ss_currentRelation),
 													 vals, natts,
 													 estate->es_snapshot,
 													 slot, &visible,

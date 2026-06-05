@@ -161,8 +161,14 @@ extern void RelationRowCacheBindRelation(Relation rel);
  * the global RelMeta-array scan and sticky lookup entirely.  vals[0..nvals-1]
  * are the pkey column Datums in cache attno order; nvals must equal the
  * cache's n_pkey_attrs.  Semantics otherwise match RelationRowCachePkeyFetch.
+ *
+ * expected_relid is the oid the caller's scan expects this binding to serve.
+ * Since a RelMeta slot can be freed on Drop and reused by a *different*
+ * relation, the fetch bails (returns false) if rm->relid no longer equals
+ * expected_relid — guarding against an in-flight scan using a repurposed slot.
  */
 extern bool RelationRowCachePkeyFetchBound(struct RelMeta *rm,
+										   Oid expected_relid,
 										   const Datum *vals,
 										   int nvals,
 										   Snapshot snapshot,

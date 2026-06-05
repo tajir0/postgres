@@ -1108,6 +1108,15 @@ RelationRowCacheLoadRelation(Relation rel)
 	scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL);
 	slot = table_slot_create(rel, NULL);
 
+	/*
+	 * 把全表扫描 + 插入包在 PG_TRY 里:中途若 dsa_allocate OOM(或其他
+	 * ereport),在 PG_CATCH 里清理半成品——否则会留下 state=LOADING +
+	 * 部分 entry,而后续 re-Load 的幂等清理只在 state==ENABLED 时触发,
+	 * 会把残留 entry 重复累加。scan / slot / snapshot 是事务资源,由事务
+	 * abort 自动回收,PG_CATCH 只需清理行缓存的 shmem 状态。
+	 */
+	PG_TRY();
+	{
 	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
 	{
 		uint8		pkey_buf[ROW_CACHE_PKEY_INLINE_BYTES];
@@ -1154,7 +1163,13 @@ RelationRowCacheLoadRelation(Relation rel)
 			flat_size = tmp_flat->total_size;
 			combined_size = MAXALIGN(sizeof(GlobalEntry)) + flat_size;
 
-			entry_dp = dsa_allocate(LocalDsa, combined_size);
+			/*
+			 * 用 NO_OOM:OOM 时返回 InvalidDsaPointer(而非自行 ereport),
+			 * 这样我们能先 dsa_free 临时 flatten 块 tmp_dp 再抛错,不泄漏它;
+			 * 抛出的 ERROR 由外层 PG_CATCH 清理已插入的部分 entry。
+			 */
+			entry_dp = dsa_allocate_extended(LocalDsa, combined_size,
+											 DSA_ALLOC_NO_OOM);
 			if (!DsaPointerIsValid(entry_dp))
 			{
 				dsa_free(LocalDsa, tmp_dp);
@@ -1186,6 +1201,28 @@ RelationRowCacheLoadRelation(Relation rel)
 		BucketInsertHead(bucket, entry_dp, e);
 		LWLockRelease(part);
 	}
+	}
+	PG_CATCH();
+	{
+		/*
+		 * 加载中途失败(通常是 DSA OOM):清掉已插入的部分 entry、把 state
+		 * 回滚到 DISABLED、释放 RelMeta 槽位、推进代数,然后重新抛出。
+		 * 此处只持有 build_lock(OOM 发生在分区锁之外的 dsa_allocate),
+		 * DropAllEntriesForRelid 自取/放分区锁,dsa_free 在 OOM 后仍可用。
+		 */
+		pg_atomic_write_u32(&rm->state, RELMETA_DISABLED);
+		pg_memory_barrier();
+		DropAllEntriesForRelid(relid);
+		rm->n_pkey_attrs = 0;
+		rm->pkey_total_len = 0;
+		rm->relid = InvalidOid;
+		LastLookupRelMeta = NULL;
+		LastLookupRelid = InvalidOid;
+		LWLockRelease(&rm->build_lock);
+		pg_atomic_fetch_add_u32(&RowCacheCtl->global_gen.value, 1);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	table_endscan(scan);
 	ExecDropSingleTupleTableSlot(slot);
@@ -1613,19 +1650,30 @@ RelationRowCacheDropRelation(Oid relid)
 
 	LWLockAcquire(&rm->build_lock, LW_EXCLUSIVE);
 
-	if (pg_atomic_read_u32(&rm->state) == RELMETA_DISABLED)
-	{
-		LWLockRelease(&rm->build_lock);
-		return;
-	}
-
+	/*
+	 * 始终先禁用并清空该表的全部 entry —— 即使当前已是 DISABLED 也要清:
+	 * relcache 回调(DDL)只把 state 置 DISABLED、并不清 entry,所以一个
+	 * DISABLED 的槽仍可能残留 entry。DropAllEntriesForRelid 对无匹配 entry
+	 * 是廉价的空扫(Drop 是冷路径,可接受)。
+	 */
 	pg_atomic_write_u32(&rm->state, RELMETA_DISABLED);
 	pg_memory_barrier();
 
 	DropAllEntriesForRelid(relid);
 
+	/*
+	 * 清描述符并释放 RelMeta 槽位(修槽位 leak):把 relid 置 InvalidOid,
+	 * AllocateOrFindRelMeta 才能把这个槽重新分配给*别的*表。在 relid 置空
+	 * 之前 entry 已全部清掉,新表接管该槽时不会看到旧表残留。
+	 *
+	 * 槽位被别的表复用后,持该槽陈旧 live 指针的 backend 由两道防线兜住:
+	 *   - 下面 global_gen +1,各 backend 下次 bind 会重绑;
+	 *   - 读路径 RelationRowCachePkeyFetchBound 用调用方传入的 expected_relid
+	 *     与 rm->relid 比对,不匹配直接 bail(防 in-flight 扫描用错复用槽)。
+	 */
 	rm->n_pkey_attrs = 0;
 	rm->pkey_total_len = 0;
+	rm->relid = InvalidOid;
 
 	LastLookupRelMeta = NULL;
 	LastLookupRelid = InvalidOid;
@@ -2008,15 +2056,21 @@ RelationRowCacheBindRelation(Relation rel)
 }
 
 /*
- * Probe the cache using a RelMeta pointer the caller already holds (taken
- * from rd_rowcache_meta and carried in IndexScanState).  Skips
- * LookupRelMetaForFetch entirely — no FindRelMeta scan, no sticky cache —
- * and resolves the bucket-head array through the backend-local cached
- * pointer (BucketHeads()).  Equivalent in result to
- * RelationRowCachePkeyFetchComposite(rm->relid, ...).
+ * 用调用方已持有的 RelMeta 指针(取自 rd_rowcache_meta、由 IndexScanState
+ * 携带)探测缓存。跳过 LookupRelMetaForFetch 的数组扫描 + sticky,经
+ * backend 本地缓存的桶头指针(BucketHeads())查找。
+ *
+ * expected_relid 是调用方(扫描)期望的表 oid。槽位 leak 修复后,一个
+ * RelMeta 槽在 Drop 后可被*别的*表复用;而 IndexScanState 在 ExecInit 时
+ * 捕获了 iss_RowCacheMeta 指针,若扫描途中该槽被 Drop+Load 复用成别的表,
+ * 这里用 expected_relid 与 rm->relid 比对挡住:不匹配直接 bail 走 btree。
+ * 且后续 BucketLookup 一律用 expected_relid 匹配(而非 rm->relid),即便
+ * 描述符竞态读到复用表的 schema,也只会序列化出错误字节、查 expected_relid
+ * 的桶 -> miss -> btree,绝不会返回别的表的数据。
  */
 bool
 RelationRowCachePkeyFetchBound(RelMeta *rm,
+							   Oid expected_relid,
 							   const Datum *vals,
 							   int nvals,
 							   Snapshot snapshot,
@@ -2039,6 +2093,13 @@ RelationRowCachePkeyFetchBound(RelMeta *rm,
 		return false;
 
 	/*
+	 * 槽位复用防线:确认这个槽现在仍属于期望的表。relid 是 4 字节对齐,
+	 * 读取原子。不匹配说明槽已被 Drop(或被别的表复用)-> bail 走 btree。
+	 */
+	if (rm->relid != expected_relid)
+		return false;
+
+	/*
 	 * State fast-fail via the bound pointer (a single deref, not an array
 	 * scan).  DoPkeyFetchBytes re-checks state under the partition lock; this
 	 * early check just avoids hashing + locking for a dropped relation.
@@ -2053,7 +2114,8 @@ RelationRowCachePkeyFetchBound(RelMeta *rm,
 	if (pkey_len < 0)
 		return false;
 
-	return DoPkeyFetchBytes(rm, rm->relid, pkey_buf, pkey_len,
+	/* 用 expected_relid(非 rm->relid)做桶匹配,见函数头注释。 */
+	return DoPkeyFetchBytes(rm, expected_relid, pkey_buf, pkey_len,
 							snapshot, slot, is_visible, has_hot_chain);
 }
 
