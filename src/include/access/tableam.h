@@ -21,6 +21,7 @@
 #include "access/sdir.h"
 #include "access/xact.h"
 #include "executor/tuptable.h"
+#include "lib/relation_row_cache.h"
 #include "storage/read_stream.h"
 #include "utils/rel.h"
 #include "utils/snapshot.h"
@@ -1217,6 +1218,41 @@ table_index_fetch_tuple(struct IndexFetchTableData *scan,
 	if (unlikely(TransactionIdIsValid(CheckXidAlive) && !bsysscan))
 		elog(ERROR, "unexpected table_index_fetch_tuple call during logical decoding");
 
+	/*
+	 * Index-scan cache path:
+	 * - visible in cache: return cached row directly;
+	 * - invisible + HOT chain possible: fallback to native AM logic;
+	 * - invisible + no HOT chain: treat as no visible row.
+	 */
+	if (IsMVCCSnapshot(snapshot))
+	{
+		bool		cache_visible = false;
+		bool		cache_hot_chain = false;
+
+		if (RelationRowCacheFetchWithVisibility(RelationGetRelid(scan->rel),
+												tid, snapshot, slot,
+												&cache_visible, &cache_hot_chain))
+		{
+			if (cache_visible)
+			{
+				if (call_again)
+					*call_again = false;
+				if (all_dead)
+					*all_dead = false;
+				return true;
+			}
+
+			if (!cache_hot_chain)
+			{
+				if (call_again)
+					*call_again = false;
+				if (all_dead)
+					*all_dead = false;
+				return false;
+			}
+		}
+	}
+
 	return scan->rel->rd_tableam->index_fetch_tuple(scan, tid, snapshot,
 													slot, call_again,
 													all_dead);
@@ -1262,6 +1298,28 @@ table_tuple_fetch_row_version(Relation rel,
 	 */
 	if (unlikely(TransactionIdIsValid(CheckXidAlive) && !bsysscan))
 		elog(ERROR, "unexpected table_tuple_fetch_row_version call during logical decoding");
+
+	/*
+	 * Tuple-fetch cache path:
+	 * - visible in cache: return cached row directly;
+	 * - invisible + HOT chain possible: fallback to native AM logic;
+	 * - invisible + no HOT chain: treat as no visible row.
+	 */
+	if (IsMVCCSnapshot(snapshot))
+	{
+		bool		cache_visible = false;
+		bool		cache_hot_chain = false;
+
+		if (RelationRowCacheFetchWithVisibility(RelationGetRelid(rel),
+												tid, snapshot, slot,
+												&cache_visible, &cache_hot_chain))
+		{
+			if (cache_visible)
+				return true;
+			if (!cache_hot_chain)
+				return false;
+		}
+	}
 
 	return rel->rd_tableam->tuple_fetch_row_version(rel, tid, snapshot, slot);
 }
