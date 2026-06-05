@@ -43,6 +43,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_database_d.h"
 #include "commands/vacuum.h"
+#include "lib/relation_row_cache.h"
 #include "pgstat.h"
 #include "port/pg_bitutils.h"
 #include "storage/lmgr.h"
@@ -3167,6 +3168,14 @@ l1:
 	 */
 	CacheInvalidateHeapTuple(relation, &tp, NULL);
 
+	/*
+	 * V4 row-cache: invalidate the cached entry (if any) for this row.
+	 * Must run while `tp.t_data` is still mapped, i.e. before ReleaseBuffer.
+	 * Always-on early-out inside the hook keeps per-call cost ~5-15 ns
+	 * for relations that are not cache-enabled.
+	 */
+	RowCacheOnHeapDelete(relation, &tp);
+
 	/* Now we can release the buffer */
 	ReleaseBuffer(buffer);
 
@@ -4158,6 +4167,14 @@ l2:
 	 * sinval messages.)
 	 */
 	CacheInvalidateHeapTuple(relation, &oldtup, heaptup);
+
+	/*
+	 * V4 row-cache: invalidate the cached entry for the OLD tuple.  See
+	 * the matching call in heap_delete and the hook header comment for
+	 * the rationale (HOT update also routes here, key-update handling,
+	 * write-through deferred to a later phase).
+	 */
+	RowCacheOnHeapUpdate(relation, &oldtup, heaptup);
 
 	/* Now we can release the buffer(s) */
 	if (newbuf != buffer)

@@ -1724,30 +1724,43 @@ typedef struct IndexScanState
 	Size		iss_PscanLen;
 
 	/*
-	 * Row-cache pkey fast-path state.
+	 * Row-cache pkey fast-path state (V4 Phase 4 (2/2) composite-aware).
 	 *
 	 * iss_RowCachePkeyShapeOk: set ONCE at ExecInitIndexScan when this
-	 *   IndexScan's STATIC shape matches a single-column equality lookup
-	 *   on the index's first column.  This depends only on the plan tree
-	 *   and never changes during execution.
+	 *   IndexScan's STATIC shape is a candidate for the cache fast path:
+	 *     - NumScanKeys >= 1 and equals indnkeyatts
+	 *     - every ScanKey is btree equality, no disqualifying flags
+	 *     - no ORDER BY
+	 *     - ScanKeys are in index-attno order (i.e. ScanKeys[i].sk_attno
+	 *       == i+1) so we can pair them with index-key positions without
+	 *       extra mapping at runtime
+	 *     - every index key column maps to a real heap attno (>0)
+	 *   This depends only on the plan tree and never changes during
+	 *   execution.
 	 *
-	 * iss_RowCachePkeyHeapAttno: heap attno (1-based) of the index's first
-	 *   column, captured at ExecInit time so IndexNext doesn't need to
-	 *   re-derive it from the index relation each call.  Valid only when
+	 * iss_RowCachePkeyIndexHeapAttnos: heap attno (1-based) for each of
+	 *   the index's iss_RowCachePkeyIndexNatts key columns, captured at
+	 *   ExecInit so IndexNext doesn't re-derive them from the index
+	 *   relation each call.  ScanKeys[i].sk_argument corresponds to
+	 *   iss_RowCachePkeyIndexHeapAttnos[i].  Valid only when
 	 *   iss_RowCachePkeyShapeOk is true.
+	 *
+	 * iss_RowCachePkeyIndexNatts: number of key columns in the index
+	 *   (== iss_NumScanKeys for the eligibility check above).
 	 *
 	 * iss_PkeyAttempted: per-scan flag, true after the first IndexNext
 	 *   call has consulted the cache for this scan instance.  Reset on
 	 *   rescan so that NestedLoop inner scans re-consult the cache for
 	 *   each new outer tuple.
 	 *
-	 * Whether to actually use the cache (i.e. whether the relation has a
-	 * pkey index loaded right now) is checked DYNAMICALLY in IndexNext via
-	 * RelationRowCachePkeyAttno, so a Load that happens after ExecInit but
-	 * before query execution still takes effect.
+	 * Whether to actually use the cache (and with what shape) is checked
+	 * DYNAMICALLY in IndexNext via RelationRowCachePkeyDescriptor, so a
+	 * Load that happens after ExecInit but before query execution still
+	 * takes effect.
 	 */
 	bool		iss_RowCachePkeyShapeOk;
-	AttrNumber	iss_RowCachePkeyHeapAttno;
+	AttrNumber	iss_RowCachePkeyIndexHeapAttnos[INDEX_MAX_KEYS];
+	int			iss_RowCachePkeyIndexNatts;
 	bool		iss_PkeyAttempted;
 } IndexScanState;
 
