@@ -16,7 +16,7 @@
  */
 #define ROW_CACHE_DEFAULT_HASH_BUCKETS	(1 << 23)	/* 8,388,608 */
 #define ROW_CACHE_MIN_HASH_BUCKETS		(1 << 10)	/* 1,024 */
-#define ROW_CACHE_MAX_HASH_BUCKETS		(1 << 27)	/* 134,217,728 */
+#define ROW_CACHE_MAX_HASH_BUCKETS		(1 << 24)	/* 134,217,728 */
 extern PGDLLIMPORT int row_cache_hash_buckets;
 
 /* 共享内存大小与初始化(由 ipci.c 调用)。 */

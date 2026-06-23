@@ -969,7 +969,7 @@ RelationRowCacheLoadRelation(Relation rel)
 
 	LWLockAcquire(&rm->build_lock, LW_EXCLUSIVE);
 
-	if (pg_atomic_read_u32(&rm->state) == RELMETA_ENABLED)
+	if (pg_atomic_read_u32(&rm->state) != RELMETA_DISABLED)
 	{
 		pg_atomic_write_u32(&rm->state, RELMETA_DISABLED);
 		pg_memory_barrier();
@@ -1077,7 +1077,7 @@ RelationRowCacheLoadRelation(Relation rel)
 		 * 此处只持有 build_lock(OOM 发生在分区锁之外的 dsa_allocate),
 		 * DropAllEntriesForRelid 自取/放分区锁,dsa_free 在 OOM 后仍可用。
 		 */
-		pg_atomic_write_u32(&rm->state, RELMETA_DISABLED);
+		// pg_atomic_write_u32(&rm->state, RELMETA_DISABLED);
 		pg_memory_barrier();
 		DropAllEntriesForRelid(relid);
 		rm->n_pkey_attrs = 0;
@@ -1125,6 +1125,8 @@ DropAllEntriesForRelid(Oid relid)
 		dsa_pointer prev_dp = InvalidDsaPointer;
 		dsa_pointer cur_dp;
 		GlobalEntry *prev = NULL;
+
+		CHECK_FOR_INTERRUPTS();
 
 		LWLockAcquire(part, LW_EXCLUSIVE);
 
