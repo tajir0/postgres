@@ -56,6 +56,14 @@ ExecInitIndexScanRowCache(IndexScanState *node)
 		Relation	indexRel = node->iss_RelationDesc;
 		bool		shape_ok = true;
 
+		/*
+		 * S2:只允许唯一索引探测缓存。schema 指纹(relfilenode +
+		 * tupdesc)看不见"主键约束被删"——若之后经同列非唯一索引探测,
+		 * 而堆里已插入重复键,缓存单行命中会漏读其余行。唯一性在此把关:
+		 * 唯一索引 + 全列等值 ⇒ 至多一行,与缓存单行语义一致。
+		 */
+		if (!indexRel->rd_index->indisunique)
+			shape_ok = false;
 		if (indexRel->rd_index->indnkeyatts != node->iss_NumScanKeys)
 			shape_ok = false;
 

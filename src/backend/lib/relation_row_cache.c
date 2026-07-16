@@ -35,8 +35,19 @@
  *       不构成死锁。正在 LOADING 的表 build_lock 被持有,其 ACTIVE 段
  *       因此永远不会被淘汰。
  *
+ *   S2(本阶段):
+ *     - 读路径 pin 化:分区锁内只做"查链 + pin 所在段",拷贝移到锁外,
+ *       锁持有时长从"整行拷贝"缩到"链查找"。段物理复用前等 pin 排空
+ *       (微秒级,函数作用域引用;abort 由事务回调兜底释放)。
+ *     - 段 seq_num 换代计数:回收时 +1;读路径作绊线校验,为 S3 洗段
+ *       与 S6 无锁读预置失效原语。
+ *     - DDL schema 指纹:RelMeta 存 (relfilenumber, tupdesc_hash),
+ *       bind 慢路径复核——vacuum/analyze/GRANT 等触发的 relcache 失效
+ *       不再误伤缓存,真 DDL(改列/重写)才失效。指纹必须纯内存可算
+ *       (bind 在 RelationBuildDesc 的禁 catalog 区域内运行);
+ *       "删主键约束"由执行器侧 indisunique 门槛封堵(execRowcache.c)。
+ *
  *   Todo:
- *     - S2:seq_num 惰性失效 + pin 化读路径
  *     - S3:衰减 LFU 打分 + 后台洗段 + 点查 miss 按需回填
  *
  *   Pkey 限制:1..ROW_CACHE_PKEY_MAX_ATTS 个传值列。pkey 为传引用的表在
@@ -51,6 +62,7 @@
 #include "access/relation.h"
 #include "access/tableam.h"
 #include "access/tupmacs.h"
+#include "access/xact.h"
 #include "common/hashfn.h"
 #include "catalog/pg_index.h"
 #include "executor/tuptable.h"
@@ -178,6 +190,15 @@ typedef struct RelMeta
 	 */
 	int32			first_seg;		/* 段链头;-1 = 无 */
 	int32			cur_seg;		/* 当前写入段(仅 LOADING 期间);-1 = 无 */
+
+	/*
+	 * schema 指纹(S2):load 时拍下,bind 慢路径(relcache 重建后的
+	 * 首次绑定)复核。relfilenumber 抓 TRUNCATE / VACUUM FULL / CLUSTER
+	 * 等重写(TID 全变);tupdesc_hash 抓加删改列。两者都纯内存可算——
+	 * bind 运行在 RelationBuildDesc 的禁 catalog 区域,不能开索引。
+	 */
+	RelFileNumber	fp_relfilenumber;
+	uint64			fp_tupdesc_hash;
 } RelMeta;
 
 typedef struct GlobalEntry
@@ -215,6 +236,18 @@ typedef struct RowCacheSegment
 	uint32		n_entries;		/* 段内条目数(含已被 DML 摘链的死条目) */
 	uint64		alloc_seq;		/* 全局分配序号;FIFO 淘汰(LRU 近似)依据 */
 	int32		next_seg;		/* 本表段链 / 空闲链的下一段;-1 = 无 */
+
+	/*
+	 * S2:换代计数 + 在途读者 pin。
+	 *
+	 * seq_num 在段被物理回收(SegPrepareReuse)时 +1——持旧引用者靠
+	 * 失配自查发现换代(读路径绊线;S3 洗段/S6 无锁读的失效原语)。
+	 * pin_cnt > 0 表示有读者正在锁外拷贝本段数据,禁止物理复用;
+	 * pin 在分区锁内获取(此时 entry 仍在链上 ⇒ 段必然活着),释放
+	 * 无需任何锁。
+	 */
+	uint32		seq_num;
+	pg_atomic_uint32 pin_cnt;
 } RowCacheSegment;
 
 /*
@@ -313,6 +346,13 @@ static char *RowCachePool = NULL;				/* n_segments × 1MB */
 static Oid			LastLookupRelid = InvalidOid;
 static RelMeta	   *LastLookupRelMeta = NULL;
 
+/*
+ * 本 backend 在途的段 pin(至多一个:pin 是 DoPkeyFetchBytes 的函数
+ * 作用域引用,无嵌套)。唯一的中途逃逸路径是锁外拷贝时 ereport(如
+ * palloc OOM)——由事务/子事务 abort 回调兜底释放。
+ */
+static int32		PendingPinnedSeg = -1;
+
 /* 前向声明。 */
 static void RowCacheEnsureBackendInit(void);
 static RelMeta *FindRelMeta(Oid relid);
@@ -364,7 +404,63 @@ static int SerializePkeyFromDatumArray(const Datum *vals, int nvals,
 static inline uint32 ComputePkeyHashBytes(const uint8 *buf, int len);
 static void SegUnlinkEntries(int32 sid);
 static void ReleaseAllSegmentsForRel(RelMeta *rm);
+static void SegPrepareReuse(int32 sid);
 static GlobalEntry *SegAllocEntry(RelMeta *rm, Size need);
+static uint64 RowCacheTupDescHash(TupleDesc desc);
+
+/* ----------------------------------------------------------------
+ * 段 pin(S2)
+ * ---------------------------------------------------------------- */
+
+/* entry 所在段号(entry 必在池内,O(1) 算术)。 */
+static inline int32
+EntrySegId(const GlobalEntry *e)
+{
+	return (int32) (((const char *) e - RowCachePool) / ROW_CACHE_SEGMENT_SIZE);
+}
+
+static inline void
+SegPin(int32 sid)
+{
+	Assert(PendingPinnedSeg == -1);
+	pg_atomic_fetch_add_u32(&RowCacheSegs[sid].pin_cnt, 1);
+	PendingPinnedSeg = sid;
+}
+
+static inline void
+SegUnpin(int32 sid)
+{
+	PendingPinnedSeg = -1;
+	pg_atomic_fetch_sub_u32(&RowCacheSegs[sid].pin_cnt, 1);
+}
+
+/*
+ * 事务/子事务 abort 兜底:把在途 pin 放掉,保证段回收不因错误路径卡死。
+ * FATAL 走 AbortOutOfAnyTransaction 同样到达这里;kill -9 由 postmaster
+ * 重建共享内存兜底。
+ */
+static void
+RowCacheXactCallback(XactEvent event, void *arg)
+{
+	if (event == XACT_EVENT_ABORT ||
+		event == XACT_EVENT_PARALLEL_ABORT)
+	{
+		if (PendingPinnedSeg >= 0)
+			SegUnpin(PendingPinnedSeg);
+	}
+#ifdef USE_ASSERT_CHECKING
+	else if (event == XACT_EVENT_PRE_COMMIT)
+		Assert(PendingPinnedSeg == -1);
+#endif
+}
+
+static void
+RowCacheSubXactCallback(SubXactEvent event, SubTransactionId mySubid,
+						SubTransactionId parentSubid, void *arg)
+{
+	if (event == SUBXACT_EVENT_ABORT_SUB && PendingPinnedSeg >= 0)
+		SegUnpin(PendingPinnedSeg);
+}
 
 /* ----------------------------------------------------------------
  * 共享内存大小与初始化
@@ -462,6 +558,8 @@ RowCacheShmemInit(void)
 		rm->pkey_total_len = 0;
 		rm->first_seg = -1;
 		rm->cur_seg = -1;
+		rm->fp_relfilenumber = InvalidRelFileNumber;
+		rm->fp_tupdesc_hash = 0;
 	}
 
 	/* 桶头全空。 */
@@ -479,19 +577,28 @@ RowCacheShmemInit(void)
 		seg->n_entries = 0;
 		seg->alloc_seq = 0;
 		seg->next_seg = (s + 1 < nsegs) ? (s + 1) : -1;
+		seg->seq_num = 0;
+		pg_atomic_init_u32(&seg->pin_cnt, 0);
 	}
 	RowCacheCtl->free_seg_head = (nsegs > 0) ? 0 : -1;
 }
 
 /* ----------------------------------------------------------------
- * backend 一次性初始化:注册 relcache 失效回调。
+ * backend 一次性初始化:注册 relcache 失效回调 + 事务回调(pin 兜底)。
  * S1 之后不再有 DSA,共享内存基址在 RowCacheShmemInit 时已设好。
  * ---------------------------------------------------------------- */
+
+static bool RowCacheBackendInitDone = false;
 
 static void
 RowCacheEnsureBackendInit(void)
 {
+	if (RowCacheBackendInitDone)
+		return;
 	RowCacheRegisterRelcacheCallback();
+	RegisterXactCallback(RowCacheXactCallback, NULL);
+	RegisterSubXactCallback(RowCacheSubXactCallback, NULL);
+	RowCacheBackendInitDone = true;
 }
 
 /* ----------------------------------------------------------------
@@ -901,6 +1008,42 @@ SegUnlinkEntries(int32 sid)
 }
 
 /*
+ * 段物理回收前的最后一步(S2):等在途 pin 排空,然后换代(seq_num++)
+ * 并清空段元数据。调用方随后自行处理 next_seg 归属(空闲链/悬空)。
+ *
+ * 等待有界的依据:pin 是 DoPkeyFetchBytes 的函数作用域引用,持有窗口
+ * 是锁外拷贝一行的时长(微秒级),中途 ereport 由事务 abort 回调兜底
+ * 释放;性质等同自旋锁,不违反"分配路径不等内存"的纪律(等的不是
+ * 内存,是必然排空的在途读者)。持续 10s 不排空说明 pin 泄漏(bug),
+ * 打 WARNING 便于诊断,继续等。
+ *
+ * 死锁论证:两个调用语境分别持有 (build_lock + seg_lock) 或
+ * (seg_lock + victim build_lock),而 pin 的释放不需要任何锁
+ * (SegUnpin 是纯原子减),不存在循环等待。
+ */
+static void
+SegPrepareReuse(int32 sid)
+{
+	RowCacheSegment *seg = &RowCacheSegs[sid];
+	long		waited_us = 0;
+
+	while (pg_atomic_read_u32(&seg->pin_cnt) != 0)
+	{
+		pg_usleep(10);
+		waited_us += 10;
+		if (waited_us % (10L * 1000000L) == 0)
+			elog(WARNING, "row cache: segment %d still pinned after %ld s (possible pin leak)",
+				 sid, waited_us / 1000000L);
+	}
+
+	seg->seq_num++;
+	seg->relid = InvalidOid;
+	seg->state = RC_SEG_FREE;
+	seg->used = 0;
+	seg->n_entries = 0;
+}
+
+/*
  * 释放 rm 段链上的全部段:摘净桶链引用后整链归还空闲链。
  * 调用方持有 rm->build_lock。幂等(中途被中断后重跑安全)。
  */
@@ -922,10 +1065,7 @@ ReleaseAllSegmentsForRel(RelMeta *rm)
 		RowCacheSegment *seg = &RowCacheSegs[sid];
 		int32		next = seg->next_seg;
 
-		seg->relid = InvalidOid;
-		seg->state = RC_SEG_FREE;
-		seg->used = 0;
-		seg->n_entries = 0;
+		SegPrepareReuse(sid);
 		seg->next_seg = RowCacheCtl->free_seg_head;
 		RowCacheCtl->free_seg_head = sid;
 		sid = next;
@@ -991,10 +1131,7 @@ SegPopOrEvict(Oid loading_relid)
 			elog(WARNING, "row cache: segment %d owned by relation %u without metadata",
 				 victim, vseg->relid);
 			SegUnlinkEntries(victim);
-			vseg->relid = InvalidOid;
-			vseg->state = RC_SEG_FREE;
-			vseg->used = 0;
-			vseg->n_entries = 0;
+			SegPrepareReuse(victim);
 			vseg->next_seg = -1;
 			return victim;
 		}
@@ -1056,12 +1193,12 @@ SegPopOrEvict(Oid loading_relid)
 
 		LWLockRelease(&vrm->build_lock);
 
-		vseg = &RowCacheSegs[victim];
-		vseg->relid = InvalidOid;
-		vseg->state = RC_SEG_FREE;
-		vseg->used = 0;
-		vseg->n_entries = 0;
-		vseg->next_seg = -1;
+		/*
+		 * 此刻 victim 已摘净桶链引用且不在任何段链上,不可能再有新 pin;
+		 * 等存量读者(锁外拷贝中)排空后换代复用。
+		 */
+		SegPrepareReuse(victim);
+		RowCacheSegs[victim].next_seg = -1;
 		return victim;
 	}
 }
@@ -1342,6 +1479,10 @@ RelationRowCacheLoadRelation(Relation rel)
 		LWLockRelease(&rm->build_lock);
 		return;
 	}
+
+	/* schema 指纹:bind 慢路径复核用(S2)。 */
+	rm->fp_relfilenumber = rel->rd_locator.relNumber;
+	rm->fp_tupdesc_hash = RowCacheTupDescHash(RelationGetDescr(rel));
 
 	if (!ActiveSnapshotSet())
 	{
@@ -1626,7 +1767,8 @@ DoPkeyFetchBytes(RelMeta *rm, Oid relid,
 	FlatCachedTuple *flat;
 	HeapTupleData	htup;
 	ItemPointerData	tid;
-	bool			result = false;
+	int32			sid;
+	uint32			seq_seen;
 
 	if (pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
 		return false;
@@ -1636,13 +1778,32 @@ DoPkeyFetchBytes(RelMeta *rm, Oid relid,
 	bucket = hash & RowCacheCtl->bucket_mask;
 	part = PartitionLockForBucket(bucket);
 
+	/*
+	 * S2 读协议:锁内只做"查链 + pin 所在段",可见性判断与整行拷贝移到
+	 * 锁外——分区锁持有时长从"整行拷贝"缩到"链查找"。
+	 *
+	 * 安全论证:持分区锁期间 entry 在链上 ⇒ 其所在段必然活着(段物理
+	 * 复用前必须先摘净全部条目,摘链需要本分区排他锁,会被我们挡住);
+	 * pin 在锁内完成 ⇒ 放锁后段的物理复用被 pin_cnt 阻止,锁外读到的
+	 * 字节稳定。并发 DML 失效只改链指针、不改 entry 内容,不影响在途
+	 * 拷贝——语义等同 V4 的"锁内拷贝刚结束,行随即被更新"。
+	 */
 	LWLockAcquire(part, LW_SHARED);
 
 	entry = BucketLookup(bucket, relid, hash, pkey_buf, pkey_len);
 	if (entry == NULL)
-		goto out;
+	{
+		LWLockRelease(part);
+		return false;
+	}
 
-	pg_read_barrier();
+	sid = EntrySegId(entry);
+	seq_seen = RowCacheSegs[sid].seq_num;
+	SegPin(sid);
+
+	LWLockRelease(part);
+
+	/* ---- 以下在锁外,段内存由 pin 保护 ---- */
 
 	flat = ENTRY_FLAT(entry);
 
@@ -1659,16 +1820,80 @@ DoPkeyFetchBytes(RelMeta *rm, Oid relid,
 	{
 		slot->tts_tableOid = relid;
 		ItemPointerCopy(&tid, &slot->tts_tid);
-		RowCacheUnflattenToSlot(flat, relid, &tid, slot);
+
+		/*
+		 * 唯一可能 ereport 的点(palloc OOM):在途 pin 由事务 abort
+		 * 回调(RowCacheXactCallback)兜底释放,无需 PG_TRY。
+		 *
+		 * 展开失败(natts 与缓存时不符——正常情况下 schema 指纹会先
+		 * 一步失效整表,这里是纵深防御)按 miss 处理,绝不带着未填充
+		 * 的 slot 报命中。
+		 */
+		if (!RowCacheUnflattenToSlot(flat, relid, &tid, slot))
+		{
+			SegUnpin(sid);
+			*is_visible = false;
+			*has_hot_chain = false;
+			return false;
+		}
 	}
 
-	result = true;
+	/*
+	 * 换代绊线:pin 协议成立时段在 pin 期间绝不换代;失配说明回收纪律
+	 * 被破坏(bug)。防御性按 miss 处理——调用方回退原生路径,slot 中
+	 * 的可疑内容会被真实读取覆盖。
+	 */
+	if (unlikely(RowCacheSegs[sid].seq_num != seq_seen))
+	{
+		Assert(false);
+		SegUnpin(sid);
+		*is_visible = false;
+		*has_hot_chain = false;
+		return false;
+	}
 
-out:
-	LWLockRelease(part);
-	return result;
+	SegUnpin(sid);
+	return true;
 }
 
+
+/* ----------------------------------------------------------------
+ * schema 指纹(S2)
+ *
+ * 信号与裁决分离:relcache inval 是脏信号(vacuum/analyze 的 pg_class
+ * inplace 更新、GRANT、建索引、sinval 溢出都会触发),不能拿来直接
+ * DISABLED。真正的裁决在 bind 慢路径用指纹比对完成:指纹没变(例行
+ * 维护)缓存零损失;指纹变了(真 DDL)才失效。
+ * ---------------------------------------------------------------- */
+
+static uint64
+RowCacheTupDescHash(TupleDesc desc)
+{
+	uint64		h = (uint64) desc->natts;
+
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+		uint32		x[4];
+
+		x[0] = (uint32) att->atttypid;
+		x[1] = (uint32) att->atttypmod;
+		x[2] = (uint32) (uint16) att->attlen |
+			((uint32) att->attbyval << 16) |
+			((uint32) att->attisdropped << 17);
+		x[3] = (uint32) att->attnum;
+		h = hash_combine64(h, hash_bytes_extended((const unsigned char *) x,
+												  sizeof(x), 0));
+	}
+	return h;
+}
+
+static inline bool
+RowCacheFingerprintMatches(Relation rel, RelMeta *rm)
+{
+	return rm->fp_relfilenumber == rel->rd_locator.relNumber &&
+		rm->fp_tupdesc_hash == RowCacheTupDescHash(RelationGetDescr(rel));
+}
 
 static RelMeta *
 LookupRelMetaForFetch(Oid relid)
@@ -1804,6 +2029,45 @@ RelationRowCacheBindRelation(Relation rel)
 		return;
 	}
 	pg_read_barrier();
+
+	/*
+	 * schema 指纹复核(S2):relcache 重建后的首次绑定走到这里。指纹
+	 * 相同(vacuum/analyze/GRANT 等例行维护触发的重建)→ 正常绑定,
+	 * 缓存零损失;不同(TRUNCATE/重写/加删改列等真 DDL)→ 失效整表。
+	 *
+	 * 用条件锁:拿不到(正被 load/drop/淘汰)就本轮按未缓存绑定,失效
+	 * 由下一个拿到锁的绑定者完成。期间无脏读窗口:本 backend 已绑
+	 * NOT_CACHED;其它 backend 要么还没消费 inval(受 DDL 的
+	 * AccessExclusiveLock 锁序保护,不可能正在查这张表),要么同样走到
+	 * 这里。
+	 */
+	if (!RowCacheFingerprintMatches(rel, rm))
+	{
+		if (LWLockConditionalAcquire(&rm->build_lock, LW_EXCLUSIVE))
+		{
+			if (rm->relid == relid &&
+				pg_atomic_read_u32(&rm->state) == RELMETA_ENABLED &&
+				!RowCacheFingerprintMatches(rel, rm))
+			{
+				elog(DEBUG1, "row cache: schema fingerprint mismatch for relation %u, invalidating",
+					 relid);
+				pg_atomic_write_u32(&rm->state, RELMETA_DISABLED);
+				pg_memory_barrier();
+				ReleaseAllSegmentsForRel(rm);
+				rm->n_pkey_attrs = 0;
+				rm->pkey_total_len = 0;
+				rm->relid = InvalidOid;
+				LastLookupRelMeta = NULL;
+				LastLookupRelid = InvalidOid;
+				LWLockRelease(&rm->build_lock);
+				pg_atomic_fetch_add_u32(&RowCacheCtl->global_gen.value, 1);
+			}
+			else
+				LWLockRelease(&rm->build_lock);
+		}
+		rel->rd_rowcache_meta = ROWCACHE_NOT_CACHED;
+		return;
+	}
 
 	n = rm->n_pkey_attrs;
 	if (n <= 0 || n > ROW_CACHE_PKEY_MAX_ATTS)
