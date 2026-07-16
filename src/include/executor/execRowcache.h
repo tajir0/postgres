@@ -42,4 +42,11 @@ extern RowCacheProbeResult ExecIndexNextRowCache(IndexScanState *node,
  */
 extern void ExecReScanIndexScanRowCache(IndexScanState *node);
 
+/*
+ * S3:点查 miss 后按需回填。IndexNext 在原生路径取到行、recheck 通过
+ * 后、返回该行之前调用;best-effort,绝不影响查询结果与延迟。
+ */
+extern void ExecIndexRowCacheBackfill(IndexScanState *node,
+									  TupleTableSlot *slot);
+
 #endif							/* EXEC_ROWCACHE_H */

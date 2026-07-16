@@ -37,6 +37,10 @@ extern PGDLLIMPORT int row_cache_size_mb;
 extern Size RowCacheShmemSize(void);
 extern void RowCacheShmemInit(void);
 
+/* S3:后台洗段 bgworker(注册由 postmaster.c 调用)。 */
+extern void RowCacheWasherRegister(void);
+extern void RowCacheWasherMain(Datum main_arg);
+
 extern void RowCacheOnHeapUpdate(Relation rel,
 								 HeapTuple oldtup,
 								 HeapTuple newtup);
@@ -81,6 +85,19 @@ extern bool RelationRowCachePkeyFetchBound(struct RelMeta *rm,
 										   TupleTableSlot *slot,
 										   bool *is_visible,
 										   bool *has_hot_chain);
+
+/*
+ * S3:点查 miss 按需回填。GUC row_cache_backfill 总开关;
+ * InvalGen 是回填竞态屏障的代数读取(探测 miss 时、读堆之前记下)。
+ */
+extern PGDLLIMPORT bool row_cache_backfill;
+extern uint64 RelationRowCacheInvalGen(struct RelMeta *rm);
+extern bool RelationRowCacheBackfillBound(struct RelMeta *rm,
+										  Oid expected_relid,
+										  const Datum *vals,
+										  int nvals,
+										  TupleTableSlot *slot,
+										  uint64 gen_seen);
 
 extern int RelationRowCachePkeyDescriptor(Oid relid,
 										   AttrNumber *out_attnos,

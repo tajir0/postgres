@@ -95,6 +95,7 @@
 #include "common/file_perm.h"
 #include "common/pg_prng.h"
 #include "lib/ilist.h"
+#include "lib/relation_row_cache.h"
 #include "libpq/libpq.h"
 #include "libpq/pqsignal.h"
 #include "pg_getopt.h"
@@ -925,6 +926,9 @@ PostmasterMain(int argc, char *argv[])
 	 * before any modules had a chance to take the background worker slots.
 	 */
 	ApplyLauncherRegister();
+
+	/* 行缓存后台洗段进程(衰减打分 + 空闲段水位维持)。 */
+	RowCacheWasherRegister();
 
 	/*
 	 * process any libraries that should be preloaded at postmaster start

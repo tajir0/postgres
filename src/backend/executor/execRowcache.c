@@ -40,6 +40,8 @@ ExecInitIndexScanRowCache(IndexScanState *node)
 	node->iss_PkeyAttempted = false;
 	node->iss_RowCacheMeta = NULL;
 	node->iss_RowCachePkeyNatts = 0;
+	node->iss_RowCacheInvalGen = 0;
+	node->iss_RowCacheBackfilled = false;
 
 	RelationRowCacheBindRelation(scanRel);
 	rm = scanRel->rd_rowcache_meta;
@@ -145,6 +147,13 @@ ExecIndexNextRowCache(IndexScanState *node, EState *estate,
 
 	node->iss_PkeyAttempted = true;
 
+	/*
+	 * 回填竞态屏障 c1(S3):必须在原生路径读堆之前记下本表失效代数。
+	 * 之后若走到回填,插入前比对 c2——期间本表有任何 DML 即放弃回填。
+	 */
+	node->iss_RowCacheInvalGen =
+		RelationRowCacheInvalGen(node->iss_RowCacheMeta);
+
 	/* 所有运行期 ScanKey 必须就绪(NestLoop 内层扫描)。 */
 	if (node->iss_NumRuntimeKeys != 0 && !node->iss_RuntimeKeysReady)
 		return ROW_CACHE_FALLBACK;
@@ -188,4 +197,45 @@ void
 ExecReScanIndexScanRowCache(IndexScanState *node)
 {
 	node->iss_PkeyAttempted = false;
+	node->iss_RowCacheBackfilled = false;
+}
+
+/*
+ * ExecIndexRowCacheBackfill
+ *
+ * 点查 miss 后按需回填(S3):原生路径取到行、recheck 通过后,由
+ * IndexNext 在返回该行之前调用。收集与探测同源的等值键 Datum,交给
+ * 缓存层做行状态三关检查、竞态屏障比对与插入。best-effort:任何环节
+ * 不满足直接放弃,不影响查询结果与延迟。
+ */
+void
+ExecIndexRowCacheBackfill(IndexScanState *node, TupleTableSlot *slot)
+{
+	Datum		vals[INDEX_MAX_KEYS];
+	int			natts;
+
+	if (node->iss_RowCacheMeta == NULL ||
+		!node->iss_PkeyAttempted ||
+		node->iss_RowCacheBackfilled)
+		return;
+
+	node->iss_RowCacheBackfilled = true;	/* 每个扫描实例至多一次 */
+
+	if (node->iss_NumRuntimeKeys != 0 && !node->iss_RuntimeKeysReady)
+		return;
+
+	natts = node->iss_RowCachePkeyNatts;
+	for (int i = 0; i < natts; i++)
+	{
+		ScanKey		sk = &node->iss_ScanKeys[i];
+
+		if ((sk->sk_flags & SK_ISNULL) != 0)
+			return;
+		vals[i] = sk->sk_argument;
+	}
+
+	(void) RelationRowCacheBackfillBound(node->iss_RowCacheMeta,
+										 RelationGetRelid(node->ss.ss_currentRelation),
+										 vals, natts, slot,
+										 node->iss_RowCacheInvalGen);
 }

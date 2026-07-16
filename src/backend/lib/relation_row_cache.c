@@ -92,6 +92,7 @@
 #include "utils/rel.h"
 #include "utils/relcache.h"
 #include "utils/snapmgr.h"
+#include "utils/timestamp.h"
 #include "utils/datum.h"
 
 
@@ -125,6 +126,9 @@ int			row_cache_hash_buckets = ROW_CACHE_DEFAULT_HASH_BUCKETS;
 
 /* 数据池大小(MB)。段数 = row_cache_size_mb(段固定 1MB)。 */
 int			row_cache_size_mb = ROW_CACHE_DEFAULT_SIZE_MB;
+
+/* GUC:点查 miss 后按需回填开关(S3)。 */
+bool		row_cache_backfill = true;
 
 /* RelMeta.state 取值。 */
 #define RELMETA_DISABLED	0
@@ -199,6 +203,18 @@ typedef struct RelMeta
 	 */
 	RelFileNumber	fp_relfilenumber;
 	uint64			fp_tupdesc_hash;
+
+	/*
+	 * 失效计数(S3):DML 钩子对本表每次行级失效前无条件 +1。
+	 *
+	 * 按需回填的竞态屏障:探测 miss 时执行器记下 c1(早于堆读),回填
+	 * 在分区锁内插入前比对 c2——期间本表有任何 DML 则放弃回填。两种
+	 * 交错都安全:钩子先执行(counter++ 先于其摘链的分区锁临界区,
+	 * 回填者进锁后必见新值 → 放弃);回填先插入(钩子随后的摘链必然
+	 * 命中刚插入的条目 → 摘除)。堵住"读到 xmax 干净的旧版本 → 并发
+	 * UPDATE 摘链扑空 → 回填复活死行"的窗口。
+	 */
+	pg_atomic_uint64 inval_counter;
 } RelMeta;
 
 typedef struct GlobalEntry
@@ -221,8 +237,20 @@ typedef struct GlobalEntry
 
 /* RowCacheSegment.state 取值。 */
 #define RC_SEG_FREE		0		/* 在全局空闲链上 */
-#define RC_SEG_ACTIVE	1		/* 某关系的当前写入段(仅其 LOADING 期间) */
+#define RC_SEG_ACTIVE	1		/* 某关系的当前写入段(LOADING 期间或回填段) */
 #define RC_SEG_FULL		2		/* 已封存,可被整段淘汰 */
+
+/*
+ * S3 打分/洗段参数(对应 OB CACHE_SCORE_DECAY_FACTOR = 0.9 与
+ * _cache_wash_interval = 200ms)。
+ *
+ * 空闲段水位 = max(1, n_segments/16):washer 周期性把 score 最低的
+ * FULL 段洗回空闲链,使按需回填在池满后仍能持续进行(热点轮换);
+ * 回填路径自身只从空闲链取段、绝不淘汰(两不等纪律)。
+ */
+#define ROW_CACHE_SCORE_DECAY		0.9
+#define ROW_CACHE_WASH_INTERVAL_MS	200
+#define ROW_CACHE_SEAL_BASE_SCORE	1.0		/* 封存时的起步分,防新段被立即误杀 */
 
 /*
  * 段描述符(池外定长数组)。字段无原子:分配/封存由持 build_lock 的
@@ -232,9 +260,16 @@ typedef struct RowCacheSegment
 {
 	Oid			relid;			/* 归属关系;InvalidOid = 空闲 */
 	uint32		state;			/* RC_SEG_* */
-	uint32		used;			/* 段内 bump 指针(字节) */
-	uint32		n_entries;		/* 段内条目数(含已被 DML 摘链的死条目) */
-	uint64		alloc_seq;		/* 全局分配序号;FIFO 淘汰(LRU 近似)依据 */
+
+	/*
+	 * 段内 bump 指针与条目数。S3 起为原子:load 单写者(build_lock 排他)
+	 * 之外,按需回填允许多 backend 并发 bump 同一 ENABLED 表的回填段
+	 * (各自 CAS 出不重叠区间,各写各的)。
+	 */
+	pg_atomic_uint32 used;
+	pg_atomic_uint32 n_entries;
+
+	uint64		alloc_seq;		/* 全局分配序号;打分相同时的淘汰决胜 */
 	int32		next_seg;		/* 本表段链 / 空闲链的下一段;-1 = 无 */
 
 	/*
@@ -248,6 +283,14 @@ typedef struct RowCacheSegment
 	 */
 	uint32		seq_num;
 	pg_atomic_uint32 pin_cnt;
+
+	/*
+	 * S3:衰减 LFU 打分(对应 OB score = score×0.9 + recent_get_cnt)。
+	 * recent_get_cnt 由命中读者原子累加;score 只在 seg_lock 下由打分
+	 * 器(washer / 同步淘汰者)读写。淘汰选 score 最低的 FULL 段。
+	 */
+	pg_atomic_uint32 recent_get_cnt;
+	double		score;
 } RowCacheSegment;
 
 /*
@@ -279,6 +322,14 @@ typedef struct RowCacheControl
 	int32			n_segments;
 	int32			free_seg_head;		/* 全局空闲段链头;-1 = 空 */
 	uint64			seg_alloc_counter;	/* 单调递增,发放 alloc_seq */
+	TimestampTz		last_score_refresh;	/* 上次衰减打分时刻(seg_lock 下) */
+
+	/*
+	 * 段需求计数(S3):空闲链耗尽时由取段者 +1(load 同步淘汰前 /
+	 * 回填放弃前)。washer 每轮取出清零——近期无需求就不洗段,避免
+	 * 水位机制无故蚕食一张合法占满池子的常驻表。
+	 */
+	pg_atomic_uint32 seg_demand;
 
 	RowCacheGenPadded global_gen pg_attribute_aligned(PG_CACHE_LINE_SIZE);
 
@@ -537,6 +588,8 @@ RowCacheShmemInit(void)
 	RowCacheCtl->bucket_mask = (uint32) row_cache_hash_buckets - 1;
 	RowCacheCtl->n_segments = nsegs;
 	RowCacheCtl->seg_alloc_counter = 0;
+	RowCacheCtl->last_score_refresh = 0;
+	pg_atomic_init_u32(&RowCacheCtl->seg_demand, 0);
 	pg_atomic_init_u32(&RowCacheCtl->global_gen.value, 0);
 
 	LWLockInitialize(&RowCacheCtl->seg_lock, LWTRANCHE_ROW_CACHE_CTL);
@@ -560,6 +613,7 @@ RowCacheShmemInit(void)
 		rm->cur_seg = -1;
 		rm->fp_relfilenumber = InvalidRelFileNumber;
 		rm->fp_tupdesc_hash = 0;
+		pg_atomic_init_u64(&rm->inval_counter, 0);
 	}
 
 	/* 桶头全空。 */
@@ -573,12 +627,14 @@ RowCacheShmemInit(void)
 
 		seg->relid = InvalidOid;
 		seg->state = RC_SEG_FREE;
-		seg->used = 0;
-		seg->n_entries = 0;
+		pg_atomic_init_u32(&seg->used, 0);
+		pg_atomic_init_u32(&seg->n_entries, 0);
 		seg->alloc_seq = 0;
 		seg->next_seg = (s + 1 < nsegs) ? (s + 1) : -1;
 		seg->seq_num = 0;
 		pg_atomic_init_u32(&seg->pin_cnt, 0);
+		pg_atomic_init_u32(&seg->recent_get_cnt, 0);
+		seg->score = 0.0;
 	}
 	RowCacheCtl->free_seg_head = (nsegs > 0) ? 0 : -1;
 }
@@ -966,9 +1022,10 @@ SegUnlinkEntries(int32 sid)
 {
 	RowCacheSegment *seg = &RowCacheSegs[sid];
 	char	   *base = SegBase(sid);
+	uint32		used = pg_atomic_read_u32(&seg->used);
 	uint32		off = 0;
 
-	while (off < seg->used)
+	while (off < used)
 	{
 		GlobalEntry *e = (GlobalEntry *) (base + off);
 		uint32		bucket;
@@ -1039,8 +1096,10 @@ SegPrepareReuse(int32 sid)
 	seg->seq_num++;
 	seg->relid = InvalidOid;
 	seg->state = RC_SEG_FREE;
-	seg->used = 0;
-	seg->n_entries = 0;
+	pg_atomic_write_u32(&seg->used, 0);
+	pg_atomic_write_u32(&seg->n_entries, 0);
+	pg_atomic_write_u32(&seg->recent_get_cnt, 0);
+	seg->score = 0.0;
 }
 
 /*
@@ -1076,52 +1135,84 @@ ReleaseAllSegmentsForRel(RelMeta *rm)
 }
 
 /*
- * 弹出一个可用段:优先空闲链;空了就按 alloc_seq FIFO(LRU 近似)淘汰
- * 一个不属于 loading_relid 的 FULL 段。调用方持 seg_lock EXCLUSIVE。
- * 返回段号,彻底拿不到返回 -1(调用方报错回滚,绝不等待)。
+ * 衰减打分刷新(S3):score = score×0.9 + recent_get_cnt(取出清零)。
+ * 调用方持 seg_lock EXCLUSIVE。washer 每个洗段周期跑一轮;同步淘汰
+ * 路径在打分陈旧(超过一个周期)时补跑。
+ */
+static void
+RowCacheRefreshScoresLocked(void)
+{
+	for (int32 s = 0; s < RowCacheCtl->n_segments; s++)
+	{
+		RowCacheSegment *seg = &RowCacheSegs[s];
+		uint32		recent = pg_atomic_exchange_u32(&seg->recent_get_cnt, 0);
+
+		if (seg->state == RC_SEG_FREE)
+			seg->score = 0.0;
+		else
+			seg->score = seg->score * ROW_CACHE_SCORE_DECAY + (double) recent;
+	}
+	RowCacheCtl->last_score_refresh = GetCurrentTimestamp();
+}
+
+/*
+ * 在 FULL 段中挑 score 最低者(同分取 alloc_seq 最小,退化为 FIFO)。
+ * exempt_relid 的段被豁免(load 不淘汰自己);skip_relid 排除二次扫描
+ * 时 build_lock 拿不到的表。调用方持 seg_lock EXCLUSIVE。
  */
 static int32
-SegPopOrEvict(Oid loading_relid)
+SegPickVictim(Oid exempt_relid, Oid skip_relid)
 {
-	/* 1) 空闲链 */
-	if (RowCacheCtl->free_seg_head >= 0)
+	int32		victim = -1;
+	double		victim_score = 0.0;
+	uint64		victim_seq = 0;
+
+	for (int32 s = 0; s < RowCacheCtl->n_segments; s++)
 	{
-		int32		sid = RowCacheCtl->free_seg_head;
+		RowCacheSegment *seg = &RowCacheSegs[s];
 
-		RowCacheCtl->free_seg_head = RowCacheSegs[sid].next_seg;
-		RowCacheSegs[sid].next_seg = -1;
-		return sid;
+		if (seg->state != RC_SEG_FULL)
+			continue;
+		if (seg->relid == exempt_relid ||
+			(OidIsValid(skip_relid) && seg->relid == skip_relid))
+			continue;
+		if (victim < 0 ||
+			seg->score < victim_score ||
+			(seg->score == victim_score && seg->alloc_seq < victim_seq))
+		{
+			victim = s;
+			victim_score = seg->score;
+			victim_seq = seg->alloc_seq;
+		}
 	}
+	return victim;
+}
 
-	/*
-	 * 2) 淘汰:反复挑 alloc_seq 最小的合格 FULL 段,直到某个 victim 的
-	 * build_lock 能拿到。拿不到锁的表(正在 load/drop)跳过。
-	 */
+/*
+ * 淘汰一个 FULL 段:打分选最冷 → conditional 拿 victim 表的 build_lock
+ * (拿不到换一次候选)→ 摘净桶链引用 → 从属主段链摘除 → 等 pin 排空
+ * 并换代。exempt_relid 的段被豁免。调用方持 seg_lock EXCLUSIVE。
+ * 返回段号(已不在任何链上),拿不到返回 -1(绝不等待)。
+ */
+static int32
+SegEvictOne(Oid exempt_relid)
+{
+	/* 打分陈旧时补一轮刷新(washer 常态每周期维护)。 */
+	if (TimestampDifferenceExceeds(RowCacheCtl->last_score_refresh,
+								   GetCurrentTimestamp(),
+								   ROW_CACHE_WASH_INTERVAL_MS))
+		RowCacheRefreshScoresLocked();
+
 	for (;;)
 	{
-		int32		victim = -1;
-		uint64		victim_seq = 0;
+		int32		victim = SegPickVictim(exempt_relid, InvalidOid);
 		RowCacheSegment *vseg;
 		RelMeta    *vrm;
 		int32	   *linkp;
 		int32		cur;
 
-		for (int32 s = 0; s < RowCacheCtl->n_segments; s++)
-		{
-			RowCacheSegment *seg = &RowCacheSegs[s];
-
-			if (seg->state != RC_SEG_FULL)
-				continue;
-			if (seg->relid == loading_relid)
-				continue;
-			if (victim < 0 || seg->alloc_seq < victim_seq)
-			{
-				victim = s;
-				victim_seq = seg->alloc_seq;
-			}
-		}
 		if (victim < 0)
-			return -1;			/* 池全被本表(或加载中的表)占用 */
+			return -1;			/* 无可淘汰段 */
 
 		vseg = &RowCacheSegs[victim];
 		vrm = FindRelMeta(vseg->relid);
@@ -1145,23 +1236,8 @@ SegPopOrEvict(Oid loading_relid)
 			 * 线性扫描下一个次老候选:重扫时跳过该 relid。
 			 */
 			Oid			busy_relid = vseg->relid;
-			int32		alt = -1;
-			uint64		alt_seq = 0;
+			int32		alt = SegPickVictim(exempt_relid, busy_relid);
 
-			for (int32 s = 0; s < RowCacheCtl->n_segments; s++)
-			{
-				RowCacheSegment *seg = &RowCacheSegs[s];
-
-				if (seg->state != RC_SEG_FULL)
-					continue;
-				if (seg->relid == loading_relid || seg->relid == busy_relid)
-					continue;
-				if (alt < 0 || seg->alloc_seq < alt_seq)
-				{
-					alt = s;
-					alt_seq = seg->alloc_seq;
-				}
-			}
 			if (alt < 0)
 				return -1;
 
@@ -1204,10 +1280,135 @@ SegPopOrEvict(Oid loading_relid)
 }
 
 /*
+ * 弹出一个可用段:优先空闲链(washer 负责维持水位),空了同步淘汰
+ * (打分最冷)。调用方持 seg_lock EXCLUSIVE。
+ */
+static int32
+SegPopOrEvict(Oid loading_relid)
+{
+	if (RowCacheCtl->free_seg_head >= 0)
+	{
+		int32		sid = RowCacheCtl->free_seg_head;
+
+		RowCacheCtl->free_seg_head = RowCacheSegs[sid].next_seg;
+		RowCacheSegs[sid].next_seg = -1;
+		return sid;
+	}
+	/* 空闲链耗尽 = 段需求信号,washer 据此维持水位。 */
+	pg_atomic_fetch_add_u32(&RowCacheCtl->seg_demand, 1);
+	return SegEvictOne(loading_relid);
+}
+
+/*
+ * 段内 CAS bump 出一块 need 字节的空间并写好占位头(S3:允许多写者——
+ * 并发回填者各自拿到不重叠区间,各写各的)。段剩余不足返回 NULL。
+ *
+ * 立即写 span / 占位字段:此后即使写者中途异常,SegUnlinkEntries 也能
+ * 按 span 安全遍历本段。
+ */
+static GlobalEntry *
+SegTryBump(int32 sid, uint32 need)
+{
+	RowCacheSegment *seg = &RowCacheSegs[sid];
+	uint32		old = pg_atomic_read_u32(&seg->used);
+	GlobalEntry *e;
+
+	for (;;)
+	{
+		if ((Size) old + need > ROW_CACHE_SEGMENT_SIZE)
+			return NULL;
+		if (pg_atomic_compare_exchange_u32(&seg->used, &old, old + need))
+			break;
+		/* CAS 失败时 old 已被更新为当前值,重试。 */
+	}
+
+	pg_atomic_fetch_add_u32(&seg->n_entries, 1);
+
+	e = (GlobalEntry *) (SegBase(sid) + old);
+	e->span = need;
+	e->relid = InvalidOid;		/* 插链前的未完成标记 */
+	e->pkey_hash = 0;
+	e->next = NULL;
+	return e;
+}
+
+/*
+ * 回填分配(S3):从本表当前写入段 CAS bump;段满则在 seg_lock 下换段,
+ * 但只从空闲链取——绝不同步淘汰、绝不等待(查询路径纪律)。空闲链空
+ * 时记一次段需求(washer 下轮补水位)并放弃。
+ *
+ * 调用方持 rm->build_lock SHARED:挡住 drop/load/指纹失效/淘汰(它们
+ * 取 EXCLUSIVE)对段链与段内存的并发变更;多个回填者之间靠 SegTryBump
+ * 的原子 CAS 与 seg_lock 串行。陈旧的 cur_seg 读值无害:bump 进一个
+ * 刚被封存(FULL)的段仍然合法——FULL 只表示"可淘汰",而淘汰需要
+ * EXCLUSIVE build_lock,被我们的 SHARED 挡住。
+ */
+static GlobalEntry *
+SegBackfillAlloc(RelMeta *rm, Size need)
+{
+	need = MAXALIGN(need);
+
+	if (need > ROW_CACHE_SEGMENT_SIZE)
+		return NULL;
+
+	for (;;)
+	{
+		int32		sid = rm->cur_seg;
+		int32		nid;
+
+		if (sid >= 0)
+		{
+			GlobalEntry *e = SegTryBump(sid, (uint32) need);
+
+			if (e != NULL)
+				return e;
+		}
+
+		LWLockAcquire(&RowCacheCtl->seg_lock, LW_EXCLUSIVE);
+
+		/* 并发回填者可能已换好新段:重试 bump。 */
+		if (rm->cur_seg != sid)
+		{
+			LWLockRelease(&RowCacheCtl->seg_lock);
+			continue;
+		}
+
+		if (RowCacheCtl->free_seg_head < 0)
+		{
+			pg_atomic_fetch_add_u32(&RowCacheCtl->seg_demand, 1);
+			LWLockRelease(&RowCacheCtl->seg_lock);
+			return NULL;
+		}
+
+		nid = RowCacheCtl->free_seg_head;
+		RowCacheCtl->free_seg_head = RowCacheSegs[nid].next_seg;
+
+		{
+			RowCacheSegment *nseg = &RowCacheSegs[nid];
+
+			nseg->relid = rm->relid;
+			nseg->state = RC_SEG_ACTIVE;
+			pg_atomic_write_u32(&nseg->used, 0);
+			pg_atomic_write_u32(&nseg->n_entries, 0);
+			nseg->alloc_seq = ++RowCacheCtl->seg_alloc_counter;
+			nseg->next_seg = rm->first_seg;
+		}
+		if (sid >= 0)
+		{
+			RowCacheSegs[sid].state = RC_SEG_FULL;
+			RowCacheSegs[sid].score = ROW_CACHE_SEAL_BASE_SCORE;
+		}
+		rm->first_seg = nid;
+		rm->cur_seg = nid;
+		LWLockRelease(&RowCacheCtl->seg_lock);
+	}
+}
+
+/*
  * 从本表当前写入段 bump 出一个 entry(含内联 flat 载荷的总空间 need)。
  * 段不够就换新段(空闲链/淘汰);单行超过段容量返回 NULL(调用方跳过
  * 该行);池彻底腾不出则 ereport(调用方 PG_CATCH 回滚整个 load)。
- * 调用方持有 rm->build_lock(单写者,bump 无需原子)。
+ * 调用方持有 rm->build_lock EXCLUSIVE。
  */
 static GlobalEntry *
 SegAllocEntry(RelMeta *rm, Size need)
@@ -1223,25 +1424,10 @@ SegAllocEntry(RelMeta *rm, Size need)
 
 		if (sid >= 0)
 		{
-			RowCacheSegment *seg = &RowCacheSegs[sid];
+			GlobalEntry *e = SegTryBump(sid, (uint32) need);
 
-			if ((Size) seg->used + need <= ROW_CACHE_SEGMENT_SIZE)
-			{
-				GlobalEntry *e = (GlobalEntry *) (SegBase(sid) + seg->used);
-
-				seg->used += (uint32) need;
-				seg->n_entries++;
-
-				/*
-				 * 立即写 span / 占位字段:此后即使 load 中途异常,
-				 * SegUnlinkEntries 也能按 span 安全遍历本段。
-				 */
-				e->span = (uint32) need;
-				e->relid = InvalidOid;	/* 插链前的未完成标记 */
-				e->pkey_hash = 0;
-				e->next = NULL;
+			if (e != NULL)
 				return e;
-			}
 		}
 
 		/* 换新段。 */
@@ -1267,13 +1453,17 @@ SegAllocEntry(RelMeta *rm, Size need)
 
 				nseg->relid = rm->relid;
 				nseg->state = RC_SEG_ACTIVE;
-				nseg->used = 0;
-				nseg->n_entries = 0;
+				pg_atomic_write_u32(&nseg->used, 0);
+				pg_atomic_write_u32(&nseg->n_entries, 0);
 				nseg->alloc_seq = ++RowCacheCtl->seg_alloc_counter;
 				nseg->next_seg = rm->first_seg;
 			}
 			if (sid >= 0)
+			{
+				/* 封存旧段:给起步分,防"刚写满还没被读过"的段被立即误杀。 */
 				RowCacheSegs[sid].state = RC_SEG_FULL;
+				RowCacheSegs[sid].score = ROW_CACHE_SEAL_BASE_SCORE;
+			}
 			rm->first_seg = nid;
 			rm->cur_seg = nid;
 			LWLockRelease(&RowCacheCtl->seg_lock);
@@ -1607,11 +1797,12 @@ RelationRowCacheLoadRelation(Relation rel)
 	if (pushed_snapshot)
 		PopActiveSnapshot();
 
-	/* 封存当前写入段:ENABLED 后所有段均为 FULL(可淘汰)。 */
+	/* 封存当前写入段:ENABLED 后所有段均为 FULL(可淘汰),带起步分。 */
 	if (rm->cur_seg >= 0)
 	{
 		LWLockAcquire(&RowCacheCtl->seg_lock, LW_EXCLUSIVE);
 		RowCacheSegs[rm->cur_seg].state = RC_SEG_FULL;
+		RowCacheSegs[rm->cur_seg].score = ROW_CACHE_SEAL_BASE_SCORE;
 		rm->cur_seg = -1;
 		LWLockRelease(&RowCacheCtl->seg_lock);
 	}
@@ -1693,6 +1884,14 @@ InvalidateByHeapTuple(Relation rel, HeapTuple tuple)
 		return;
 
 	relid = RelationGetRelid(rel);
+
+	/*
+	 * 回填竞态屏障(S3):先推进失效计数,再做摘链。顺序保证两种交错
+	 * 都安全——回填者在其分区锁临界区内比对计数:若本钩子先走完摘链
+	 * (锁的 acquire 语义使回填者必见新计数)则回填放弃;若回填先插入,
+	 * 下面的摘链必然命中刚插入的条目并将其摘除。
+	 */
+	pg_atomic_fetch_add_u64(&rm->inval_counter, 1);
 
 	/* 用 reldata 的本地 pkey schema 快照序列化 */
 	pkey_len = SerializePkeyFromTuple(tuple, RelationGetDescr(rel),
@@ -1800,6 +1999,9 @@ DoPkeyFetchBytes(RelMeta *rm, Oid relid,
 	sid = EntrySegId(entry);
 	seq_seen = RowCacheSegs[sid].seq_num;
 	SegPin(sid);
+
+	/* S3:段级命中计数,washer 打分(衰减 LFU)的输入。 */
+	pg_atomic_fetch_add_u32(&RowCacheSegs[sid].recent_get_cnt, 1);
 
 	LWLockRelease(part);
 
@@ -2127,6 +2329,145 @@ RelationRowCachePkeyFetchBound(RelMeta *rm,
 							snapshot, slot, is_visible, has_hot_chain);
 }
 
+/*
+ * 探测 miss 时执行器记下的失效代数(回填竞态屏障的 c1)。
+ * 必须在原生路径读堆之前取得——调用点在 ExecIndexNextRowCache 开头。
+ */
+uint64
+RelationRowCacheInvalGen(RelMeta *rm)
+{
+	if (rm == NULL || rm == ROWCACHE_NOT_CACHED)
+		return 0;
+	return pg_atomic_read_u64(&rm->inval_counter);
+}
+
+/*
+ * 点查 miss 按需回填(S3,对应 OB get_block_row 的 miss 后回填)。
+ *
+ * best-effort:任何检查不满足直接放弃,绝不阻塞、绝不淘汰、绝不影响
+ * 查询结果。gen_seen 是探测 miss 时(读堆之前)记下的失效代数,插入
+ * 前在分区锁内终检——期间本表有任何 DML 即放弃,堵住"读到 xmax 干净
+ * 的旧版本、并发 UPDATE 摘链扑空、回填复活死行"的窗口(与 DML 钩子
+ * 的 counter++ 先于摘链共同构成完整屏障,见 RelMeta.inval_counter)。
+ *
+ * 行状态三关(对应 OB 的 !have_uncommited_row / read_with_same_schema):
+ *   1. xmin 已提交且 hint 已设(排除本事务未提交行;hint 未设保守放弃,
+ *      不做 clog 查询);
+ *   2. 未被删/改(xmax invalid 或仅行锁);
+ *   3. 非 HOT 更新链的中间版本。
+ */
+bool
+RelationRowCacheBackfillBound(RelMeta *rm, Oid expected_relid,
+							  const Datum *vals, int nvals,
+							  TupleTableSlot *slot, uint64 gen_seen)
+{
+	uint8		pkey_buf[ROW_CACHE_PKEY_INLINE_BYTES];
+	int			pkey_len;
+	uint32		pkey_hash;
+	uint32		bucket;
+	HeapTuple	src = NULL;
+	bool		src_should_free = false;
+	HeapTuple	htup;
+	Size		flat_size;
+	uint32		htup_off;
+	uint32		varlen_off;
+	GlobalEntry *e;
+	LWLock	   *part;
+	bool		inserted = false;
+
+	if (!row_cache_backfill)
+		return false;
+	if (rm == NULL || rm == ROWCACHE_NOT_CACHED || slot == NULL)
+		return false;
+	if (RowCacheCtl == NULL)
+		return false;
+
+	/* 快速预检:期间已有 DML,不必白做 flatten。 */
+	if (pg_atomic_read_u64(&rm->inval_counter) != gen_seen)
+		return false;
+
+	/*
+	 * build_lock SHARED(conditional):挡住 drop/load/指纹失效/淘汰
+	 * (均取 EXCLUSIVE)对段链与段内存的并发变更;表正被维护时直接
+	 * 放弃。多个回填者 SHARED 共享,互相靠原子 bump 并行。
+	 */
+	if (!LWLockConditionalAcquire(&rm->build_lock, LW_SHARED))
+		return false;
+
+	if (rm->relid != expected_relid ||
+		pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED ||
+		rm->n_pkey_attrs != nvals)
+		goto out;
+
+	/* 行状态三关。 */
+	src = ExecFetchSlotHeapTuple(slot, false, &src_should_free);
+	if (src == NULL || src->t_data == NULL)
+		goto out;
+	{
+		uint16		infomask = src->t_data->t_infomask;
+
+		if (!(infomask & HEAP_XMIN_COMMITTED))
+			goto out;
+		if (!(infomask & HEAP_XMAX_INVALID) &&
+			!HEAP_XMAX_IS_LOCKED_ONLY(infomask))
+			goto out;
+		if (HeapTupleIsHotUpdated(src))
+			goto out;
+	}
+
+	pkey_len = SerializePkeyFromDatumArray(vals, nvals, rm, pkey_buf);
+	if (pkey_len < 0)
+		goto out;
+	pkey_hash = ComputePkeyHashBytes(pkey_buf, pkey_len);
+	bucket = pkey_hash & RowCacheCtl->bucket_mask;
+
+	slot_getallattrs(slot);
+	htup = ExecCopySlotHeapTuple(slot);
+	flat_size = FlatTupleComputeSize(slot, htup, &htup_off, &varlen_off);
+
+	e = SegBackfillAlloc(rm, MAXALIGN(sizeof(GlobalEntry)) + flat_size);
+	if (e == NULL)
+	{
+		heap_freetuple(htup);
+		goto out;
+	}
+
+	FlatTupleFillInto(ENTRY_FLAT(e), flat_size, htup_off, varlen_off,
+					  slot, htup);
+	heap_freetuple(htup);
+
+	e->pkey_hash = pkey_hash;
+	e->pkey_len = (uint8) pkey_len;
+	memcpy(e->pkey_buf, pkey_buf, pkey_len);
+	ItemPointerCopy(&slot->tts_tid, &e->tid);
+
+	part = PartitionLockForBucket(bucket);
+	LWLockAcquire(part, LW_EXCLUSIVE);
+
+	/*
+	 * 竞态屏障终检 + 查重(锁内):期间本表有 DML → 放弃;并发回填者
+	 * 已插同键 → 放弃。放弃时 bump 出的空间成为死数据,随段回收消失。
+	 */
+	if (pg_atomic_read_u64(&rm->inval_counter) == gen_seen &&
+		BucketLookup(bucket, expected_relid, pkey_hash,
+					 pkey_buf, pkey_len) == NULL)
+	{
+		e->relid = expected_relid;
+		BucketInsertHead(bucket, e);
+		inserted = true;
+	}
+	LWLockRelease(part);
+
+	if (inserted)
+		elog(DEBUG2, "row cache: backfilled one row of relation %u",
+			 expected_relid);
+
+out:
+	if (src_should_free && src != NULL)
+		heap_freetuple(src);
+	LWLockRelease(&rm->build_lock);
+	return inserted;
+}
 
 AttrNumber
 RelationRowCachePkeyAttno(Oid relid)
@@ -2188,4 +2529,104 @@ RelationRowCachePkeyDescriptor(Oid relid, AttrNumber *out_attnos,
 		out_attnos[i] = rm->pkey_attnos[i];
 
 	return n;
+}
+
+/* ----------------------------------------------------------------
+ * 后台洗段进程(S3,对应 OceanBase 的 wash 定时线程)
+ *
+ * 每 ROW_CACHE_WASH_INTERVAL_MS 一轮:
+ *   1. 衰减打分刷新(score = score×0.9 + recent_get_cnt);
+ *   2. 若上个周期出现过段需求(seg_demand > 0),把 score 最低的
+ *      FULL 段洗回空闲链,直至水位 max(1, n_segments/16)。
+ *
+ * "无需求不洗段"避免蚕食合法占满池子的常驻表;洗段遵循与同步淘汰
+ * 相同的锁序与 pin 排空纪律(复用 SegEvictOne)。
+ * ---------------------------------------------------------------- */
+
+static void
+RowCacheWashRound(void)
+{
+	int32		free_cnt;
+	int32		target;
+	uint32		demand;
+
+	if (RowCacheCtl == NULL)
+		return;
+
+	LWLockAcquire(&RowCacheCtl->seg_lock, LW_EXCLUSIVE);
+
+	RowCacheRefreshScoresLocked();
+
+	demand = pg_atomic_exchange_u32(&RowCacheCtl->seg_demand, 0);
+	if (demand > 0)
+	{
+		free_cnt = 0;
+		for (int32 s = RowCacheCtl->free_seg_head; s >= 0;
+			 s = RowCacheSegs[s].next_seg)
+			free_cnt++;
+
+		target = Max(1, RowCacheCtl->n_segments / 16);
+
+		while (free_cnt < target)
+		{
+			int32		sid = SegEvictOne(InvalidOid);
+
+			if (sid < 0)
+				break;			/* 没有可淘汰段(全 FREE/ACTIVE/表被锁) */
+			RowCacheSegs[sid].next_seg = RowCacheCtl->free_seg_head;
+			RowCacheCtl->free_seg_head = sid;
+			free_cnt++;
+		}
+	}
+
+	LWLockRelease(&RowCacheCtl->seg_lock);
+}
+
+void
+RowCacheWasherRegister(void)
+{
+	BackgroundWorker bgw;
+
+	if (IsBinaryUpgrade)
+		return;
+
+	memset(&bgw, 0, sizeof(bgw));
+	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS;
+	bgw.bgw_start_time = BgWorkerStart_PostmasterStart;
+	snprintf(bgw.bgw_library_name, MAXPGPATH, "postgres");
+	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "RowCacheWasherMain");
+	snprintf(bgw.bgw_name, BGW_MAXLEN, "row cache washer");
+	snprintf(bgw.bgw_type, BGW_MAXLEN, "row cache washer");
+	bgw.bgw_restart_time = 5;
+	bgw.bgw_notify_pid = 0;
+	bgw.bgw_main_arg = (Datum) 0;
+
+	RegisterBackgroundWorker(&bgw);
+}
+
+void
+RowCacheWasherMain(Datum main_arg)
+{
+	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+	pqsignal(SIGHUP, SIG_IGN);
+	BackgroundWorkerUnblockSignals();
+
+	elog(DEBUG1, "row cache washer started");
+
+	for (;;)
+	{
+		int			rc;
+
+		if (ShutdownRequestPending)
+			proc_exit(0);
+
+		RowCacheWashRound();
+
+		rc = WaitLatch(MyLatch,
+					   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+					   ROW_CACHE_WASH_INTERVAL_MS,
+					   WAIT_EVENT_ROW_CACHE_WASHER_MAIN);
+		if (rc & WL_LATCH_SET)
+			ResetLatch(MyLatch);
+	}
 }

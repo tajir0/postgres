@@ -1755,6 +1755,15 @@ typedef struct IndexScanState
 	bool		iss_PkeyAttempted;
 
 	/*
+	 * S3 按需回填状态。iss_RowCacheInvalGen:探测 miss 时(读堆之前)
+	 * 记下的该表失效代数,回填插入前在分区锁内比对,期间有 DML 即放弃
+	 * (竞态屏障,防回填复活旧版本)。iss_RowCacheBackfilled:每个扫描
+	 * 实例至多回填一次;rescan 时随 iss_PkeyAttempted 一并重置。
+	 */
+	uint64		iss_RowCacheInvalGen;
+	bool		iss_RowCacheBackfilled;
+
+	/*
 	 * 绑定的行缓存快路径。在 ExecInitIndexScan 时从扫描关系的 rd_rowcache_meta
 	 * 快照解析一次,前提是 (a) 静态形态合格(iss_RowCachePkeyShapeOk)且
 	 * (b) 缓存的 pkey attno 列表与本索引的键列逐位对应。

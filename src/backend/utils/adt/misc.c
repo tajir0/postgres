@@ -84,24 +84,33 @@ load_relation_row_cache_internal(Oid relid)
 	if (!OidIsValid(relid))
 		return false;
 
-	rel = try_table_open(relid, AccessShareLock);
+	/*
+	 * ShareLock:load 期间挡住 INSERT/UPDATE/DELETE(允许并发读)。
+	 *
+	 * 必须挡写:load 扫描拷贝某行之后、ENABLED 之前,并发 DML 的行级
+	 * 失效会因 state != ENABLED 被跳过,而该 DML 打的 xmax 不在已拷贝
+	 * 的副本上——缓存会带着"xmax 干净的旧版本"上线,后续命中判可见,
+	 * 返回过期行。挡写让整个 LOADING 窗口内表静止,窗口关闭。
+	 * (按需回填的同类微秒级窗口由 RelMeta.inval_counter 屏障处理。)
+	 */
+	rel = try_table_open(relid, ShareLock);
 	if (rel == NULL)
 		return false;
 
 	if (!RELKIND_HAS_TABLE_AM(rel->rd_rel->relkind))
 	{
-		table_close(rel, AccessShareLock);
+		table_close(rel, ShareLock);
 		return false;
 	}
 
 	if (pg_class_aclcheck(relid, GetUserId(), ACL_SELECT) != ACLCHECK_OK)
 	{
-		table_close(rel, AccessShareLock);
+		table_close(rel, ShareLock);
 		return false;
 	}
 
 	RelationRowCacheLoadRelation(rel);
-	table_close(rel, AccessShareLock);
+	table_close(rel, ShareLock);
 	return true;
 }
 

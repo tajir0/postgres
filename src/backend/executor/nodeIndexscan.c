@@ -157,6 +157,9 @@ IndexNext(IndexScanState *node)
 			}
 		}
 
+		/* 点查 miss 后的 best-effort 行缓存回填(S3)。 */
+		ExecIndexRowCacheBackfill(node, slot);
+
 		return slot;
 	}
 
