@@ -253,6 +253,61 @@ END
 EOSQL
 }
 
+# FOR UPDATE reader: locks a random row and verifies the invariant on
+# the locked (heap-rechecked) tuple.  This statistically covers the
+# probe-then-lock race the deterministic forupdate script cannot reach:
+# the cache probe returns tuple+TID, a writer updates the row before
+# LockRows acquires the lock, EPQ must surface the NEW version — whose
+# payload must still satisfy the invariant.  See also
+# relation_row_cache_forupdate.sh for the deterministic two-session
+# scenarios (real lock / EPQ / RR 40001).
+generate_reader_sql_forupdate() {
+  cat <<EOSQL
+SET client_min_messages = warning;
+SET search_path = row_cache_correctness, public;
+SET jit = off;
+-- PG 14+: backend periodically checks if the client TCP socket is still
+-- alive.  Without this, a SIGKILL'd psql leaves the backend stuck in the
+-- DO loop until pg_terminate_backend is called manually.
+SET client_connection_check_interval = '5s';
+SET lock_timeout = '500ms';
+SET deadlock_timeout = '50ms';
+
+DO \$\$
+DECLARE
+    i   int;
+    pk  int;
+    v   int;
+    p   text;
+BEGIN
+    FOR i IN 1..1000000000 LOOP
+        pk := 1 + (random() * ${SINGLEPK_ROWS})::int;
+        IF pk > ${SINGLEPK_ROWS} THEN pk := ${SINGLEPK_ROWS}; END IF;
+        BEGIN
+            v := NULL; p := NULL;
+            SELECT version, payload INTO v, p
+              FROM singlepk_tbl
+             WHERE id = pk
+               FOR UPDATE;
+            IF v IS NOT NULL AND p <> 'v' || v THEN
+                RAISE EXCEPTION 'forupdate reader: invariant violated at id=% (payload=%, version=%)',
+                    pk, p, v;
+            END IF;
+        EXCEPTION
+            WHEN deadlock_detected OR lock_not_available
+              OR serialization_failure OR object_not_in_prerequisite_state THEN
+                NULL;  -- expected OLTP noise under concurrent writers
+        END;
+        -- Release the row lock promptly so writers keep flowing.  COMMIT
+        -- must sit OUTSIDE the BEGIN/EXCEPTION sub-block (plpgsql cannot
+        -- commit while a subtransaction is active).
+        COMMIT;
+    END LOOP;
+END
+\$\$;
+EOSQL
+}
+
 # Writer: alternates UPDATE / DELETE+INSERT on a random row of each
 # table.  Each operation atomically maintains the invariant.
 #
@@ -484,6 +539,11 @@ for ((r=1; r<=READERS; r++)); do
   generate_reader_sql_composite >"$sql"
   start_worker "reader_composite" "$r" "$sql"
 done
+
+# FOR UPDATE reader (always exactly 1): covers probe-then-lock EPQ races
+sql="$OUT_DIR/reader_forupdate_1.sql"
+generate_reader_sql_forupdate >"$sql"
+start_worker "reader_forupdate" "1" "$sql"
 
 # Writer workers
 for ((w=1; w<=WRITERS; w++)); do
