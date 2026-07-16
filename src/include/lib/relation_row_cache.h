@@ -12,12 +12,26 @@
 
 /*
  * GUC:行缓存哈希桶数(PGC_POSTMASTER,改需重启,必须是 2 的幂)。
- * 桶头数组首次用缓存时在 DSA 里一次性分配;实际生效值固化进 RowCacheControl。
+ * S1 起桶头数组在启动时随共享内存一并分配;实际生效值固化进 RowCacheControl。
  */
 #define ROW_CACHE_DEFAULT_HASH_BUCKETS	(1 << 23)	/* 8,388,608 */
 #define ROW_CACHE_MIN_HASH_BUCKETS		(1 << 10)	/* 1,024 */
 #define ROW_CACHE_MAX_HASH_BUCKETS		(1 << 24)	/* 134,217,728 */
 extern PGDLLIMPORT int row_cache_hash_buckets;
+
+/*
+ * GUC:行缓存数据池总大小(MB,PGC_POSTMASTER)。
+ *
+ * S1 内存模型:启动时在传统共享内存里一次性划出固定大小的段池
+ * (row_cache_size / 1MB 个段),运行期零动态分配——写入是段内 bump
+ * 指针推进,回收以整段为单位。"池满"不是失败,走整段淘汰(FIFO,
+ * LRU 近似)腾地方;彻底腾不出(池全被当前加载中的表占用)时 load
+ * 报错回滚,绝不阻塞等内存。
+ */
+#define ROW_CACHE_DEFAULT_SIZE_MB	64
+#define ROW_CACHE_MIN_SIZE_MB		16
+#define ROW_CACHE_MAX_SIZE_MB		(256 * 1024)	/* 256GB */
+extern PGDLLIMPORT int row_cache_size_mb;
 
 /* 共享内存大小与初始化(由 ipci.c 调用)。 */
 extern Size RowCacheShmemSize(void);

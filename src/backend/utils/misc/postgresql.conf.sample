@@ -137,6 +137,8 @@
 					# (change requires restart)
 #row_cache_hash_buckets = 8388608	# min 1024, must be a power of two
 					# (change requires restart)
+#row_cache_size = 64MB			# fixed segment pool for the row cache,
+					# min 16MB (change requires restart)
 #temp_buffers = 8MB			# min 800kB
 #max_prepared_transactions = 0		# zero disables the feature
 					# (change requires restart)

@@ -2398,6 +2398,18 @@ struct config_int ConfigureNamesInt[] =
 	},
 
 	{
+		{"row_cache_size", PGC_POSTMASTER, RESOURCES_MEM,
+			gettext_noop("Sets the size of the shared row cache data pool."),
+			gettext_noop("The pool is carved into fixed 1MB segments at server start; "
+						 "rows are bump-allocated into segments and reclaimed segment-wise."),
+			GUC_UNIT_MB
+		},
+		&row_cache_size_mb,
+		ROW_CACHE_DEFAULT_SIZE_MB, ROW_CACHE_MIN_SIZE_MB, ROW_CACHE_MAX_SIZE_MB,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"vacuum_buffer_usage_limit", PGC_USERSET, RESOURCES_MEM,
 			gettext_noop("Sets the buffer pool size for VACUUM, ANALYZE, and autovacuum."),
 			NULL,

@@ -3,32 +3,41 @@
  * relation_row_cache.c
  *	  行缓存:分区锁保护的全局哈希 (relid, pkey) -> 扁平化 tuple。
  *
- * 架构:
+ * 架构(S1:段式固定池,借鉴 OceanBase KVCache 的内存组织):
  *
- *   GlobalCache:一张 DSA 常驻、按 (relid, pkey) 键控的链地址哈希表。
- *                桶头存在一个扁平的 dsa_pointer[n_hash_buckets]
- *                数组里((1<<23) = 8M 个桶)。每个链元素是一个 GlobalEntry,
- *                持有 pkey、hash、载荷指针和 next_dp 链。
+ *   内存模型:启动时在传统共享内存里一次性划出
+ *     [RowCacheControl][桶头数组][段描述符数组][数据池(N × 1MB 段)]
+ *   运行期零动态分配:行(GlobalEntry + 内联 FlatCachedTuple)在段内
+ *   bump-pointer 追加分配;段内永不删除单条,回收只以整段为单位。
+ *   传统 shmem 在所有 backend 映射到相同地址,桶链直接用真实指针。
+ *
+ *   GlobalCache:按 (relid, pkey) 键控的链地址哈希表。桶头数组
+ *                GlobalEntry*[n_hash_buckets],链元素是 GlobalEntry。
+ *
+ *   段(RowCacheSegment):1MB,归属单一 relation。RelMeta 持有本表段链
+ *   (first_seg,受 build_lock 保护);空闲段挂全局 free 链(受 seg_lock
+ *   保护)。池满时按 alloc_seq FIFO 淘汰别的表的最老 FULL 段(LRU 近似,
+ *   S3 换衰减打分);淘汰对 victim 表只造成部分行 miss(回退原生路径,
+ *   正确性无损)。彻底腾不出时 load 报错回滚——任何路径不等内存。
  *
  *   RelMeta[64]:固定 shmem 数组,保存 per-relation 元数据(DISABLED/
- *                LOADING/ENABLED 状态、pkey 描述符、build_lock)。没有
- *                rel_gen 字段;DDL 失效直接在 build_lock 下把 state 置为
- *                DISABLED。
+ *                LOADING/ENABLED 状态、pkey 描述符、build_lock、段链)。
  *
- *   并发模型:
+ *   并发模型(锁序:build_lock → seg_lock → 分区锁):
  *     - 128 个 LWLock 分区,每组桶一个。
- *     - 读路径:在桶的分区锁上取 LW_SHARED,走链,拷贝载荷,释放。同一
- *       分区上任意键的并发读者完全并行(SHARED 不阻塞 SHARED)。
- *     - 写路径(Load / Drop / DML 失效):在桶的分区锁上取 LW_EXCLUSIVE,
- *       摘链,同步 dsa_free 载荷与 entry,释放。EX 会等所有在途 SHARED
- *       读者排空,所以 dsa_free 安全。
- *     - Load / Drop 通过 per-RelMeta 的 build_lock(LWLock,非分区锁)
- *       彼此串行化。
+ *     - 读路径:在桶的分区锁上取 LW_SHARED,走链,拷贝载荷到 slot,释放。
+ *     - DML 失效:分区锁 EXCLUSIVE 下摘链;载荷留在段内成死数据,等整段
+ *       回收(不再逐条释放)。
+ *     - Load / Drop 通过 per-RelMeta 的 build_lock 彼此串行化;段的
+ *       分配/归还/淘汰选段由全局 seg_lock 串行化。
+ *     - 淘汰者持 seg_lock 后对 victim 表用 ConditionalAcquire(build_lock),
+ *       拿不到就换下一个候选——与"build_lock → seg_lock"的正向锁序
+ *       不构成死锁。正在 LOADING 的表 build_lock 被持有,其 ACTIVE 段
+ *       因此永远不会被淘汰。
  *
  *   Todo:
- *     - INSERT 钩子(对新行没有 LRU/填充策略)
- *     - LRU 驱逐
- *     
+ *     - S2:seq_num 惰性失效 + pin 化读路径
+ *     - S3:衰减 LFU 打分 + 后台洗段 + 点查 miss 按需回填
  *
  *   Pkey 限制:1..ROW_CACHE_PKEY_MAX_ATTS 个传值列。pkey 为传引用的表在
  *   Load 时被静默跳过(不报错,不建任何 entry)。
@@ -86,8 +95,8 @@
  *   更小的负载会浪费一些桶头内存,但没有时间代价。
  *
  *   桶头数组占用:
- *     8M * sizeof(dsa_pointer) = 8M * 8 B = 预留 64 MB DSA。
- *   它在首次 Load 时于 DSA 内惰性分配;从不碰缓存的 backend 不付任何成本。
+ *     8M * sizeof(GlobalEntry *) = 8M * 8 B = 64 MB 传统共享内存。
+ *   S1 起它在启动时随段池一并划出(固定池全预分配)。
  *
  *   桶数现为 PGC_POSTMASTER 的 GUC row_cache_hash_buckets(改需重启,默认仍
  *   8M,必须是 2 的幂);运维可按工作集大小调整。
@@ -101,6 +110,9 @@
  * 所以 `hash & bucket_mask` 仍是干净的低位掩码。
  */
 int			row_cache_hash_buckets = ROW_CACHE_DEFAULT_HASH_BUCKETS;
+
+/* 数据池大小(MB)。段数 = row_cache_size_mb(段固定 1MB)。 */
+int			row_cache_size_mb = ROW_CACHE_DEFAULT_SIZE_MB;
 
 /* RelMeta.state 取值。 */
 #define RELMETA_DISABLED	0
@@ -158,6 +170,14 @@ typedef struct RelMeta
 	int16			pkey_typlens[ROW_CACHE_PKEY_MAX_ATTS];
 	bool			pkey_byvals[ROW_CACHE_PKEY_MAX_ATTS];
 	int				pkey_total_len;	/* pkey_typlens 之和, <= ROW_CACHE_PKEY_INLINE_BYTES */
+
+	/*
+	 * 本关系持有的段链(seg id,经 RowCacheSegment.next_seg 串联)。
+	 * 受 build_lock 保护:loader 自己持有;淘汰者要动别人的链必须
+	 * ConditionalAcquire 对方的 build_lock。
+	 */
+	int32			first_seg;		/* 段链头;-1 = 无 */
+	int32			cur_seg;		/* 当前写入段(仅 LOADING 期间);-1 = 无 */
 } RelMeta;
 
 typedef struct GlobalEntry
@@ -167,9 +187,35 @@ typedef struct GlobalEntry
 	uint8			pkey_len;		/* 序列化长度, <= ROW_CACHE_PKEY_INLINE_BYTES */
 	uint8			pkey_buf[ROW_CACHE_PKEY_INLINE_BYTES];
 	ItemPointerData	tid;			/* Load 时的 heap TID(填 slot 用) */
-	dsa_pointer		payload_dp;		/* FlatCachedTuple(永远是块内内部指针) */
-	dsa_pointer		next_dp;		/* 桶链上的下一个 GlobalEntry */
+	uint32			span;			/* 本条目在段内占用的总字节数(含内联 flat) */
+	struct GlobalEntry *next;		/* 桶链上的下一个 GlobalEntry(真实指针) */
+	/* FlatCachedTuple 载荷内联紧随其后(MAXALIGN 对齐),见 ENTRY_FLAT */
 } GlobalEntry;
+
+/*
+ * 段大小:固定 1MB。足够容纳千列宽行(超过段容量的单行在 load 时跳过,
+ * 读路径 miss 回退原生,正确性无损),又保持淘汰粒度精细。
+ */
+#define ROW_CACHE_SEGMENT_SIZE	((uint32) (1024 * 1024))
+
+/* RowCacheSegment.state 取值。 */
+#define RC_SEG_FREE		0		/* 在全局空闲链上 */
+#define RC_SEG_ACTIVE	1		/* 某关系的当前写入段(仅其 LOADING 期间) */
+#define RC_SEG_FULL		2		/* 已封存,可被整段淘汰 */
+
+/*
+ * 段描述符(池外定长数组)。字段无原子:分配/封存由持 build_lock 的
+ * loader 单写;归还/淘汰在 seg_lock(+victim build_lock)下串行。
+ */
+typedef struct RowCacheSegment
+{
+	Oid			relid;			/* 归属关系;InvalidOid = 空闲 */
+	uint32		state;			/* RC_SEG_* */
+	uint32		used;			/* 段内 bump 指针(字节) */
+	uint32		n_entries;		/* 段内条目数(含已被 DML 摘链的死条目) */
+	uint64		alloc_seq;		/* 全局分配序号;FIFO 淘汰(LRU 近似)依据 */
+	int32		next_seg;		/* 本表段链 / 空闲链的下一段;-1 = 无 */
+} RowCacheSegment;
 
 /*
  * 全局代数计数器
@@ -184,17 +230,11 @@ typedef union RowCacheGenPadded
 } RowCacheGenPadded;
 
 /*
- * RowCacheControl:顶层 shmem 段。
+ * RowCacheControl:顶层 shmem 段。桶头数组、段描述符数组、数据池紧随
+ * 本结构之后,在同一次 ShmemInitStruct 里划出(见 RowCacheShmemInit)。
  */
 typedef struct RowCacheControl
 {
-	dsa_handle		global_dsa_handle;
-
-	/*
-	 * 桶头数组(长度 n_hash_buckets)。
-	 */
-	dsa_pointer		hash_buckets_dp;
-
 	/*
 	 * 桶数与掩码:由 GUC row_cache_hash_buckets 决定,在 RowCacheShmemInit
 	 * 设一次、之后只读。bucket_mask = n_hash_buckets - 1(必为 2 的幂)。
@@ -202,9 +242,14 @@ typedef struct RowCacheControl
 	int				n_hash_buckets;
 	uint32			bucket_mask;
 
+	/* 段池:段数在启动时由 row_cache_size 固化,之后只读。 */
+	int32			n_segments;
+	int32			free_seg_head;		/* 全局空闲段链头;-1 = 空 */
+	uint64			seg_alloc_counter;	/* 单调递增,发放 alloc_seq */
+
 	RowCacheGenPadded global_gen pg_attribute_aligned(PG_CACHE_LINE_SIZE);
 
-	LWLock			control_lock;			/* 保护 DSA 初始化 */
+	LWLock			seg_lock;				/* 保护空闲链/段归属/淘汰选段 */
 	LWLock			relmeta_alloc_lock;		/* 保护 RelMeta 槽分配 */
 	LWLock			partition_locks[ROW_CACHE_NUM_PARTITIONS];
 
@@ -216,8 +261,8 @@ typedef struct RowCacheControl
  * FlatCachedTuple: 单次分配、扁平存储的缓存 tuple。
  *
  * 把每行的全部数据(values[]、isnull[]、HeapTupleHeader、以及按引用传递的
- * Datum 载荷)打包进一块由 dsa_allocate 分配的连续内存。取代了此前的
- * TidRowCacheEntry——后者把数据散在三次独立 palloc 里。
+ * Datum 载荷)打包进一块连续内存——S1 起直接在段内 bump 出的空间上
+ * 原地构建(GlobalEntry 之后内联),运行期零动态分配。
  *
  * 固定头之后的内存布局:
  *   Datum   values[natts]       -- 起于 MAXALIGN(sizeof(FlatCachedTuple))
@@ -240,30 +285,36 @@ typedef struct FlatCachedTuple
 #define FLAT_TUPLE_HTUP_DATA(ft) \
 	((char *)(ft) + (ft)->htup_offset)
 
-static dsa_pointer RowCacheFlattenTuple(dsa_area *area, TupleTableSlot *slot);
+/* GlobalEntry 之后内联的 FlatCachedTuple。 */
+#define ENTRY_FLAT(e) \
+	((FlatCachedTuple *) ((char *) (e) + MAXALIGN(sizeof(GlobalEntry))))
+
+static Size FlatTupleComputeSize(TupleTableSlot *slot, HeapTuple htup,
+								 uint32 *htup_offset_out,
+								 uint32 *varlen_offset_out);
+static void FlatTupleFillInto(FlatCachedTuple *ft, Size total_size,
+							  uint32 htup_offset, uint32 varlen_offset,
+							  TupleTableSlot *slot, HeapTuple htup);
 static bool RowCacheUnflattenToSlot(const FlatCachedTuple *flat,
 									Oid relid,
 									ItemPointer tid,
 									TupleTableSlot *slot);
 
-static RowCacheControl *RowCacheCtl = NULL;
-static dsa_area *LocalDsa = NULL;
-
 /*
- * 桶头数组的进程局部地址的 backend 本地缓存。
- *
- * 桶头数组(dsa_pointer[n_hash_buckets])在 shmem 初始化时分配一次，
- * dsa_get_address 在本 backend 的 DSA 附着生命周期内返回稳定地址。解析
- * 一次后复用,省掉每次缓存探测的一次 dsa_get_address(段映射查找 + 加法)。
- * 在 EnsureRowCacheDsa 里每次(重新)设置 LocalDsa 时把它重置为 NULL。
+ * 共享内存各区域的进程本地基址。传统 shmem 在所有 backend 映射到相同
+ * 地址,四个指针在 RowCacheShmemInit 里(创建者与 attach 者一致地)按
+ * 偏移算出;此后进程内只读。
  */
-static dsa_pointer *LocalBucketHeads = NULL;
+static RowCacheControl *RowCacheCtl = NULL;
+static GlobalEntry **RowCacheBuckets = NULL;	/* 长度 n_hash_buckets */
+static RowCacheSegment *RowCacheSegs = NULL;	/* 长度 n_segments */
+static char *RowCachePool = NULL;				/* n_segments × 1MB */
 
 static Oid			LastLookupRelid = InvalidOid;
 static RelMeta	   *LastLookupRelMeta = NULL;
 
-/* rowcache_relcache_callback 需要的前向声明。 */
-static void EnsureRowCacheDsa(void);
+/* 前向声明。 */
+static void RowCacheEnsureBackendInit(void);
 static RelMeta *FindRelMeta(Oid relid);
 
 static bool	RowCacheRelcacheCallbackRegistered = false;
@@ -285,20 +336,15 @@ RowCacheRegisterRelcacheCallback(void)
 static void
 rowcache_relcache_callback(Datum arg, Oid relid)
 {
-	RelMeta	   *rm;
-
 	if (RowCacheCtl == NULL)
 		return;
-	if (!OidIsValid(relid))
-		return;					
 
-	// rm = FindRelMeta(relid);
-	// if (rm == NULL)
-	// 	return;
-
-	// pg_atomic_write_u32(&rm->state, RELMETA_DISABLED);
-
-	if (LastLookupRelid == relid)
+	/*
+	 * relid == InvalidOid 表示 sinval 队列溢出(全量失效):清掉整个
+	 * 本地查找缓存。具体某表失效则只清对应项。真正的"要不要 DISABLED"
+	 * 裁决留给 S2 的 schema 指纹复核;这里只保证本地指针不悬空。
+	 */
+	if (!OidIsValid(relid) || LastLookupRelid == relid)
 	{
 		LastLookupRelid = InvalidOid;
 		LastLookupRelMeta = NULL;
@@ -316,7 +362,9 @@ static int SerializePkeyFromDatum(Datum d, RelMeta *rm, uint8 *out_buf);
 static int SerializePkeyFromDatumArray(const Datum *vals, int nvals,
 									   RelMeta *rm, uint8 *out_buf);
 static inline uint32 ComputePkeyHashBytes(const uint8 *buf, int len);
-static void DropAllEntriesForRelid(Oid relid);
+static void SegUnlinkEntries(int32 sid);
+static void ReleaseAllSegmentsForRel(RelMeta *rm);
+static GlobalEntry *SegAllocEntry(RelMeta *rm, Size need);
 
 /* ----------------------------------------------------------------
  * 共享内存大小与初始化
@@ -335,32 +383,67 @@ check_row_cache_hash_buckets(int *newval, void **extra, GucSource source)
 	return true;
 }
 
+/* 段数:池大小(MB)/ 段大小(1MB)。 */
+static inline int32
+RowCacheNSegments(void)
+{
+	return (int32) (((Size) row_cache_size_mb * 1024 * 1024) /
+					ROW_CACHE_SEGMENT_SIZE);
+}
+
 Size
 RowCacheShmemSize(void)
 {
-	return MAXALIGN(sizeof(RowCacheControl));
+	Size		sz = MAXALIGN(sizeof(RowCacheControl));
+	Size		nsegs = (Size) RowCacheNSegments();
+
+	/* 桶头数组 */
+	sz = add_size(sz, MAXALIGN(sizeof(GlobalEntry *) *
+							   (Size) row_cache_hash_buckets));
+	/* 段描述符数组 */
+	sz = add_size(sz, MAXALIGN(sizeof(RowCacheSegment) * nsegs));
+	/* 数据池(前置缓存行对齐余量) */
+	sz = add_size(sz, PG_CACHE_LINE_SIZE);
+	sz = add_size(sz, mul_size(nsegs, ROW_CACHE_SEGMENT_SIZE));
+
+	return sz;
 }
 
 void
 RowCacheShmemInit(void)
 {
 	bool		found;
+	char	   *base;
+	Size		off;
+	int32		nsegs = RowCacheNSegments();
 
-	RowCacheCtl = (RowCacheControl *)
-		ShmemInitStruct("Row Cache Control V4",
-						sizeof(RowCacheControl),
-						&found);
+	base = (char *) ShmemInitStruct("Row Cache Control V5",
+									RowCacheShmemSize(),
+									&found);
+
+	/*
+	 * 各区域基址对创建者与 attach 者(EXEC_BACKEND)都要设置;传统 shmem
+	 * 映射地址一致,直接按偏移切分。
+	 */
+	RowCacheCtl = (RowCacheControl *) base;
+	off = MAXALIGN(sizeof(RowCacheControl));
+	RowCacheBuckets = (GlobalEntry **) (base + off);
+	off += MAXALIGN(sizeof(GlobalEntry *) * (Size) row_cache_hash_buckets);
+	RowCacheSegs = (RowCacheSegment *) (base + off);
+	off += MAXALIGN(sizeof(RowCacheSegment) * (Size) nsegs);
+	off = TYPEALIGN(PG_CACHE_LINE_SIZE, off);
+	RowCachePool = base + off;
 
 	if (found)
 		return;
 
-	RowCacheCtl->global_dsa_handle = DSA_HANDLE_INVALID;
-	RowCacheCtl->hash_buckets_dp = InvalidDsaPointer;
 	RowCacheCtl->n_hash_buckets = row_cache_hash_buckets;
 	RowCacheCtl->bucket_mask = (uint32) row_cache_hash_buckets - 1;
+	RowCacheCtl->n_segments = nsegs;
+	RowCacheCtl->seg_alloc_counter = 0;
 	pg_atomic_init_u32(&RowCacheCtl->global_gen.value, 0);
 
-	LWLockInitialize(&RowCacheCtl->control_lock, LWTRANCHE_ROW_CACHE_CTL);
+	LWLockInitialize(&RowCacheCtl->seg_lock, LWTRANCHE_ROW_CACHE_CTL);
 	LWLockInitialize(&RowCacheCtl->relmeta_alloc_lock,
 					 LWTRANCHE_ROW_CACHE_RELMETA);
 
@@ -377,69 +460,37 @@ RowCacheShmemInit(void)
 		LWLockInitialize(&rm->build_lock, LWTRANCHE_ROW_CACHE_RELMETA);
 		rm->n_pkey_attrs = 0;
 		rm->pkey_total_len = 0;
+		rm->first_seg = -1;
+		rm->cur_seg = -1;
 	}
+
+	/* 桶头全空。 */
+	memset(RowCacheBuckets, 0,
+		   sizeof(GlobalEntry *) * (Size) row_cache_hash_buckets);
+
+	/* 所有段串成空闲链。 */
+	for (int32 s = 0; s < nsegs; s++)
+	{
+		RowCacheSegment *seg = &RowCacheSegs[s];
+
+		seg->relid = InvalidOid;
+		seg->state = RC_SEG_FREE;
+		seg->used = 0;
+		seg->n_entries = 0;
+		seg->alloc_seq = 0;
+		seg->next_seg = (s + 1 < nsegs) ? (s + 1) : -1;
+	}
+	RowCacheCtl->free_seg_head = (nsegs > 0) ? 0 : -1;
 }
 
 /* ----------------------------------------------------------------
- * DSA 惰性初始化。桶头数组在任何 backend 首次碰缓存时、在 control_lock
- * 下于 DSA 里分配。
+ * backend 一次性初始化:注册 relcache 失效回调。
+ * S1 之后不再有 DSA,共享内存基址在 RowCacheShmemInit 时已设好。
  * ---------------------------------------------------------------- */
 
 static void
-EnsureRowCacheDsa(void)
+RowCacheEnsureBackendInit(void)
 {
-	MemoryContext old_ctx;
-
-	if (LocalDsa != NULL)
-		return;
-
-	old_ctx = MemoryContextSwitchTo(TopMemoryContext);
-
-	LWLockAcquire(&RowCacheCtl->control_lock, LW_EXCLUSIVE);
-
-	if (RowCacheCtl->global_dsa_handle == DSA_HANDLE_INVALID)
-	{
-		dsa_area   *dsa = dsa_create(LWTRANCHE_ROW_CACHE_DSA);
-		dsa_pointer dp;
-		dsa_pointer *buckets;
-
-		dsa_pin(dsa);
-		dsa_pin_mapping(dsa);
-
-		dp = dsa_allocate0(dsa,
-						   sizeof(dsa_pointer) * RowCacheCtl->n_hash_buckets);
-		if (!DsaPointerIsValid(dp))
-		{
-			LWLockRelease(&RowCacheCtl->control_lock);
-			MemoryContextSwitchTo(old_ctx);
-			ereport(ERROR,
-					(errcode(ERRCODE_OUT_OF_MEMORY),
-					 errmsg("out of memory"),
-					 errdetail_internal("row cache: cannot allocate hash buckets")));
-		}
-		buckets = (dsa_pointer *) dsa_get_address(dsa, dp);
-		for (int i = 0; i < RowCacheCtl->n_hash_buckets; i++)
-			buckets[i] = InvalidDsaPointer;
-
-		RowCacheCtl->global_dsa_handle = dsa_get_handle(dsa);
-		RowCacheCtl->hash_buckets_dp = dp;
-		LocalDsa = dsa;
-		LocalBucketHeads = NULL;	
-	}
-	else
-	{
-		LocalDsa = dsa_attach(RowCacheCtl->global_dsa_handle);
-		dsa_pin_mapping(LocalDsa);
-		LocalBucketHeads = NULL;	
-	}
-
-	LWLockRelease(&RowCacheCtl->control_lock);
-
-	MemoryContextSwitchTo(old_ctx);
-
-	/*
-	 * relcache 失效回调,使本 backend 能观察到对缓存关系的 DDL。
-	 */
 	RowCacheRegisterRelcacheCallback();
 }
 
@@ -496,6 +547,8 @@ AllocateOrFindRelMeta(Oid relid)
 			pg_atomic_write_u32(&cand->state, RELMETA_DISABLED);
 			cand->n_pkey_attrs = 0;
 			cand->pkey_total_len = 0;
+			cand->first_seg = -1;
+			cand->cur_seg = -1;
 			rm = cand;
 			break;
 		}
@@ -703,15 +756,11 @@ PartitionLockForBucket(uint32 bucket)
 	return &RowCacheCtl->partition_locks[bucket % ROW_CACHE_NUM_PARTITIONS];
 }
 
-static inline dsa_pointer *
-BucketHeads(void)
+/* 段 payload 基址。 */
+static inline char *
+SegBase(int32 sid)
 {
-	if (likely(LocalBucketHeads != NULL))
-		return LocalBucketHeads;
-
-	LocalBucketHeads = (dsa_pointer *) dsa_get_address(LocalDsa,
-												   RowCacheCtl->hash_buckets_dp);
-	return LocalBucketHeads;
+	return RowCachePool + (Size) sid * ROW_CACHE_SEGMENT_SIZE;
 }
 
 /* ----------------------------------------------------------------
@@ -759,13 +808,11 @@ RowCacheTupleVisibleMVCC(HeapTuple tuple, Snapshot snapshot)
  * 调用方必须持有该桶的分区锁 EXCLUSIVE。
  */
 static void
-BucketInsertHead(uint32 bucket, dsa_pointer entry_dp, GlobalEntry *entry)
+BucketInsertHead(uint32 bucket, GlobalEntry *entry)
 {
-	dsa_pointer *heads = BucketHeads();
-
-	entry->next_dp = heads[bucket];
+	entry->next = RowCacheBuckets[bucket];
 	pg_write_barrier();
-	heads[bucket] = entry_dp;
+	RowCacheBuckets[bucket] = entry;
 }
 
 /*
@@ -779,115 +826,418 @@ BucketInsertHead(uint32 bucket, dsa_pointer entry_dp, GlobalEntry *entry)
  */
 static GlobalEntry *
 BucketLookup(uint32 bucket, Oid relid, uint32 pkey_hash,
-			 const uint8 *pkey_buf, int pkey_len,
-			 dsa_pointer *out_entry_dp)
+			 const uint8 *pkey_buf, int pkey_len)
 {
-	dsa_pointer *heads = BucketHeads();
-	dsa_pointer cur_dp = heads[bucket];
+	GlobalEntry *e;
 
-	while (DsaPointerIsValid(cur_dp))
+	for (e = RowCacheBuckets[bucket]; e != NULL; e = e->next)
 	{
-		GlobalEntry *e = (GlobalEntry *) dsa_get_address(LocalDsa, cur_dp);
-
 		if (e->relid == relid &&
 			e->pkey_hash == pkey_hash &&
 			e->pkey_len == pkey_len &&
 			memcmp(e->pkey_buf, pkey_buf, pkey_len) == 0)
-		{
-			if (out_entry_dp)
-				*out_entry_dp = cur_dp;
 			return e;
-		}
-		cur_dp = e->next_dp;
 	}
 	return NULL;
+}
+
+/* ----------------------------------------------------------------
+ * 段分配 / 回收 / 淘汰
+ *
+ * 锁序:build_lock → seg_lock → 分区锁。淘汰者反向需要 victim 的
+ * build_lock 时只用 ConditionalAcquire,失败换候选,不构成死锁。
+ * ---------------------------------------------------------------- */
+
+/*
+ * 把段 sid 里所有仍挂在哈希桶链上的 entry 摘掉。按 entry 地址匹配,
+ * 幂等:已被 DML 失效摘掉的、或分配后从未插链的条目自然找不到,跳过。
+ * 调用方保证没有并发写者会往该段追加(持有属主 build_lock,或段属主
+ * 已不存在)。
+ */
+static void
+SegUnlinkEntries(int32 sid)
+{
+	RowCacheSegment *seg = &RowCacheSegs[sid];
+	char	   *base = SegBase(sid);
+	uint32		off = 0;
+
+	while (off < seg->used)
+	{
+		GlobalEntry *e = (GlobalEntry *) (base + off);
+		uint32		bucket;
+		LWLock	   *part;
+		GlobalEntry *cur;
+		GlobalEntry *prev;
+
+		/* span 在 bump 时立即写入;为 0 说明段元数据损坏,防御退出。 */
+		if (e->span == 0)
+		{
+			elog(WARNING, "row cache: corrupted segment %d at offset %u",
+				 sid, off);
+			break;
+		}
+
+		bucket = e->pkey_hash & RowCacheCtl->bucket_mask;
+		part = PartitionLockForBucket(bucket);
+
+		LWLockAcquire(part, LW_EXCLUSIVE);
+		prev = NULL;
+		for (cur = RowCacheBuckets[bucket]; cur != NULL; cur = cur->next)
+		{
+			if (cur == e)
+			{
+				if (prev != NULL)
+					prev->next = e->next;
+				else
+					RowCacheBuckets[bucket] = e->next;
+				break;
+			}
+			prev = cur;
+		}
+		LWLockRelease(part);
+
+		off += e->span;
+	}
+}
+
+/*
+ * 释放 rm 段链上的全部段:摘净桶链引用后整链归还空闲链。
+ * 调用方持有 rm->build_lock。幂等(中途被中断后重跑安全)。
+ */
+static void
+ReleaseAllSegmentsForRel(RelMeta *rm)
+{
+	int32		sid;
+
+	for (sid = rm->first_seg; sid >= 0; sid = RowCacheSegs[sid].next_seg)
+	{
+		CHECK_FOR_INTERRUPTS();
+		SegUnlinkEntries(sid);
+	}
+
+	LWLockAcquire(&RowCacheCtl->seg_lock, LW_EXCLUSIVE);
+	sid = rm->first_seg;
+	while (sid >= 0)
+	{
+		RowCacheSegment *seg = &RowCacheSegs[sid];
+		int32		next = seg->next_seg;
+
+		seg->relid = InvalidOid;
+		seg->state = RC_SEG_FREE;
+		seg->used = 0;
+		seg->n_entries = 0;
+		seg->next_seg = RowCacheCtl->free_seg_head;
+		RowCacheCtl->free_seg_head = sid;
+		sid = next;
+	}
+	rm->first_seg = -1;
+	rm->cur_seg = -1;
+	LWLockRelease(&RowCacheCtl->seg_lock);
+}
+
+/*
+ * 弹出一个可用段:优先空闲链;空了就按 alloc_seq FIFO(LRU 近似)淘汰
+ * 一个不属于 loading_relid 的 FULL 段。调用方持 seg_lock EXCLUSIVE。
+ * 返回段号,彻底拿不到返回 -1(调用方报错回滚,绝不等待)。
+ */
+static int32
+SegPopOrEvict(Oid loading_relid)
+{
+	/* 1) 空闲链 */
+	if (RowCacheCtl->free_seg_head >= 0)
+	{
+		int32		sid = RowCacheCtl->free_seg_head;
+
+		RowCacheCtl->free_seg_head = RowCacheSegs[sid].next_seg;
+		RowCacheSegs[sid].next_seg = -1;
+		return sid;
+	}
+
+	/*
+	 * 2) 淘汰:反复挑 alloc_seq 最小的合格 FULL 段,直到某个 victim 的
+	 * build_lock 能拿到。拿不到锁的表(正在 load/drop)跳过。
+	 */
+	for (;;)
+	{
+		int32		victim = -1;
+		uint64		victim_seq = 0;
+		RowCacheSegment *vseg;
+		RelMeta    *vrm;
+		int32	   *linkp;
+		int32		cur;
+
+		for (int32 s = 0; s < RowCacheCtl->n_segments; s++)
+		{
+			RowCacheSegment *seg = &RowCacheSegs[s];
+
+			if (seg->state != RC_SEG_FULL)
+				continue;
+			if (seg->relid == loading_relid)
+				continue;
+			if (victim < 0 || seg->alloc_seq < victim_seq)
+			{
+				victim = s;
+				victim_seq = seg->alloc_seq;
+			}
+		}
+		if (victim < 0)
+			return -1;			/* 池全被本表(或加载中的表)占用 */
+
+		vseg = &RowCacheSegs[victim];
+		vrm = FindRelMeta(vseg->relid);
+		if (vrm == NULL || vrm->relid != vseg->relid)
+		{
+			/* 不应发生:有主的段必有 RelMeta。防御:直接回收。 */
+			elog(WARNING, "row cache: segment %d owned by relation %u without metadata",
+				 victim, vseg->relid);
+			SegUnlinkEntries(victim);
+			vseg->relid = InvalidOid;
+			vseg->state = RC_SEG_FREE;
+			vseg->used = 0;
+			vseg->n_entries = 0;
+			vseg->next_seg = -1;
+			return victim;
+		}
+
+		if (!LWLockConditionalAcquire(&vrm->build_lock, LW_EXCLUSIVE))
+		{
+			/*
+			 * victim 表正在 load/drop,跳过它:把该表的段全部临时排除
+			 * 太复杂,简单起见本轮直接放弃淘汰这张表——把它的最老段
+			 * 从候选里排除的办法是换一张表。为避免死循环,这里改为
+			 * 线性扫描下一个次老候选:重扫时跳过该 relid。
+			 */
+			Oid			busy_relid = vseg->relid;
+			int32		alt = -1;
+			uint64		alt_seq = 0;
+
+			for (int32 s = 0; s < RowCacheCtl->n_segments; s++)
+			{
+				RowCacheSegment *seg = &RowCacheSegs[s];
+
+				if (seg->state != RC_SEG_FULL)
+					continue;
+				if (seg->relid == loading_relid || seg->relid == busy_relid)
+					continue;
+				if (alt < 0 || seg->alloc_seq < alt_seq)
+				{
+					alt = s;
+					alt_seq = seg->alloc_seq;
+				}
+			}
+			if (alt < 0)
+				return -1;
+
+			vseg = &RowCacheSegs[alt];
+			vrm = FindRelMeta(vseg->relid);
+			if (vrm == NULL || vrm->relid != vseg->relid ||
+				!LWLockConditionalAcquire(&vrm->build_lock, LW_EXCLUSIVE))
+				return -1;		/* 两次都不顺利:放弃,让 load 失败 */
+			victim = alt;
+		}
+
+		/* 持有 victim 的 build_lock:摘桶链引用 + 从其段链摘除。 */
+		SegUnlinkEntries(victim);
+
+		linkp = &vrm->first_seg;
+		cur = vrm->first_seg;
+		while (cur >= 0)
+		{
+			if (cur == victim)
+			{
+				*linkp = RowCacheSegs[cur].next_seg;
+				break;
+			}
+			linkp = &RowCacheSegs[cur].next_seg;
+			cur = RowCacheSegs[cur].next_seg;
+		}
+		if (vrm->cur_seg == victim)
+			vrm->cur_seg = -1;
+
+		LWLockRelease(&vrm->build_lock);
+
+		vseg = &RowCacheSegs[victim];
+		vseg->relid = InvalidOid;
+		vseg->state = RC_SEG_FREE;
+		vseg->used = 0;
+		vseg->n_entries = 0;
+		vseg->next_seg = -1;
+		return victim;
+	}
+}
+
+/*
+ * 从本表当前写入段 bump 出一个 entry(含内联 flat 载荷的总空间 need)。
+ * 段不够就换新段(空闲链/淘汰);单行超过段容量返回 NULL(调用方跳过
+ * 该行);池彻底腾不出则 ereport(调用方 PG_CATCH 回滚整个 load)。
+ * 调用方持有 rm->build_lock(单写者,bump 无需原子)。
+ */
+static GlobalEntry *
+SegAllocEntry(RelMeta *rm, Size need)
+{
+	need = MAXALIGN(need);
+
+	if (need > ROW_CACHE_SEGMENT_SIZE)
+		return NULL;			/* 单行超段容量:跳过 */
+
+	for (;;)
+	{
+		int32		sid = rm->cur_seg;
+
+		if (sid >= 0)
+		{
+			RowCacheSegment *seg = &RowCacheSegs[sid];
+
+			if ((Size) seg->used + need <= ROW_CACHE_SEGMENT_SIZE)
+			{
+				GlobalEntry *e = (GlobalEntry *) (SegBase(sid) + seg->used);
+
+				seg->used += (uint32) need;
+				seg->n_entries++;
+
+				/*
+				 * 立即写 span / 占位字段:此后即使 load 中途异常,
+				 * SegUnlinkEntries 也能按 span 安全遍历本段。
+				 */
+				e->span = (uint32) need;
+				e->relid = InvalidOid;	/* 插链前的未完成标记 */
+				e->pkey_hash = 0;
+				e->next = NULL;
+				return e;
+			}
+		}
+
+		/* 换新段。 */
+		{
+			int32		nid;
+
+			LWLockAcquire(&RowCacheCtl->seg_lock, LW_EXCLUSIVE);
+			nid = SegPopOrEvict(rm->relid);
+			if (nid < 0)
+			{
+				LWLockRelease(&RowCacheCtl->seg_lock);
+				ereport(ERROR,
+						(errcode(ERRCODE_OUT_OF_MEMORY),
+						 errmsg("row cache: segment pool exhausted"),
+						 errdetail_internal("row_cache_size = %dMB (%d segments); "
+											"relation already holds all reclaimable segments",
+											row_cache_size_mb,
+											RowCacheCtl->n_segments)));
+			}
+
+			{
+				RowCacheSegment *nseg = &RowCacheSegs[nid];
+
+				nseg->relid = rm->relid;
+				nseg->state = RC_SEG_ACTIVE;
+				nseg->used = 0;
+				nseg->n_entries = 0;
+				nseg->alloc_seq = ++RowCacheCtl->seg_alloc_counter;
+				nseg->next_seg = rm->first_seg;
+			}
+			if (sid >= 0)
+				RowCacheSegs[sid].state = RC_SEG_FULL;
+			rm->first_seg = nid;
+			rm->cur_seg = nid;
+			LWLockRelease(&RowCacheCtl->seg_lock);
+		}
+	}
 }
 
 /* ----------------------------------------------------------------
  * FlatCachedTuple:行的连续物化存储格式
  * ---------------------------------------------------------------- */
 
-dsa_pointer
-RowCacheFlattenTuple(dsa_area *area, TupleTableSlot *slot)
+/*
+ * 计算 slot 扁平化后 FlatCachedTuple 的总字节数。htup 是调用方已物化的
+ * heap tuple 副本(测量与写入两步共用,避免重复物化)。
+ */
+static Size
+FlatTupleComputeSize(TupleTableSlot *slot, HeapTuple htup,
+					 uint32 *htup_offset_out, uint32 *varlen_offset_out)
 {
-	 TupleDesc	desc = slot->tts_tupleDescriptor;
-	 int			natts = desc->natts;
-	 HeapTuple	htup;
-	 Size		total_size;
-	 uint32		values_offset,
-				 isnull_offset,
-				 htup_offset,
-				 varlen_offset;
-	 FlatCachedTuple *ft;
-	 dsa_pointer dp;
-	 Datum	   *dst_values;
-	 bool	   *dst_isnull;
-	 char	   *varlen_cursor;
- 
-	 slot_getallattrs(slot);
-	 htup = ExecCopySlotHeapTuple(slot);
- 
-	 values_offset = MAXALIGN(sizeof(FlatCachedTuple));
-	 isnull_offset = values_offset + sizeof(Datum) * natts;
-	 htup_offset = MAXALIGN(isnull_offset + sizeof(bool) * natts);
- 
-	 varlen_offset = htup_offset + MAXALIGN(htup->t_len);
-	 total_size = varlen_offset;
- 
-	 for (int i = 0; i < natts; i++)
-	 {
-		 Form_pg_attribute attr = TupleDescAttr(desc, i);
- 
-		 if (!slot->tts_isnull[i] && !attr->attbyval)
-			 total_size += MAXALIGN(datumGetSize(slot->tts_values[i],
-												 false, attr->attlen));
-	 }
- 
-	 dp = dsa_allocate(area, total_size);
-	 ft = (FlatCachedTuple *) dsa_get_address(area, dp);
-	 memset(ft, 0, total_size);
- 
-	 ft->total_size = total_size;
-	 ft->natts = natts;
-	 ft->htup_offset = htup_offset;
-	 ft->htup_len = htup->t_len;
- 
-	 dst_values = FLAT_TUPLE_VALUES(ft);
-	 dst_isnull = FLAT_TUPLE_ISNULL(ft);
-	 varlen_cursor = (char *) ft + varlen_offset;
- 
-	 for (int i = 0; i < natts; i++)
-	 {
-		 Form_pg_attribute attr = TupleDescAttr(desc, i);
- 
-		 dst_isnull[i] = slot->tts_isnull[i];
- 
-		 if (slot->tts_isnull[i])
-		 {
-			 dst_values[i] = (Datum) 0;
-		 }
-		 else if (attr->attbyval)
-		 {
-			 dst_values[i] = slot->tts_values[i];
-		 }
-		 else
-		 {
-			 Size		datum_size = datumGetSize(slot->tts_values[i],
+	TupleDesc	desc = slot->tts_tupleDescriptor;
+	int			natts = desc->natts;
+	uint32		values_offset,
+				isnull_offset,
+				htup_offset,
+				varlen_offset;
+	Size		total_size;
+
+	values_offset = MAXALIGN(sizeof(FlatCachedTuple));
+	isnull_offset = values_offset + sizeof(Datum) * natts;
+	htup_offset = MAXALIGN(isnull_offset + sizeof(bool) * natts);
+	varlen_offset = htup_offset + MAXALIGN(htup->t_len);
+	total_size = varlen_offset;
+
+	for (int i = 0; i < natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(desc, i);
+
+		if (!slot->tts_isnull[i] && !attr->attbyval)
+			total_size += MAXALIGN(datumGetSize(slot->tts_values[i],
+												false, attr->attlen));
+	}
+
+	*htup_offset_out = htup_offset;
+	*varlen_offset_out = varlen_offset;
+	return total_size;
+}
+
+/*
+ * 把 slot 扁平化写进调用方给定的缓冲(段内 bump 出的空间,S1 起原地
+ * 写入,不再经过临时分配 + memcpy)。参数均来自 FlatTupleComputeSize。
+ * 全程纯 memcpy,无 ereport 点。
+ */
+static void
+FlatTupleFillInto(FlatCachedTuple *ft, Size total_size,
+				  uint32 htup_offset, uint32 varlen_offset,
+				  TupleTableSlot *slot, HeapTuple htup)
+{
+	TupleDesc	desc = slot->tts_tupleDescriptor;
+	int			natts = desc->natts;
+	Datum	   *dst_values;
+	bool	   *dst_isnull;
+	char	   *varlen_cursor;
+
+	ft->total_size = (uint32) total_size;
+	ft->natts = natts;
+	ft->htup_offset = htup_offset;
+	ft->htup_len = htup->t_len;
+
+	dst_values = FLAT_TUPLE_VALUES(ft);
+	dst_isnull = FLAT_TUPLE_ISNULL(ft);
+	varlen_cursor = (char *) ft + varlen_offset;
+
+	for (int i = 0; i < natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(desc, i);
+
+		dst_isnull[i] = slot->tts_isnull[i];
+
+		if (slot->tts_isnull[i])
+		{
+			dst_values[i] = (Datum) 0;
+		}
+		else if (attr->attbyval)
+		{
+			dst_values[i] = slot->tts_values[i];
+		}
+		else
+		{
+			Size		datum_size = datumGetSize(slot->tts_values[i],
 												  false, attr->attlen);
- 
-			 memcpy(varlen_cursor,
-					DatumGetPointer(slot->tts_values[i]),
-					datum_size);
-			 /* Store offset from ft base, not a process-local pointer */
-			 dst_values[i] = (Datum) (varlen_cursor - (char *) ft);
-			 varlen_cursor += MAXALIGN(datum_size);
-		 }
-	 }
- 
-	 memcpy((char *) ft + htup_offset, htup->t_data, htup->t_len);
- 
-	 heap_freetuple(htup);
-	 return dp;
+
+			memcpy(varlen_cursor,
+				   DatumGetPointer(slot->tts_values[i]),
+				   datum_size);
+			/* 存相对 ft 基址的偏移,不存进程本地指针 */
+			dst_values[i] = (Datum) (varlen_cursor - (char *) ft);
+			varlen_cursor += MAXALIGN(datum_size);
+		}
+	}
+
+	memcpy((char *) ft + htup_offset, htup->t_data, htup->t_len);
 }
 
 bool
@@ -957,7 +1307,7 @@ RelationRowCacheLoadRelation(Relation rel)
 	if (RowCacheCtl == NULL)
 		elog(ERROR, "row cache shared memory not initialized");
 
-	EnsureRowCacheDsa();
+	RowCacheEnsureBackendInit();
 
 	rm = AllocateOrFindRelMeta(relid);
 	if (rm == NULL)
@@ -973,8 +1323,14 @@ RelationRowCacheLoadRelation(Relation rel)
 	{
 		pg_atomic_write_u32(&rm->state, RELMETA_DISABLED);
 		pg_memory_barrier();
-		DropAllEntriesForRelid(relid);
 	}
+
+	/*
+	 * 无论 state 如何,只要还挂着段就先释放——覆盖上次 load/drop 中途
+	 * 被中断留下的残段(ReleaseAllSegmentsForRel 幂等)。
+	 */
+	if (rm->first_seg >= 0)
+		ReleaseAllSegmentsForRel(rm);
 
 	pg_atomic_write_u32(&rm->state, RELMETA_LOADING);
 
@@ -997,19 +1353,26 @@ RelationRowCacheLoadRelation(Relation rel)
 	slot = table_slot_create(rel, NULL);
 
 	/*
-	 * 中途若 dsa_allocate OOM(或其他 ereport),在 PG_CATCH 里清理，scan / slot / snapshot 是事务资源,由事务
-	 * abort 自动回收,PG_CATCH 只需清理行缓存的 shmem 状态。
+	 * 中途若段池耗尽(或其他 ereport),在 PG_CATCH 里清理;scan / slot /
+	 * snapshot 是事务资源,由事务 abort 自动回收,PG_CATCH 只需清理行缓存
+	 * 的 shmem 状态(整段释放,不再逐条 free)。
 	 */
 	PG_TRY();
 	{
+		int64		nloaded = 0;
+		int64		nskipped_pkey = 0;
+		int64		nskipped_big = 0;
+
 		while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
 		{
 			uint8		pkey_buf[ROW_CACHE_PKEY_INLINE_BYTES];
 			int			pkey_len;
 			uint32		pkey_hash;
 			uint32		bucket;
-			dsa_pointer payload_dp;
-			dsa_pointer entry_dp;
+			HeapTuple	htup;
+			Size		flat_size;
+			uint32		htup_off;
+			uint32		varlen_off;
 			GlobalEntry *e;
 			LWLock	   *part;
 
@@ -1017,69 +1380,75 @@ RelationRowCacheLoadRelation(Relation rel)
 
 			pkey_len = SerializePkeyFromSlot(slot, rm, pkey_buf);
 			if (pkey_len < 0)
-				continue;				
+			{
+				nskipped_pkey++;
+				continue;
+			}
 
 			pkey_hash = ComputePkeyHashBytes(pkey_buf, pkey_len);
 			bucket = pkey_hash & RowCacheCtl->bucket_mask;
 
+			htup = ExecCopySlotHeapTuple(slot);
+			flat_size = FlatTupleComputeSize(slot, htup, &htup_off, &varlen_off);
+
+			e = SegAllocEntry(rm, MAXALIGN(sizeof(GlobalEntry)) + flat_size);
+			if (e == NULL)
 			{
-				dsa_pointer	tmp_dp = RowCacheFlattenTuple(LocalDsa, slot);
-				FlatCachedTuple *tmp_flat;
-				Size		flat_size;
-				Size		combined_size;
-				char	   *inline_flat;
-
-				if (!DsaPointerIsValid(tmp_dp))
-					continue;
-
-				tmp_flat = (FlatCachedTuple *) dsa_get_address(LocalDsa, tmp_dp);
-				flat_size = tmp_flat->total_size;
-				combined_size = MAXALIGN(sizeof(GlobalEntry)) + flat_size;
-
-				entry_dp = dsa_allocate_extended(LocalDsa, combined_size,
-													DSA_ALLOC_NO_OOM);
-				if (!DsaPointerIsValid(entry_dp))
-				{
-					dsa_free(LocalDsa, tmp_dp);
-					ereport(ERROR,
-							(errcode(ERRCODE_OUT_OF_MEMORY),
-								errmsg("out of memory"),
-								errdetail_internal("row cache: cannot allocate GlobalEntry")));
-				}
-
-				e = (GlobalEntry *) dsa_get_address(LocalDsa, entry_dp);
-				inline_flat = (char *) e + MAXALIGN(sizeof(GlobalEntry));
-				memcpy(inline_flat, tmp_flat, flat_size);
-				dsa_free(LocalDsa, tmp_dp);
-
-				payload_dp = entry_dp + MAXALIGN(sizeof(GlobalEntry));
+				/* 单行超过段容量:不缓存该行(读路径 miss 回退)。 */
+				heap_freetuple(htup);
+				nskipped_big++;
+				continue;
 			}
+
+			FlatTupleFillInto(ENTRY_FLAT(e), flat_size, htup_off, varlen_off,
+							  slot, htup);
+			heap_freetuple(htup);
 
 			e->relid = relid;
 			e->pkey_hash = pkey_hash;
 			e->pkey_len = (uint8) pkey_len;
 			memcpy(e->pkey_buf, pkey_buf, pkey_len);
 			ItemPointerCopy(&slot->tts_tid, &e->tid);
-			e->payload_dp = payload_dp;
-			e->next_dp = InvalidDsaPointer;
 
 			part = PartitionLockForBucket(bucket);
 			LWLockAcquire(part, LW_EXCLUSIVE);
-			BucketInsertHead(bucket, entry_dp, e);
+			BucketInsertHead(bucket, e);
 			LWLockRelease(part);
-	}
+
+			nloaded++;
+		}
+
+		{
+			int			nsegs = 0;
+
+			for (int32 s = rm->first_seg; s >= 0; s = RowCacheSegs[s].next_seg)
+				nsegs++;
+			elog(DEBUG1, "row cache: loaded relation %u: %lld rows, %d segments"
+				 " (skipped: %lld null-pkey, %lld oversized)",
+				 relid, (long long) nloaded, nsegs,
+				 (long long) nskipped_pkey, (long long) nskipped_big);
+		}
 	}
 	PG_CATCH();
 	{
 		/*
-		 * 加载中途失败(通常是 DSA OOM):清掉已插入的部分 entry、把 state
+		 * 加载中途失败(通常是段池耗尽):整段释放已灌入的数据、把 state
 		 * 回滚到 DISABLED、释放 RelMeta 槽位、推进代数,然后重新抛出。
-		 * 此处只持有 build_lock(OOM 发生在分区锁之外的 dsa_allocate),
-		 * DropAllEntriesForRelid 自取/放分区锁,dsa_free 在 OOM 后仍可用。
+		 * 此处只持有 build_lock;ReleaseAllSegmentsForRel 自取/放
+		 * seg_lock 与分区锁。
+		 *
+		 * 注意:errfinish() 在 longjmp 之前把 InterruptHoldoffCount 清零,
+		 * 而 build_lock 仍被本 backend 持有(错误恢复的 LWLockReleaseAll
+		 * 尚未运行)。必须先补一个 HOLD_INTERRUPTS 与下面手动
+		 * LWLockRelease(build_lock) 内部的 RESUME 配平——这是
+		 * LWLockReleaseAll 的标准做法;顺带让清理期间的
+		 * CHECK_FOR_INTERRUPTS 保持无操作。(V4 的 PG_CATCH 缺这一步,
+		 * 只是其 DSA OOM 路径从未真正执行过,没暴露。)
 		 */
-		// pg_atomic_write_u32(&rm->state, RELMETA_DISABLED);
+		HOLD_INTERRUPTS();
+		pg_atomic_write_u32(&rm->state, RELMETA_DISABLED);
 		pg_memory_barrier();
-		DropAllEntriesForRelid(relid);
+		ReleaseAllSegmentsForRel(rm);
 		rm->n_pkey_attrs = 0;
 		rm->pkey_total_len = 0;
 		rm->relid = InvalidOid;
@@ -1097,6 +1466,15 @@ RelationRowCacheLoadRelation(Relation rel)
 	if (pushed_snapshot)
 		PopActiveSnapshot();
 
+	/* 封存当前写入段:ENABLED 后所有段均为 FULL(可淘汰)。 */
+	if (rm->cur_seg >= 0)
+	{
+		LWLockAcquire(&RowCacheCtl->seg_lock, LW_EXCLUSIVE);
+		RowCacheSegs[rm->cur_seg].state = RC_SEG_FULL;
+		rm->cur_seg = -1;
+		LWLockRelease(&RowCacheCtl->seg_lock);
+	}
+
 	pg_write_barrier();
 	pg_atomic_write_u32(&rm->state, RELMETA_ENABLED);
 
@@ -1109,75 +1487,20 @@ RelationRowCacheLoadRelation(Relation rel)
 	RelationRowCacheBindRelation(rel);
 }
 
-static void
-DropAllEntriesForRelid(Oid relid)
-{
-	dsa_pointer *heads;
-
-	if (!DsaPointerIsValid(RowCacheCtl->hash_buckets_dp))
-		return;
-
-	heads = BucketHeads();
-
-	for (uint32 b = 0; b < RowCacheCtl->n_hash_buckets; b++)
-	{
-		LWLock	   *part = PartitionLockForBucket(b);
-		dsa_pointer prev_dp = InvalidDsaPointer;
-		dsa_pointer cur_dp;
-		GlobalEntry *prev = NULL;
-
-		CHECK_FOR_INTERRUPTS();
-
-		LWLockAcquire(part, LW_EXCLUSIVE);
-
-		cur_dp = heads[b];
-		while (DsaPointerIsValid(cur_dp))
-		{
-			GlobalEntry *e = (GlobalEntry *) dsa_get_address(LocalDsa, cur_dp);
-			dsa_pointer next_dp = e->next_dp;
-
-			if (e->relid == relid)
-			{
-				if (DsaPointerIsValid(prev_dp))
-					prev->next_dp = next_dp;
-				else
-					heads[b] = next_dp;
-
-				dsa_free(LocalDsa, cur_dp);
-
-				cur_dp = next_dp;
-			}
-			else
-			{
-				prev_dp = cur_dp;
-				prev = e;
-				cur_dp = next_dp;
-			}
-		}
-
-		LWLockRelease(part);
-	}
-}
-
-
+/*
+ * DML 行级失效:按 pkey 从桶链上摘除对应 entry。
+ *
+ * S1 起摘链即完成——载荷留在段内成为死数据,等所在段被整段回收
+ * (drop / 淘汰)时一并消失。失效路径上不再有任何内存释放调用。
+ */
 static void
 InvalidateEntryByPkeyBytes(Oid relid, const uint8 *pkey_buf, int pkey_len)
 {
 	uint32			pkey_hash;
 	uint32			bucket;
 	LWLock		   *part;
-	dsa_pointer	   *heads;
-	dsa_pointer		prev_dp;
-	dsa_pointer		cur_dp;
 	GlobalEntry	   *prev;
-	dsa_pointer		victim_dp = InvalidDsaPointer;
-
-	/*
-	 * backend 至少要跑过一次 EnsureRowCacheDsa,LocalDsa 才有效、
-	 * BucketHeads 才能解析。DML 钩子路径可能是本 backend 第一次碰
-	 * 缓存,这里惰性 attach。
-	 */
-	EnsureRowCacheDsa();
+	GlobalEntry	   *cur;
 
 	pkey_hash = ComputePkeyHashBytes(pkey_buf, pkey_len);
 	bucket = pkey_hash & RowCacheCtl->bucket_mask;
@@ -1185,46 +1508,24 @@ InvalidateEntryByPkeyBytes(Oid relid, const uint8 *pkey_buf, int pkey_len)
 
 	LWLockAcquire(part, LW_EXCLUSIVE);
 
-	if (!DsaPointerIsValid(RowCacheCtl->hash_buckets_dp))
-	{
-		LWLockRelease(part);
-		return;
-	}
-
-	heads = BucketHeads();
-	prev_dp = InvalidDsaPointer;
 	prev = NULL;
-	cur_dp = heads[bucket];
-
-	while (DsaPointerIsValid(cur_dp))
+	for (cur = RowCacheBuckets[bucket]; cur != NULL; cur = cur->next)
 	{
-		GlobalEntry *e = (GlobalEntry *) dsa_get_address(LocalDsa, cur_dp);
-
-		if (e->relid == relid &&
-			e->pkey_hash == pkey_hash &&
-			e->pkey_len == pkey_len &&
-			memcmp(e->pkey_buf, pkey_buf, pkey_len) == 0)
+		if (cur->relid == relid &&
+			cur->pkey_hash == pkey_hash &&
+			cur->pkey_len == pkey_len &&
+			memcmp(cur->pkey_buf, pkey_buf, pkey_len) == 0)
 		{
-			/* 从链上摘除。 */
-			if (DsaPointerIsValid(prev_dp))
-				prev->next_dp = e->next_dp;
+			if (prev != NULL)
+				prev->next = cur->next;
 			else
-				heads[bucket] = e->next_dp;
-
-			victim_dp = cur_dp;
-
+				RowCacheBuckets[bucket] = cur->next;
 			break;
 		}
-
-		prev_dp = cur_dp;
-		prev = e;
-		cur_dp = e->next_dp;
+		prev = cur;
 	}
 
 	LWLockRelease(part);
-
-	if (DsaPointerIsValid(victim_dp))
-		dsa_free(LocalDsa, victim_dp);
 }
 
 static void
@@ -1290,7 +1591,7 @@ RelationRowCacheDropRelation(Oid relid)
 	if (rm == NULL)
 		return;
 
-	EnsureRowCacheDsa();
+	RowCacheEnsureBackendInit();
 
 	LWLockAcquire(&rm->build_lock, LW_EXCLUSIVE);
 
@@ -1298,7 +1599,7 @@ RelationRowCacheDropRelation(Oid relid)
 	pg_atomic_write_u32(&rm->state, RELMETA_DISABLED);
 	pg_memory_barrier();
 
-	DropAllEntriesForRelid(relid);
+	ReleaseAllSegmentsForRel(rm);
 
 	rm->n_pkey_attrs = 0;
 	rm->pkey_total_len = 0;
@@ -1331,23 +1632,19 @@ DoPkeyFetchBytes(RelMeta *rm, Oid relid,
 		return false;
 	pg_read_barrier();
 
-	EnsureRowCacheDsa();
-
 	hash = ComputePkeyHashBytes(pkey_buf, pkey_len);
 	bucket = hash & RowCacheCtl->bucket_mask;
 	part = PartitionLockForBucket(bucket);
 
 	LWLockAcquire(part, LW_SHARED);
 
-	entry = BucketLookup(bucket, relid, hash, pkey_buf, pkey_len, NULL);
+	entry = BucketLookup(bucket, relid, hash, pkey_buf, pkey_len);
 	if (entry == NULL)
 		goto out;
 
 	pg_read_barrier();
 
-	if (!DsaPointerIsValid(entry->payload_dp))
-		goto out;
-	flat = (FlatCachedTuple *) dsa_get_address(LocalDsa, entry->payload_dp);
+	flat = ENTRY_FLAT(entry);
 
 	ItemPointerCopy(&entry->tid, &tid);
 	htup.t_data = (HeapTupleHeader) FLAT_TUPLE_HTUP_DATA(flat);
@@ -1481,6 +1778,9 @@ RelationRowCacheBindRelation(Relation rel)
 
 	if (RowCacheCtl == NULL)
 		return;
+
+	/* 注册 relcache 失效回调(每 backend 一次,冷路径)。 */
+	RowCacheEnsureBackendInit();
 
 	cur_gen = pg_atomic_read_u32(&RowCacheCtl->global_gen.value);
 
