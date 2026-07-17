@@ -13,8 +13,10 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/skey.h"
 #include "access/stratnum.h"
+#include "catalog/pg_index.h"
 #include "executor/execRowcache.h"
 #include "executor/executor.h"
 #include "lib/relation_row_cache.h"
@@ -63,8 +65,19 @@ ExecInitIndexScanRowCache(IndexScanState *node)
 		 * tupdesc)看不见"主键约束被删"——若之后经同列非唯一索引探测,
 		 * 而堆里已插入重复键,缓存单行命中会漏读其余行。唯一性在此把关:
 		 * 唯一索引 + 全列等值 ⇒ 至多一行,与缓存单行语义一致。
+		 *
+		 * 但 indisunique 本身不够,还必须:
+		 *  - indimmediate:延迟唯一约束(DEFERRABLE)允许事务内暂时
+		 *    重复,此时同键两行都可见,缓存单行命中会漏行;
+		 *  - 非部分索引:planner 会把被索引谓词蕴含的 qual 从 filter
+		 *    中消除,缓存命中绕过索引后无人复查谓词,可能返回谓词外
+		 *    的行。indpred 是变长字段,经 rd_indextuple 零分配判空。
 		 */
 		if (!indexRel->rd_index->indisunique)
+			shape_ok = false;
+		if (!indexRel->rd_index->indimmediate)
+			shape_ok = false;
+		if (!heap_attisnull(indexRel->rd_indextuple, Anum_pg_index_indpred, NULL))
 			shape_ok = false;
 		if (indexRel->rd_index->indnkeyatts != node->iss_NumScanKeys)
 			shape_ok = false;
@@ -88,6 +101,24 @@ ExecInitIndexScanRowCache(IndexScanState *node)
 				shape_ok = false;
 				break;
 			}
+
+			/*
+			 * 跨类型 ScanKey(如 int4 主键列 = int8 参数,btree 操作符族
+			 * 允许):缓存判等是"按缓存列宽序列化 + 裸字节 memcmp",参数
+			 * 物理宽度与列不一致时会被截断,产生错误命中(实测
+			 * id = 4294967296::int8 截成 4 字节 0,误命中 id=0)。参数
+			 * 类型必须与堆列类型一致,否则整个扫描回退原生路径。
+			 * (缓存序列化宽度与当前 tupdesc 的一致性由 schema 指纹保证,
+			 * 故与当前 atttypid 比较即等价于与缓存时类型比较。)
+			 */
+			if (sk->sk_subtype != InvalidOid &&
+				sk->sk_subtype !=
+				TupleDescAttr(RelationGetDescr(scanRel), heap_attno - 1)->atttypid)
+			{
+				shape_ok = false;
+				break;
+			}
+
 			node->iss_RowCachePkeyIndexHeapAttnos[i] = heap_attno;
 		}
 

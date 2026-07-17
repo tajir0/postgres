@@ -168,6 +168,13 @@ StaticAssertDecl(ROW_CACHE_PKEY_MAX_ATTS <= INDEX_MAX_KEYS,
 
 typedef struct RelMeta
 {
+	/*
+	 * 槽身份 = (dboid, relid)。主共享内存是实例级的,而 relid /
+	 * relfilenode 都是数据库内标识——模板克隆库(CREATE DATABASE ...
+	 * TEMPLATE)中两库的表 OID 与 filenode 完全相同,schema 指纹也
+	 * 无法区分,必须以数据库 OID 参与完整键,否则跨库串数据。
+	 */
+	Oid				dboid;			/* 所属数据库;InvalidOid = 空闲槽 */
 	Oid				relid;			/* InvalidOid = 空闲槽 */
 	pg_atomic_uint32 state;			/* RELMETA_{DISABLED,LOADING,ENABLED} */
 	LWLock			build_lock;		/* 串行化 Load / Drop;不在读路径上 */
@@ -219,6 +226,7 @@ typedef struct RelMeta
 
 typedef struct GlobalEntry
 {
+	Oid				dboid;			/* 所属数据库(条目键的一部分,防跨库串数据) */
 	Oid				relid;
 	uint32			pkey_hash;
 	uint8			pkey_len;		/* 序列化长度, <= ROW_CACHE_PKEY_INLINE_BYTES */
@@ -258,6 +266,7 @@ typedef struct GlobalEntry
  */
 typedef struct RowCacheSegment
 {
+	Oid			dboid;			/* 归属数据库(淘汰者按 (dboid,relid) 反查属主) */
 	Oid			relid;			/* 归属关系;InvalidOid = 空闲 */
 	uint32		state;			/* RC_SEG_* */
 
@@ -406,7 +415,7 @@ static int32		PendingPinnedSeg = -1;
 
 /* 前向声明。 */
 static void RowCacheEnsureBackendInit(void);
-static RelMeta *FindRelMeta(Oid relid);
+static RelMeta *FindRelMeta(Oid dboid, Oid relid);
 
 static bool	RowCacheRelcacheCallbackRegistered = false;
 
@@ -442,7 +451,7 @@ rowcache_relcache_callback(Datum arg, Oid relid)
 	}
 }
 
-static RelMeta *AllocateOrFindRelMeta(Oid relid);
+static RelMeta *AllocateOrFindRelMeta(Oid dboid, Oid relid);
 static bool CheckEligiblePkey(Relation rel, RelMeta *rm);
 static int SerializePkeyFromSlot(TupleTableSlot *slot, RelMeta *rm,
 								 uint8 *out_buf);
@@ -604,6 +613,7 @@ RowCacheShmemInit(void)
 	{
 		RelMeta    *rm = &RowCacheCtl->relmetas[i];
 
+		rm->dboid = InvalidOid;
 		rm->relid = InvalidOid;
 		pg_atomic_init_u32(&rm->state, RELMETA_DISABLED);
 		LWLockInitialize(&rm->build_lock, LWTRANCHE_ROW_CACHE_RELMETA);
@@ -625,6 +635,7 @@ RowCacheShmemInit(void)
 	{
 		RowCacheSegment *seg = &RowCacheSegs[s];
 
+		seg->dboid = InvalidOid;
 		seg->relid = InvalidOid;
 		seg->state = RC_SEG_FREE;
 		pg_atomic_init_u32(&seg->used, 0);
@@ -662,27 +673,27 @@ RowCacheEnsureBackendInit(void)
  * ---------------------------------------------------------------- */
 
 static RelMeta *
-FindRelMeta(Oid relid)
+FindRelMeta(Oid dboid, Oid relid)
 {
-	if (!OidIsValid(relid))
+	if (!OidIsValid(dboid) || !OidIsValid(relid))
 		return NULL;
 
 	for (int i = 0; i < ROW_CACHE_MAX_RELATIONS; i++)
 	{
 		RelMeta    *rm = &RowCacheCtl->relmetas[i];
 
-		if (rm->relid == relid)
+		if (rm->dboid == dboid && rm->relid == relid)
 			return rm;
 	}
 	return NULL;
 }
 
 static RelMeta *
-AllocateOrFindRelMeta(Oid relid)
+AllocateOrFindRelMeta(Oid dboid, Oid relid)
 {
 	RelMeta    *rm;
 
-	rm = FindRelMeta(relid);
+	rm = FindRelMeta(dboid, relid);
 	if (rm != NULL)
 		return rm;
 
@@ -691,11 +702,12 @@ AllocateOrFindRelMeta(Oid relid)
 	/* 持锁下重新检查。 */
 	for (int i = 0; i < ROW_CACHE_MAX_RELATIONS; i++)
 	{
-		if (RowCacheCtl->relmetas[i].relid == relid)
+		RelMeta    *cand = &RowCacheCtl->relmetas[i];
+
+		if (cand->dboid == dboid && cand->relid == relid)
 		{
-			rm = &RowCacheCtl->relmetas[i];
 			LWLockRelease(&RowCacheCtl->relmeta_alloc_lock);
-			return rm;
+			return cand;
 		}
 	}
 
@@ -706,6 +718,7 @@ AllocateOrFindRelMeta(Oid relid)
 
 		if (cand->relid == InvalidOid)
 		{
+			cand->dboid = dboid;
 			cand->relid = relid;
 			pg_atomic_write_u32(&cand->state, RELMETA_DISABLED);
 			cand->n_pkey_attrs = 0;
@@ -979,23 +992,25 @@ BucketInsertHead(uint32 bucket, GlobalEntry *entry)
 }
 
 /*
- * 走一条桶链,找匹配 (relid, pkey_hash, pkey_len, pkey_buf) 的 entry。
+ * 走一条桶链,找匹配 (dboid, relid, pkey_hash, pkey_len, pkey_buf) 的
+ * entry。
  *
  * 匹配条件:
- *   - relid 相等(4 字节比较)
+ *   - dboid + relid 相等(模板克隆库的表 OID 可能相同,库号必须参与判等)
  *   - pkey_hash 相等(廉价的哈希碰撞过滤)
  *   - pkey_len 相等(单字节比较)
  *   - memcmp(pkey_buf, ..., pkey_len) 做最终判等
  */
 static GlobalEntry *
-BucketLookup(uint32 bucket, Oid relid, uint32 pkey_hash,
+BucketLookup(uint32 bucket, Oid dboid, Oid relid, uint32 pkey_hash,
 			 const uint8 *pkey_buf, int pkey_len)
 {
 	GlobalEntry *e;
 
 	for (e = RowCacheBuckets[bucket]; e != NULL; e = e->next)
 	{
-		if (e->relid == relid &&
+		if (e->dboid == dboid &&
+			e->relid == relid &&
 			e->pkey_hash == pkey_hash &&
 			e->pkey_len == pkey_len &&
 			memcmp(e->pkey_buf, pkey_buf, pkey_len) == 0)
@@ -1094,6 +1109,7 @@ SegPrepareReuse(int32 sid)
 	}
 
 	seg->seq_num++;
+	seg->dboid = InvalidOid;
 	seg->relid = InvalidOid;
 	seg->state = RC_SEG_FREE;
 	pg_atomic_write_u32(&seg->used, 0);
@@ -1161,7 +1177,8 @@ RowCacheRefreshScoresLocked(void)
  * 时 build_lock 拿不到的表。调用方持 seg_lock EXCLUSIVE。
  */
 static int32
-SegPickVictim(Oid exempt_relid, Oid skip_relid)
+SegPickVictim(Oid exempt_dboid, Oid exempt_relid,
+			  const Oid *skip_dboids, const Oid *skip_relids, int nskip)
 {
 	int32		victim = -1;
 	double		victim_score = 0.0;
@@ -1170,11 +1187,21 @@ SegPickVictim(Oid exempt_relid, Oid skip_relid)
 	for (int32 s = 0; s < RowCacheCtl->n_segments; s++)
 	{
 		RowCacheSegment *seg = &RowCacheSegs[s];
+		bool		skipped = false;
 
 		if (seg->state != RC_SEG_FULL)
 			continue;
-		if (seg->relid == exempt_relid ||
-			(OidIsValid(skip_relid) && seg->relid == skip_relid))
+		if (seg->dboid == exempt_dboid && seg->relid == exempt_relid)
+			continue;
+		for (int k = 0; k < nskip; k++)
+		{
+			if (seg->dboid == skip_dboids[k] && seg->relid == skip_relids[k])
+			{
+				skipped = true;
+				break;
+			}
+		}
+		if (skipped)
 			continue;
 		if (victim < 0 ||
 			seg->score < victim_score ||
@@ -1190,13 +1217,24 @@ SegPickVictim(Oid exempt_relid, Oid skip_relid)
 
 /*
  * 淘汰一个 FULL 段:打分选最冷 → conditional 拿 victim 表的 build_lock
- * (拿不到换一次候选)→ 摘净桶链引用 → 从属主段链摘除 → 等 pin 排空
- * 并换代。exempt_relid 的段被豁免。调用方持 seg_lock EXCLUSIVE。
- * 返回段号(已不在任何链上),拿不到返回 -1(绝不等待)。
+ * → 摘净桶链引用 → 从属主段链摘除 → 等 pin 排空并换代。
+ *
+ * 候选遍历纪律(对应 OB try_wash_mb 的"失败即跳过、穷尽为止"):属主
+ * build_lock 拿不到(正在 load/drop)就把该 (dboid, relid) 记入 skip
+ * 集合换下一个属主,每个属主至多一次条件锁;所有持段属主都忙时才返回
+ * -1——绝不因为前两个候选不顺利就误报池耗尽。skip 集合上限即 RelMeta
+ * 槽数,循环有界。
+ *
+ * (exempt_dboid, exempt_relid) 的段被豁免(load 不淘汰自己)。
+ * 调用方持 seg_lock EXCLUSIVE。返回段号(已不在任何链上)。
  */
 static int32
-SegEvictOne(Oid exempt_relid)
+SegEvictOne(Oid exempt_dboid, Oid exempt_relid)
 {
+	Oid			skip_dboids[ROW_CACHE_MAX_RELATIONS];
+	Oid			skip_relids[ROW_CACHE_MAX_RELATIONS];
+	int			nskip = 0;
+
 	/* 打分陈旧时补一轮刷新(washer 常态每周期维护)。 */
 	if (TimestampDifferenceExceeds(RowCacheCtl->last_score_refresh,
 								   GetCurrentTimestamp(),
@@ -1205,22 +1243,24 @@ SegEvictOne(Oid exempt_relid)
 
 	for (;;)
 	{
-		int32		victim = SegPickVictim(exempt_relid, InvalidOid);
+		int32		victim = SegPickVictim(exempt_dboid, exempt_relid,
+										   skip_dboids, skip_relids, nskip);
 		RowCacheSegment *vseg;
 		RelMeta    *vrm;
 		int32	   *linkp;
 		int32		cur;
 
 		if (victim < 0)
-			return -1;			/* 无可淘汰段 */
+			return -1;			/* 候选已穷尽:真·无可淘汰段 */
 
 		vseg = &RowCacheSegs[victim];
-		vrm = FindRelMeta(vseg->relid);
-		if (vrm == NULL || vrm->relid != vseg->relid)
+		vrm = FindRelMeta(vseg->dboid, vseg->relid);
+		if (vrm == NULL || vrm->dboid != vseg->dboid ||
+			vrm->relid != vseg->relid)
 		{
 			/* 不应发生:有主的段必有 RelMeta。防御:直接回收。 */
-			elog(WARNING, "row cache: segment %d owned by relation %u without metadata",
-				 victim, vseg->relid);
+			elog(WARNING, "row cache: segment %d owned by relation %u/%u without metadata",
+				 victim, vseg->dboid, vseg->relid);
 			SegUnlinkEntries(victim);
 			SegPrepareReuse(victim);
 			vseg->next_seg = -1;
@@ -1229,24 +1269,13 @@ SegEvictOne(Oid exempt_relid)
 
 		if (!LWLockConditionalAcquire(&vrm->build_lock, LW_EXCLUSIVE))
 		{
-			/*
-			 * victim 表正在 load/drop,跳过它:把该表的段全部临时排除
-			 * 太复杂,简单起见本轮直接放弃淘汰这张表——把它的最老段
-			 * 从候选里排除的办法是换一张表。为避免死循环,这里改为
-			 * 线性扫描下一个次老候选:重扫时跳过该 relid。
-			 */
-			Oid			busy_relid = vseg->relid;
-			int32		alt = SegPickVictim(exempt_relid, busy_relid);
-
-			if (alt < 0)
-				return -1;
-
-			vseg = &RowCacheSegs[alt];
-			vrm = FindRelMeta(vseg->relid);
-			if (vrm == NULL || vrm->relid != vseg->relid ||
-				!LWLockConditionalAcquire(&vrm->build_lock, LW_EXCLUSIVE))
-				return -1;		/* 两次都不顺利:放弃,让 load 失败 */
-			victim = alt;
+			/* 属主正被 load/drop:记入 skip 集合,换下一个属主。 */
+			if (nskip >= ROW_CACHE_MAX_RELATIONS)
+				return -1;		/* 防御:不应发生(属主数受槽数限制) */
+			skip_dboids[nskip] = vseg->dboid;
+			skip_relids[nskip] = vseg->relid;
+			nskip++;
+			continue;
 		}
 
 		/* 持有 victim 的 build_lock:摘桶链引用 + 从其段链摘除。 */
@@ -1284,7 +1313,7 @@ SegEvictOne(Oid exempt_relid)
  * (打分最冷)。调用方持 seg_lock EXCLUSIVE。
  */
 static int32
-SegPopOrEvict(Oid loading_relid)
+SegPopOrEvict(Oid loading_dboid, Oid loading_relid)
 {
 	if (RowCacheCtl->free_seg_head >= 0)
 	{
@@ -1296,7 +1325,7 @@ SegPopOrEvict(Oid loading_relid)
 	}
 	/* 空闲链耗尽 = 段需求信号,washer 据此维持水位。 */
 	pg_atomic_fetch_add_u32(&RowCacheCtl->seg_demand, 1);
-	return SegEvictOne(loading_relid);
+	return SegEvictOne(loading_dboid, loading_relid);
 }
 
 /*
@@ -1386,6 +1415,7 @@ SegBackfillAlloc(RelMeta *rm, Size need)
 		{
 			RowCacheSegment *nseg = &RowCacheSegs[nid];
 
+			nseg->dboid = rm->dboid;
 			nseg->relid = rm->relid;
 			nseg->state = RC_SEG_ACTIVE;
 			pg_atomic_write_u32(&nseg->used, 0);
@@ -1435,7 +1465,7 @@ SegAllocEntry(RelMeta *rm, Size need)
 			int32		nid;
 
 			LWLockAcquire(&RowCacheCtl->seg_lock, LW_EXCLUSIVE);
-			nid = SegPopOrEvict(rm->relid);
+			nid = SegPopOrEvict(rm->dboid, rm->relid);
 			if (nid < 0)
 			{
 				LWLockRelease(&RowCacheCtl->seg_lock);
@@ -1636,7 +1666,7 @@ RelationRowCacheLoadRelation(Relation rel)
 
 	RowCacheEnsureBackendInit();
 
-	rm = AllocateOrFindRelMeta(relid);
+	rm = AllocateOrFindRelMeta(MyDatabaseId, relid);
 	if (rm == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
@@ -1735,6 +1765,7 @@ RelationRowCacheLoadRelation(Relation rel)
 							  slot, htup);
 			heap_freetuple(htup);
 
+			e->dboid = MyDatabaseId;
 			e->relid = relid;
 			e->pkey_hash = pkey_hash;
 			e->pkey_len = (uint8) pkey_len;
@@ -1782,6 +1813,7 @@ RelationRowCacheLoadRelation(Relation rel)
 		ReleaseAllSegmentsForRel(rm);
 		rm->n_pkey_attrs = 0;
 		rm->pkey_total_len = 0;
+		rm->dboid = InvalidOid;
 		rm->relid = InvalidOid;
 		LastLookupRelMeta = NULL;
 		LastLookupRelid = InvalidOid;
@@ -1826,7 +1858,8 @@ RelationRowCacheLoadRelation(Relation rel)
  * (drop / 淘汰)时一并消失。失效路径上不再有任何内存释放调用。
  */
 static void
-InvalidateEntryByPkeyBytes(Oid relid, const uint8 *pkey_buf, int pkey_len)
+InvalidateEntryByPkeyBytes(Oid dboid, Oid relid,
+						   const uint8 *pkey_buf, int pkey_len)
 {
 	uint32			pkey_hash;
 	uint32			bucket;
@@ -1843,7 +1876,8 @@ InvalidateEntryByPkeyBytes(Oid relid, const uint8 *pkey_buf, int pkey_len)
 	prev = NULL;
 	for (cur = RowCacheBuckets[bucket]; cur != NULL; cur = cur->next)
 	{
-		if (cur->relid == relid &&
+		if (cur->dboid == dboid &&
+			cur->relid == relid &&
 			cur->pkey_hash == pkey_hash &&
 			cur->pkey_len == pkey_len &&
 			memcmp(cur->pkey_buf, pkey_buf, pkey_len) == 0)
@@ -1902,7 +1936,7 @@ InvalidateByHeapTuple(Relation rel, HeapTuple tuple)
 	if (pkey_len < 0)
 		return;
 
-	InvalidateEntryByPkeyBytes(relid, pkey_buf, pkey_len);
+	InvalidateEntryByPkeyBytes(MyDatabaseId, relid, pkey_buf, pkey_len);
 }
 
 
@@ -1927,7 +1961,7 @@ RelationRowCacheDropRelation(Oid relid)
 	if (RowCacheCtl == NULL)
 		return;
 
-	rm = FindRelMeta(relid);
+	rm = FindRelMeta(MyDatabaseId, relid);
 	if (rm == NULL)
 		return;
 
@@ -1943,6 +1977,7 @@ RelationRowCacheDropRelation(Oid relid)
 
 	rm->n_pkey_attrs = 0;
 	rm->pkey_total_len = 0;
+	rm->dboid = InvalidOid;
 	rm->relid = InvalidOid;
 
 	LastLookupRelMeta = NULL;
@@ -1989,7 +2024,7 @@ DoPkeyFetchBytes(RelMeta *rm, Oid relid,
 	 */
 	LWLockAcquire(part, LW_SHARED);
 
-	entry = BucketLookup(bucket, relid, hash, pkey_buf, pkey_len);
+	entry = BucketLookup(bucket, rm->dboid, relid, hash, pkey_buf, pkey_len);
 	if (entry == NULL)
 	{
 		LWLockRelease(part);
@@ -2109,7 +2144,7 @@ LookupRelMetaForFetch(Oid relid)
 		rm = LastLookupRelMeta;
 	else
 	{
-		rm = FindRelMeta(relid);
+		rm = FindRelMeta(MyDatabaseId, relid);
 		LastLookupRelid = relid;
 		LastLookupRelMeta = rm;
 	}
@@ -2223,7 +2258,7 @@ RelationRowCacheBindRelation(Relation rel)
 		return;
 	}
 
-	rm = FindRelMeta(relid);
+	rm = FindRelMeta(MyDatabaseId, relid);
 	if (rm == NULL ||
 		pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
 	{
@@ -2247,7 +2282,7 @@ RelationRowCacheBindRelation(Relation rel)
 	{
 		if (LWLockConditionalAcquire(&rm->build_lock, LW_EXCLUSIVE))
 		{
-			if (rm->relid == relid &&
+			if (rm->dboid == MyDatabaseId && rm->relid == relid &&
 				pg_atomic_read_u32(&rm->state) == RELMETA_ENABLED &&
 				!RowCacheFingerprintMatches(rel, rm))
 			{
@@ -2258,6 +2293,7 @@ RelationRowCacheBindRelation(Relation rel)
 				ReleaseAllSegmentsForRel(rm);
 				rm->n_pkey_attrs = 0;
 				rm->pkey_total_len = 0;
+				rm->dboid = InvalidOid;
 				rm->relid = InvalidOid;
 				LastLookupRelMeta = NULL;
 				LastLookupRelid = InvalidOid;
@@ -2394,7 +2430,7 @@ RelationRowCacheBackfillBound(RelMeta *rm, Oid expected_relid,
 	if (!LWLockConditionalAcquire(&rm->build_lock, LW_SHARED))
 		return false;
 
-	if (rm->relid != expected_relid ||
+	if (rm->dboid != MyDatabaseId || rm->relid != expected_relid ||
 		pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED ||
 		rm->n_pkey_attrs != nvals)
 		goto out;
@@ -2449,9 +2485,10 @@ RelationRowCacheBackfillBound(RelMeta *rm, Oid expected_relid,
 	 * 已插同键 → 放弃。放弃时 bump 出的空间成为死数据,随段回收消失。
 	 */
 	if (pg_atomic_read_u64(&rm->inval_counter) == gen_seen &&
-		BucketLookup(bucket, expected_relid, pkey_hash,
+		BucketLookup(bucket, rm->dboid, expected_relid, pkey_hash,
 					 pkey_buf, pkey_len) == NULL)
 	{
+		e->dboid = rm->dboid;
 		e->relid = expected_relid;
 		BucketInsertHead(bucket, e);
 		inserted = true;
@@ -2481,7 +2518,7 @@ RelationRowCachePkeyAttno(Oid relid)
 		rm = LastLookupRelMeta;
 	else
 	{
-		rm = FindRelMeta(relid);
+		rm = FindRelMeta(MyDatabaseId, relid);
 		LastLookupRelid = relid;
 		LastLookupRelMeta = rm;
 	}
@@ -2512,7 +2549,7 @@ RelationRowCachePkeyDescriptor(Oid relid, AttrNumber *out_attnos,
 		rm = LastLookupRelMeta;
 	else
 	{
-		rm = FindRelMeta(relid);
+		rm = FindRelMeta(MyDatabaseId, relid);
 		LastLookupRelid = relid;
 		LastLookupRelMeta = rm;
 	}
@@ -2569,7 +2606,7 @@ RowCacheWashRound(void)
 
 		while (free_cnt < target)
 		{
-			int32		sid = SegEvictOne(InvalidOid);
+			int32		sid = SegEvictOne(InvalidOid, InvalidOid);
 
 			if (sid < 0)
 				break;			/* 没有可淘汰段(全 FREE/ACTIVE/表被锁) */
