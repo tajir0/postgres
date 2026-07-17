@@ -172,11 +172,12 @@ bool		row_cache_backfill = true;
  *                              - 8 列 int4       (32B)
  *                            更长的规范化键完整存放在条目头之后。
  *
- * ROW_CACHE_PKEY_MAX_BYTES — 单键编码上限(16KB)。桶链判等靠 pkey_hash
- * 前滤 + 逐字节 memcmp,超长键让哈希碰撞时的比较成本失控,且几百 KB 的
- * "主键"没有点查语义上的合理性。超限的行在所有路径同值拒绝:load 跳过
- * 该行、probe/回填按 miss 回退、DML 失效因该行从未入缓存而无需动作——
- * cap 在四条路径一致,不存在"缓存了却失效不掉"的组合。
+ * ROW_CACHE_PKEY_MAX_BYTES — 单键编码上限(16KB),**针对规范化后的键**
+ * (bpchar 去尾空格后;text/varchar/bytea 规范化长即原始长)。桶链判等靠
+ * pkey_hash 前滤 + 逐字节 memcmp,超长键让哈希碰撞时的比较成本失控,且
+ * 几百 KB 的"主键"没有点查语义上的合理性。超限的行在所有路径同值拒绝:
+ * load 跳过该行、probe/回填按 miss 回退、DML 失效因该行从未入缓存而无需
+ * 动作——cap 在四条路径一致,不存在"缓存了却失效不掉"的组合。
  */
 #define ROW_CACHE_PKEY_INLINE_BYTES	32
 #define ROW_CACHE_PKEY_MAX_BYTES	((uint32) (16 * 1024))
@@ -1024,8 +1025,22 @@ SerializePkeyDatum(Datum value, const RowCachePkeyDesc *desc,
 		if (desc->typlen != -1)
 			return false;
 
+		/*
+		 * 16KB 上限针对"规范化后的键"。text/varchar/bytea 的规范化长度
+		 * 等于原始长度,可以在 detoast 之前预检(顺便省掉超长值的
+		 * detoast);bpchar 的规范化会去掉等值语义忽略的尾部空格,必须
+		 * detoast 之后才知道键长——char(20000) 里存 'a' 的键只有 5 字
+		 * 节,不能按原始 20000 字节误拒。bpchar 只保留一道段大小的
+		 * detoast 成本防线(原始值超过一个段的 bpchar 主键没有实际场景,
+		 * 不值得为可能的短键付出 MB 级 detoast)。
+		 */
 		raw_size = toast_raw_datum_size(value);
-		if (raw_size > (Size) ROW_CACHE_PKEY_MAX_BYTES + VARHDRSZ)
+		if (desc->typid == BPCHAROID)
+		{
+			if (raw_size > (Size) ROW_CACHE_SEGMENT_SIZE + VARHDRSZ)
+				return false;
+		}
+		else if (raw_size > (Size) ROW_CACHE_PKEY_MAX_BYTES + VARHDRSZ)
 			return false;
 
 		detoasted = PG_DETOAST_DATUM_PACKED(value);
@@ -1033,6 +1048,14 @@ SerializePkeyDatum(Datum value, const RowCachePkeyDesc *desc,
 		if (desc->typid == BPCHAROID)
 			payload_len = (uint32) bpchartruelen(VARDATA_ANY(detoasted),
 												 (int) payload_len);
+
+		/* 规范化键长的权威终检(对 bpchar 是唯一一道 16KB 检查)。 */
+		if (payload_len > ROW_CACHE_PKEY_MAX_BYTES)
+		{
+			if (detoasted != original)
+				pfree(detoasted);
+			return false;
+		}
 
 		ok = SerializedPkeyAppend(key, &payload_len, sizeof(payload_len)) &&
 			SerializedPkeyAppend(key, VARDATA_ANY(detoasted), payload_len);

@@ -402,6 +402,32 @@ EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)
 "
 assert_index_searches keycap_over2.log 1 "超限键回填被拒, 仍回退原生"
 
+# bpchar:上限针对规范化键(去尾空格后),不按原始填充长度误拒。
+# char(20000) 存 'a' 的规范化键仅 5 字节,必须可缓存;
+# 规范化后仍超 16KB 的 bpchar 值则拒绝。
+run_sql keycap_bp_setup.log "
+CREATE TABLE t_keycap_bp (k char(20000) COLLATE \"C\" PRIMARY KEY, v text NOT NULL);
+INSERT INTO t_keycap_bp VALUES ('a', 'bp-short'), (repeat('B', 20000), 'bp-over');
+ANALYZE t_keycap_bp;
+SELECT pg_load_relation_row_cache('row_cache_s4.t_keycap_bp');
+"
+
+run_sql keycap_bp_short.log "
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)
+  SELECT v FROM t_keycap_bp WHERE k = 'a';
+SELECT 'B1=' || v FROM t_keycap_bp WHERE k = 'a';
+"
+assert_index_searches keycap_bp_short.log 0 "bpchar 规范化短键命中(不按填充长度误拒)"
+assert_result keycap_bp_short.log "B1=bp-short" "bpchar 规范化短键结果"
+
+run_sql keycap_bp_over.log "
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)
+  SELECT v FROM t_keycap_bp WHERE k = repeat('B', 20000)::char(20000);
+SELECT 'B2=' || v FROM t_keycap_bp WHERE k = repeat('B', 20000)::char(20000);
+"
+assert_index_searches keycap_bp_over.log 1 "bpchar 规范化后仍超限, 回退原生"
+assert_result keycap_bp_over.log "B2=bp-over" "bpchar 超限键结果正确"
+
 echo "=========================================="
 if [[ $FAILURES -eq 0 ]]; then
   echo " PASS - S4 变长主键、TOAST、复合边界、DML/回填与范围闸门全部正确"

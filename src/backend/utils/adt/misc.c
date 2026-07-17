@@ -85,6 +85,18 @@ load_relation_row_cache_internal(Oid relid)
 		return false;
 
 	/*
+	 * 锁前权限预检(best-effort):未授权请求绝不能进入 ShareLock 的
+	 * 等待队列——PG 锁队列公平排队,一个排在长写事务之后的未授权
+	 * ShareLock 请求,会连带阻塞其后本可与写事务并行的 RowExclusiveLock
+	 * (正常 DML)。此处无锁读 syscache 只作快速拒绝,不作准;等待期间
+	 * 的权限/表变化由取锁后的复查兜底。
+	 */
+	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid)))
+		return false;
+	if (pg_class_aclcheck(relid, GetUserId(), ACL_MAINTAIN) != ACLCHECK_OK)
+		return false;
+
+	/*
 	 * ShareLock:load 期间挡住 INSERT/UPDATE/DELETE(允许并发读)。
 	 *
 	 * 必须挡写:load 扫描拷贝某行之后、ENABLED 之前,并发 DML 的行级
@@ -104,9 +116,9 @@ load_relation_row_cache_internal(Oid relid)
 	}
 
 	/*
-	 * MAINTAIN(而非 SELECT):load 持 ShareLock 挡写直至全表扫完,
-	 * 只读用户不应能借此阻塞大表的 DML 与 autovacuum。语义与 VACUUM/
-	 * ANALYZE 对齐(owner 隐含 MAINTAIN)。
+	 * 锁后权威复查:MAINTAIN(而非 SELECT)——load 持 ShareLock 挡写
+	 * 直至全表扫完,只读用户不应能借此阻塞大表的 DML 与 autovacuum。
+	 * 语义与 VACUUM/ANALYZE 对齐(owner 隐含 MAINTAIN)。
 	 */
 	if (pg_class_aclcheck(relid, GetUserId(), ACL_MAINTAIN) != ACLCHECK_OK)
 	{
@@ -167,6 +179,12 @@ drop_relation_row_cache_internal(Oid relid)
 	Relation	rel;
 
 	if (!OidIsValid(relid))
+		return false;
+
+	/* 与 load 对称:锁前预检,未授权请求不进入锁等待队列。 */
+	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid)))
+		return false;
+	if (pg_class_aclcheck(relid, GetUserId(), ACL_MAINTAIN) != ACLCHECK_OK)
 		return false;
 
 	rel = try_table_open(relid, AccessShareLock);
