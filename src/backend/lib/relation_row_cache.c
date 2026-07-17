@@ -200,7 +200,7 @@ typedef struct RelMeta
 	 * ConditionalAcquire 对方的 build_lock。
 	 */
 	int32			first_seg;		/* 段链头;-1 = 无 */
-	int32			cur_seg;		/* 当前写入段(仅 LOADING 期间);-1 = 无 */
+	int32			cur_seg;		/* 当前写入段(LOADING 或回填);-1 = 无 */
 
 	/*
 	 * schema 指纹(S2):load 时拍下,bind 慢路径(relcache 重建后的
@@ -259,6 +259,7 @@ typedef struct GlobalEntry
 #define ROW_CACHE_SCORE_DECAY		0.9
 #define ROW_CACHE_WASH_INTERVAL_MS	200
 #define ROW_CACHE_SEAL_BASE_SCORE	1.0		/* 封存时的起步分,防新段被立即误杀 */
+#define ROW_CACHE_SEAL_IDLE_ROUNDS	5		/* ACTIVE 段空闲 N 轮(约 1s)后封存 */
 
 /*
  * 段描述符(池外定长数组)。字段无原子:分配/封存由持 build_lock 的
@@ -300,6 +301,15 @@ typedef struct RowCacheSegment
 	 */
 	pg_atomic_uint32 recent_get_cnt;
 	double		score;
+
+	/*
+	 * washer 私有的空闲检测(seg_lock 下读写):ACTIVE 段(主要是回填
+	 * 段)连续 ROW_CACHE_SEAL_IDLE_ROUNDS 轮 used 无增长即被封存为
+	 * FULL 参与淘汰——否则每表一个常驻 ACTIVE 回填段,少量回填就能把
+	 * 整个段池占成不可淘汰。
+	 */
+	uint32		wash_seen_used;
+	uint16		wash_idle_rounds;
 } RowCacheSegment;
 
 /*
@@ -646,6 +656,8 @@ RowCacheShmemInit(void)
 		pg_atomic_init_u32(&seg->pin_cnt, 0);
 		pg_atomic_init_u32(&seg->recent_get_cnt, 0);
 		seg->score = 0.0;
+		seg->wash_seen_used = 0;
+		seg->wash_idle_rounds = 0;
 	}
 	RowCacheCtl->free_seg_head = (nsegs > 0) ? 0 : -1;
 }
@@ -1116,6 +1128,18 @@ SegPrepareReuse(int32 sid)
 	pg_atomic_write_u32(&seg->n_entries, 0);
 	pg_atomic_write_u32(&seg->recent_get_cnt, 0);
 	seg->score = 0.0;
+	seg->wash_seen_used = 0;
+	seg->wash_idle_rounds = 0;
+}
+
+/* 调用方持 seg_lock EXCLUSIVE。保留 ACTIVE 段已经积累的热点分数。 */
+static inline void
+SegSeal(RowCacheSegment *seg)
+{
+	Assert(seg->state == RC_SEG_ACTIVE || seg->state == RC_SEG_FULL);
+	seg->state = RC_SEG_FULL;
+	seg->score = Max(seg->score, ROW_CACHE_SEAL_BASE_SCORE);
+	seg->wash_idle_rounds = 0;
 }
 
 /*
@@ -1151,22 +1175,42 @@ ReleaseAllSegmentsForRel(RelMeta *rm)
 }
 
 /*
- * 衰减打分刷新(S3):score = score×0.9 + recent_get_cnt(取出清零)。
- * 调用方持 seg_lock EXCLUSIVE。washer 每个洗段周期跑一轮;同步淘汰
- * 路径在打分陈旧(超过一个周期)时补跑。
+ * 段周期维护(S3),调用方持 seg_lock EXCLUSIVE:
+ *   1. 刷新衰减 LFU 分数 score = score×0.9 + recent_get_cnt;
+ *   2. ACTIVE 段连续若干轮 used 无增长后封存为 FULL,使少量回填形成的
+ *      尾段也能参与淘汰。
+ *
+ * washer 每周期调用;同步淘汰路径在维护时间戳陈旧时补跑。两项维护合并
+ * 为一次全段扫描,避免在全局段锁下重复遍历大段池。
  */
 static void
-RowCacheRefreshScoresLocked(void)
+RowCacheRefreshSegmentsLocked(void)
 {
 	for (int32 s = 0; s < RowCacheCtl->n_segments; s++)
 	{
 		RowCacheSegment *seg = &RowCacheSegs[s];
 		uint32		recent = pg_atomic_exchange_u32(&seg->recent_get_cnt, 0);
+		uint32		used_now;
 
 		if (seg->state == RC_SEG_FREE)
+		{
 			seg->score = 0.0;
-		else
-			seg->score = seg->score * ROW_CACHE_SCORE_DECAY + (double) recent;
+			continue;
+		}
+
+		seg->score = seg->score * ROW_CACHE_SCORE_DECAY + (double) recent;
+
+		if (seg->state != RC_SEG_ACTIVE || !OidIsValid(seg->relid))
+			continue;
+
+		used_now = pg_atomic_read_u32(&seg->used);
+		if (used_now != seg->wash_seen_used)
+		{
+			seg->wash_seen_used = used_now;
+			seg->wash_idle_rounds = 0;
+		}
+		else if (++seg->wash_idle_rounds >= ROW_CACHE_SEAL_IDLE_ROUNDS)
+			SegSeal(seg);
 	}
 	RowCacheCtl->last_score_refresh = GetCurrentTimestamp();
 }
@@ -1239,7 +1283,7 @@ SegEvictOne(Oid exempt_dboid, Oid exempt_relid)
 	if (TimestampDifferenceExceeds(RowCacheCtl->last_score_refresh,
 								   GetCurrentTimestamp(),
 								   ROW_CACHE_WASH_INTERVAL_MS))
-		RowCacheRefreshScoresLocked();
+		RowCacheRefreshSegmentsLocked();
 
 	for (;;)
 	{
@@ -1424,10 +1468,7 @@ SegBackfillAlloc(RelMeta *rm, Size need)
 			nseg->next_seg = rm->first_seg;
 		}
 		if (sid >= 0)
-		{
-			RowCacheSegs[sid].state = RC_SEG_FULL;
-			RowCacheSegs[sid].score = ROW_CACHE_SEAL_BASE_SCORE;
-		}
+			SegSeal(&RowCacheSegs[sid]);
 		rm->first_seg = nid;
 		rm->cur_seg = nid;
 		LWLockRelease(&RowCacheCtl->seg_lock);
@@ -1481,6 +1522,7 @@ SegAllocEntry(RelMeta *rm, Size need)
 			{
 				RowCacheSegment *nseg = &RowCacheSegs[nid];
 
+				nseg->dboid = rm->dboid;	/* 淘汰者按 (dboid,relid) 反查属主 */
 				nseg->relid = rm->relid;
 				nseg->state = RC_SEG_ACTIVE;
 				pg_atomic_write_u32(&nseg->used, 0);
@@ -1491,8 +1533,7 @@ SegAllocEntry(RelMeta *rm, Size need)
 			if (sid >= 0)
 			{
 				/* 封存旧段:给起步分,防"刚写满还没被读过"的段被立即误杀。 */
-				RowCacheSegs[sid].state = RC_SEG_FULL;
-				RowCacheSegs[sid].score = ROW_CACHE_SEAL_BASE_SCORE;
+				SegSeal(&RowCacheSegs[sid]);
 			}
 			rm->first_seg = nid;
 			rm->cur_seg = nid;
@@ -1833,8 +1874,7 @@ RelationRowCacheLoadRelation(Relation rel)
 	if (rm->cur_seg >= 0)
 	{
 		LWLockAcquire(&RowCacheCtl->seg_lock, LW_EXCLUSIVE);
-		RowCacheSegs[rm->cur_seg].state = RC_SEG_FULL;
-		RowCacheSegs[rm->cur_seg].score = ROW_CACHE_SEAL_BASE_SCORE;
+		SegSeal(&RowCacheSegs[rm->cur_seg]);
 		rm->cur_seg = -1;
 		LWLockRelease(&RowCacheCtl->seg_lock);
 	}
@@ -1988,6 +2028,59 @@ RelationRowCacheDropRelation(Oid relid)
 	pg_atomic_fetch_add_u32(&RowCacheCtl->global_gen.value, 1);
 }
 
+/*
+ * DROP DATABASE 钩子:清掉目标库在共享缓存里的全部 RelMeta 槽与段。
+ *
+ * 必须由 dropdb(dbcommands.c)调用:缓存身份是 (dboid, relid),库删
+ * 掉后不再有任何 backend 能以该库身份 bind/drop 这些槽——不清理则
+ * 每删一个已加载缓存的库就永久泄漏若干 RelMeta 槽(上限 64,耗尽后
+ * 只能重启)。调用时 dropdb 已确保目标库无活跃连接,build_lock 至多
+ * 被别库的淘汰者短暂 conditional 持有,常规 Acquire 等待即可。
+ */
+void
+RelationRowCacheDropDatabase(Oid dboid)
+{
+	int			ndropped = 0;
+
+	if (RowCacheCtl == NULL || !OidIsValid(dboid))
+		return;
+
+	for (int i = 0; i < ROW_CACHE_MAX_RELATIONS; i++)
+	{
+		RelMeta    *rm = &RowCacheCtl->relmetas[i];
+
+		if (rm->dboid != dboid || !OidIsValid(rm->relid))
+			continue;
+
+		LWLockAcquire(&rm->build_lock, LW_EXCLUSIVE);
+
+		/* 持锁重验:期间槽可能已被并发 drop/复用。 */
+		if (rm->dboid == dboid && OidIsValid(rm->relid))
+		{
+			pg_atomic_write_u32(&rm->state, RELMETA_DISABLED);
+			pg_memory_barrier();
+
+			ReleaseAllSegmentsForRel(rm);
+
+			rm->n_pkey_attrs = 0;
+			rm->pkey_total_len = 0;
+			rm->dboid = InvalidOid;
+			rm->relid = InvalidOid;
+			ndropped++;
+		}
+		LWLockRelease(&rm->build_lock);
+	}
+
+	if (ndropped > 0)
+	{
+		LastLookupRelMeta = NULL;
+		LastLookupRelid = InvalidOid;
+		pg_atomic_fetch_add_u32(&RowCacheCtl->global_gen.value, 1);
+		elog(DEBUG1, "row cache: dropped %d relation(s) of database %u",
+			 ndropped, dboid);
+	}
+}
+
 static bool
 DoPkeyFetchBytes(RelMeta *rm, Oid relid,
 				 const uint8 *pkey_buf, int pkey_len,
@@ -2004,6 +2097,15 @@ DoPkeyFetchBytes(RelMeta *rm, Oid relid,
 	int32			sid;
 	uint32			seq_seen;
 
+	/*
+	 * 槽位换代(ABA)防御:probe 无锁,rm 可能已被释放并复用给另一个
+	 * (dboid, relid) 组合——长生命周期执行器(游标/缓存计划)持有的
+	 * 绑定不会因 global_gen 变化而立即重建。这里做快速拒绝,而真正的
+	 * 硬保证在下面:查桶键锚定在不可变的 MyDatabaseId 上,即使 rm 在
+	 * 校验后被并发换代,也只可能命中(本库, 本表, 本键)的真条目。
+	 */
+	if (rm->dboid != MyDatabaseId)
+		return false;
 	if (pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
 		return false;
 	pg_read_barrier();
@@ -2024,7 +2126,8 @@ DoPkeyFetchBytes(RelMeta *rm, Oid relid,
 	 */
 	LWLockAcquire(part, LW_SHARED);
 
-	entry = BucketLookup(bucket, rm->dboid, relid, hash, pkey_buf, pkey_len);
+	/* 查桶键用不可变的 MyDatabaseId,绝不用可变的 rm->dboid(ABA)。 */
+	entry = BucketLookup(bucket, MyDatabaseId, relid, hash, pkey_buf, pkey_len);
 	if (entry == NULL)
 	{
 		LWLockRelease(part);
@@ -2348,7 +2451,8 @@ RelationRowCachePkeyFetchBound(RelMeta *rm,
 	if (!IsMVCCSnapshot(snapshot))
 		return false;
 
-	if (rm->relid != expected_relid)
+	/* 槽位换代防御:身份 = (dboid, relid),缺一不可。 */
+	if (rm->dboid != MyDatabaseId || rm->relid != expected_relid)
 		return false;
 
 	if (pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
@@ -2485,10 +2589,10 @@ RelationRowCacheBackfillBound(RelMeta *rm, Oid expected_relid,
 	 * 已插同键 → 放弃。放弃时 bump 出的空间成为死数据,随段回收消失。
 	 */
 	if (pg_atomic_read_u64(&rm->inval_counter) == gen_seen &&
-		BucketLookup(bucket, rm->dboid, expected_relid, pkey_hash,
+		BucketLookup(bucket, MyDatabaseId, expected_relid, pkey_hash,
 					 pkey_buf, pkey_len) == NULL)
 	{
-		e->dboid = rm->dboid;
+		e->dboid = MyDatabaseId;
 		e->relid = expected_relid;
 		BucketInsertHead(bucket, e);
 		inserted = true;
@@ -2572,8 +2676,8 @@ RelationRowCachePkeyDescriptor(Oid relid, AttrNumber *out_attnos,
  * 后台洗段进程(S3,对应 OceanBase 的 wash 定时线程)
  *
  * 每 ROW_CACHE_WASH_INTERVAL_MS 一轮:
- *   1. 衰减打分刷新(score = score×0.9 + recent_get_cnt);
- *   2. 若上个周期出现过段需求(seg_demand > 0),把 score 最低的
+ *   1. 衰减打分并封存空闲的 ACTIVE 尾段;
+ *   2. 若此前出现过段需求(seg_demand > 0),把 score 最低的
  *      FULL 段洗回空闲链,直至水位 max(1, n_segments/16)。
  *
  * "无需求不洗段"避免蚕食合法占满池子的常驻表;洗段遵循与同步淘汰
@@ -2592,7 +2696,7 @@ RowCacheWashRound(void)
 
 	LWLockAcquire(&RowCacheCtl->seg_lock, LW_EXCLUSIVE);
 
-	RowCacheRefreshScoresLocked();
+	RowCacheRefreshSegmentsLocked();
 
 	demand = pg_atomic_exchange_u32(&RowCacheCtl->seg_demand, 0);
 	if (demand > 0)
@@ -2614,6 +2718,14 @@ RowCacheWashRound(void)
 			RowCacheCtl->free_seg_head = sid;
 			free_cnt++;
 		}
+
+		/*
+		 * 暂时全是 ACTIVE 段或属主正忙时保留一个需求信号。待尾段
+		 * 达到空闲阈值或 build_lock 释放后,后续轮次会自动补足水位,
+		 * 不要求前台查询再次 miss 才能推动回收。
+		 */
+		if (free_cnt < target)
+			pg_atomic_fetch_add_u32(&RowCacheCtl->seg_demand, 1);
 	}
 
 	LWLockRelease(&RowCacheCtl->seg_lock);

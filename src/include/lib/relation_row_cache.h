@@ -51,6 +51,9 @@ extern void RowCacheOnHeapDelete(Relation rel,
 extern void RelationRowCacheLoadRelation(Relation rel);
 extern void RelationRowCacheDropRelation(Oid relid);
 
+/* DROP DATABASE 钩子:清掉目标库的全部缓存槽与段(命令及 WAL redo 调用)。 */
+extern void RelationRowCacheDropDatabase(Oid dboid);
+
 /*
  *
  * RelationRowCachePkeyFetch       — 单列 pkey 关系。

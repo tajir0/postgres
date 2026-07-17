@@ -49,6 +49,7 @@
 #include "commands/seclabel.h"
 #include "commands/tablespace.h"
 #include "common/file_perm.h"
+#include "lib/relation_row_cache.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -1859,6 +1860,13 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 	DropDatabaseBuffers(db_id);
 
 	/*
+	 * 清掉该库在共享行缓存里的全部槽位与段。缓存身份是 (dboid, relid),
+	 * 库删掉后不再有 backend 能以该库身份触达这些槽,不清理会永久泄漏
+	 * RelMeta 槽位(上限固定,耗尽只能重启)。
+	 */
+	RelationRowCacheDropDatabase(db_id);
+
+	/*
 	 * Tell checkpointer to forget any pending fsync and unlink requests for
 	 * files in the database; else the fsyncs will fail at next checkpoint, or
 	 * worse, it will delete files that belong to a newly created database
@@ -3433,6 +3441,9 @@ dbase_redo(XLogReaderState *record)
 
 		/* Drop pages for this database that are in the shared buffer cache */
 		DropDatabaseBuffers(xlrec->db_id);
+
+		/* Drop shared row-cache state for the database as well. */
+		RelationRowCacheDropDatabase(xlrec->db_id);
 
 		/* Also, clean out any fsync requests that might be pending in md.c */
 		ForgetDatabaseSyncRequests(xlrec->db_id);
