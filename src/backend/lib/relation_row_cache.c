@@ -47,16 +47,18 @@
  *       (bind 在 RelationBuildDesc 的禁 catalog 区域内运行);
  *       "删主键约束"由执行器侧 indisunique 门槛封堵(execRowcache.c)。
  *
- *   Todo:
- *     - S3:衰减 LFU 打分 + 后台洗段 + 点查 miss 按需回填
+ *   S4:
+ *     - 主键编码支持确定性 collation 的 text/varchar/bpchar、uuid 与
+ *       bytea。varlena 统一 detoast 后规范化,短键内联、长键尾随条目。
  *
- *   Pkey 限制:1..ROW_CACHE_PKEY_MAX_ATTS 个传值列。pkey 为传引用的表在
- *   Load 时被静默跳过(不报错,不建任何 entry)。
+ *   Pkey 限制:1..ROW_CACHE_PKEY_MAX_ATTS 列;除原有传值类型外,传引用
+ *   类型仅接受 S4 P1 白名单。其它类型在 Load 时静默跳过。
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
+#include "access/detoast.h"
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/relation.h"
@@ -65,6 +67,7 @@
 #include "access/xact.h"
 #include "common/hashfn.h"
 #include "catalog/pg_index.h"
+#include "catalog/pg_type_d.h"
 #include "executor/tuptable.h"
 #include "lib/relation_row_cache.h"
 #include "miscadmin.h"
@@ -84,10 +87,13 @@
 #include "tcop/tcopprot.h"
 #include "utils/guc.h"
 #include "utils/guc_hooks.h"
+#include "utils/builtins.h"
 #include "utils/wait_event.h"
 #include "utils/dsa.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
+#include "utils/fmgroids.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/relcache.h"
@@ -147,21 +153,30 @@ bool		row_cache_backfill = true;
  */
 
 /*
+ * 段大小:固定 1MB。足够容纳千列宽行(超过段容量的单行在 load 时跳过,
+ * 读路径 miss 回退原生,正确性无损),又保持淘汰粒度精细。
+ */
+#define ROW_CACHE_SEGMENT_SIZE	((uint32) (1024 * 1024))
+
+/*
  * Pkey 存储参数。
  *
  * ROW_CACHE_PKEY_MAX_ATTS  — Load 资格检查时接受的最大 pkey 列数。
  *
- * ROW_CACHE_PKEY_INLINE_BYTES — 内嵌进 GlobalEntry 的序列化(拼接)pkey
- *                            的最大字节长度。32 字节覆盖以下任一:
+ * ROW_CACHE_PKEY_INLINE_BYTES — GlobalEntry 内联的短键容量。32 字节覆盖:
  *                              - 1 列 int8        (8B)
  *                              - 2 列 int8       (16B)
  *                              - 3 列 int8       (24B)
  *                              - 4 列 int8       (32B)
  *                              - 4 列 int4       (16B)
  *                              - 8 列 int4       (32B)
- *                            传引用pkey的表资格检查失败、保持不缓存。
+ *                            更长的规范化键完整存放在条目头之后。
+ *
+ * ROW_CACHE_PKEY_MAX_BYTES — 单键编码上限。最终 entry 还要容纳同一行的
+ * FlatCachedTuple,若两者合计超过一个段,该行仍按 oversized 跳过。
  */
 #define ROW_CACHE_PKEY_INLINE_BYTES	32
+#define ROW_CACHE_PKEY_MAX_BYTES		ROW_CACHE_SEGMENT_SIZE
 
 StaticAssertDecl(ROW_CACHE_PKEY_MAX_ATTS <= INDEX_MAX_KEYS,
 				 "ROW_CACHE_PKEY_MAX_ATTS must not exceed INDEX_MAX_KEYS");
@@ -182,17 +197,11 @@ typedef struct RelMeta
 	/*
 	 * Pkey 描述符。
 	 *
-	 * 支持单列与复合传值键,最多 ROW_CACHE_PKEY_MAX_ATTS 列、序列化总长
-	 * <= ROW_CACHE_PKEY_INLINE_BYTES。
-	 *
-	 * 传引用 pkey 不在范围内:故资格检查成功后 pkey_byvals[] 恒为 true;
-	 * 这个字段保留是为将来支持传引用留一个干净的扩展点
+	 * 支持单列与复合键,最多 ROW_CACHE_PKEY_MAX_ATTS 列。描述符同时保存
+	 * 类型、传值方式与主索引 collation,供四条键路径共享规范化规则。
 	 */
 	int				n_pkey_attrs;	/* 不合格 / 未加载时为 0 */
-	AttrNumber		pkey_attnos[ROW_CACHE_PKEY_MAX_ATTS];
-	int16			pkey_typlens[ROW_CACHE_PKEY_MAX_ATTS];
-	bool			pkey_byvals[ROW_CACHE_PKEY_MAX_ATTS];
-	int				pkey_total_len;	/* pkey_typlens 之和, <= ROW_CACHE_PKEY_INLINE_BYTES */
+	RowCachePkeyDesc pkey_descs[ROW_CACHE_PKEY_MAX_ATTS];
 
 	/*
 	 * 本关系持有的段链(seg id,经 RowCacheSegment.next_seg 串联)。
@@ -229,19 +238,25 @@ typedef struct GlobalEntry
 	Oid				dboid;			/* 所属数据库(条目键的一部分,防跨库串数据) */
 	Oid				relid;
 	uint32			pkey_hash;
-	uint8			pkey_len;		/* 序列化长度, <= ROW_CACHE_PKEY_INLINE_BYTES */
-	uint8			pkey_buf[ROW_CACHE_PKEY_INLINE_BYTES];
+	uint32			pkey_len;		/* 规范化键长度 */
+	uint8			pkey_inline[ROW_CACHE_PKEY_INLINE_BYTES];
 	ItemPointerData	tid;			/* Load 时的 heap TID(填 slot 用) */
-	uint32			span;			/* 本条目在段内占用的总字节数(含内联 flat) */
+	uint32			span;			/* 条目头 + 可选长键 + 内联 flat 的总字节数 */
 	struct GlobalEntry *next;		/* 桶链上的下一个 GlobalEntry(真实指针) */
-	/* FlatCachedTuple 载荷内联紧随其后(MAXALIGN 对齐),见 ENTRY_FLAT */
+	/* 长键(若有)与 FlatCachedTuple 尾随其后,见 EntryPkeyData/ENTRY_FLAT。 */
 } GlobalEntry;
 
 /*
- * 段大小:固定 1MB。足够容纳千列宽行(超过段容量的单行在 load 时跳过,
- * 读路径 miss 回退原生,正确性无损),又保持淘汰粒度精细。
+ * 一次键序列化的 backend 本地工作区。短键零分配;超过 32 字节才
+ * palloc/repalloc,调用方用 SerializedPkeyRelease 配平。
  */
-#define ROW_CACHE_SEGMENT_SIZE	((uint32) (1024 * 1024))
+typedef struct SerializedPkey
+{
+	uint8		   *data;
+	uint32		len;
+	uint32		capacity;
+	uint8		inline_data[ROW_CACHE_PKEY_INLINE_BYTES];
+} SerializedPkey;
 
 /* RowCacheSegment.state 取值。 */
 #define RC_SEG_FREE		0		/* 在全局空闲链上 */
@@ -388,9 +403,34 @@ typedef struct FlatCachedTuple
 #define FLAT_TUPLE_HTUP_DATA(ft) \
 	((char *)(ft) + (ft)->htup_offset)
 
-/* GlobalEntry 之后内联的 FlatCachedTuple。 */
+/* 长键完整存于固定头之后;短键直接使用头内的 pkey_inline。 */
+static inline uint8 *
+EntryPkeyData(GlobalEntry *e)
+{
+	if (e->pkey_len <= ROW_CACHE_PKEY_INLINE_BYTES)
+		return e->pkey_inline;
+	return (uint8 *) e + MAXALIGN(sizeof(GlobalEntry));
+}
+
+static inline const uint8 *
+EntryPkeyDataConst(const GlobalEntry *e)
+{
+	return EntryPkeyData((GlobalEntry *) e);
+}
+
+/* FlatCachedTuple 起点取决于长键长度,并始终保持 MAXALIGN。 */
+static inline Size
+EntryFlatOffset(uint32 pkey_len)
+{
+	Size		off = MAXALIGN(sizeof(GlobalEntry));
+
+	if (pkey_len > ROW_CACHE_PKEY_INLINE_BYTES)
+		off = MAXALIGN(off + pkey_len);
+	return off;
+}
+
 #define ENTRY_FLAT(e) \
-	((FlatCachedTuple *) ((char *) (e) + MAXALIGN(sizeof(GlobalEntry))))
+	((FlatCachedTuple *) ((char *) (e) + EntryFlatOffset((e)->pkey_len)))
 
 static Size FlatTupleComputeSize(TupleTableSlot *slot, HeapTuple htup,
 								 uint32 *htup_offset_out,
@@ -463,15 +503,18 @@ rowcache_relcache_callback(Datum arg, Oid relid)
 
 static RelMeta *AllocateOrFindRelMeta(Oid dboid, Oid relid);
 static bool CheckEligiblePkey(Relation rel, RelMeta *rm);
-static int SerializePkeyFromSlot(TupleTableSlot *slot, RelMeta *rm,
-								 uint8 *out_buf);
-static int SerializePkeyFromTuple(HeapTuple tuple, TupleDesc desc,
-								  int n_pkey_attrs, const AttrNumber *attnos,
-								  const int16 *typlens, uint8 *out_buf);
-static int SerializePkeyFromDatum(Datum d, RelMeta *rm, uint8 *out_buf);
-static int SerializePkeyFromDatumArray(const Datum *vals, int nvals,
-									   RelMeta *rm, uint8 *out_buf);
-static inline uint32 ComputePkeyHashBytes(const uint8 *buf, int len);
+static bool SerializePkeyFromSlot(TupleTableSlot *slot, int n_pkey_attrs,
+									  const RowCachePkeyDesc *descs,
+									  SerializedPkey *key);
+static bool SerializePkeyFromTuple(HeapTuple tuple, TupleDesc desc,
+									   int n_pkey_attrs,
+									   const RowCachePkeyDesc *descs,
+									   SerializedPkey *key);
+static bool SerializePkeyFromDatumArray(const Datum *vals, int nvals,
+										const RowCachePkeyDesc *descs,
+										SerializedPkey *key);
+static void SerializedPkeyRelease(SerializedPkey *key);
+static inline uint32 ComputePkeyHashBytes(const uint8 *buf, uint32 len);
 static void SegUnlinkEntries(int32 sid);
 static void ReleaseAllSegmentsForRel(RelMeta *rm);
 static void SegPrepareReuse(int32 sid);
@@ -583,7 +626,7 @@ RowCacheShmemInit(void)
 	Size		off;
 	int32		nsegs = RowCacheNSegments();
 
-	base = (char *) ShmemInitStruct("Row Cache Control V5",
+	base = (char *) ShmemInitStruct("Row Cache Control V6",
 									RowCacheShmemSize(),
 									&found);
 
@@ -628,7 +671,6 @@ RowCacheShmemInit(void)
 		pg_atomic_init_u32(&rm->state, RELMETA_DISABLED);
 		LWLockInitialize(&rm->build_lock, LWTRANCHE_ROW_CACHE_RELMETA);
 		rm->n_pkey_attrs = 0;
-		rm->pkey_total_len = 0;
 		rm->first_seg = -1;
 		rm->cur_seg = -1;
 		rm->fp_relfilenumber = InvalidRelFileNumber;
@@ -734,7 +776,6 @@ AllocateOrFindRelMeta(Oid dboid, Oid relid)
 			cand->relid = relid;
 			pg_atomic_write_u32(&cand->state, RELMETA_DISABLED);
 			cand->n_pkey_attrs = 0;
-			cand->pkey_total_len = 0;
 			cand->first_seg = -1;
 			cand->cur_seg = -1;
 			rm = cand;
@@ -754,17 +795,15 @@ AllocateOrFindRelMeta(Oid dboid, Oid relid)
  * 检查 rel 的主键,若合格则填充 `rm` 的 pkey 描述符部分:
  *
  *   - n_pkey_attrs       — pkey 列数(1..ROW_CACHE_PKEY_MAX_ATTS)
- *   - pkey_attnos[]      — 每个 pkey 列的 heap attno,按索引顺序
- *   - pkey_typlens[]     — 每个 pkey 列的 attlen(1/2/4/8)
- *   - pkey_byvals[]      — 恒为 true(传引用不在范围内)
- *   - pkey_total_len     — pkey_typlens 之和, <= ROW_CACHE_PKEY_INLINE_BYTES
+ *   - pkey_descs[]       — heap attno、类型、typlen/byval 与 collation
  *
  * 被拒情形:
  *   - 关系没有主键(或主键是 deferrable)
  *   - 任一 pkey 列是系统列 / 表达式(attno <= 0)
- *   - 任一 pkey 列是传引用、或 attlen 异常(<=0 或 > 8)
+ *   - 传值列 attlen 不是 1/2/4/8
+ *   - 传引用列不在 S4 P1 白名单(text/varchar/bpchar/uuid/bytea)
+ *   - 字符串列使用非确定性 collation 或非内置字节等值语义
  *   - 列数超过 ROW_CACHE_PKEY_MAX_ATTS
- *   - 序列化总长 > ROW_CACHE_PKEY_INLINE_BYTES
  */
 static bool
 CheckEligiblePkey(Relation rel, RelMeta *rm)
@@ -773,12 +812,10 @@ CheckEligiblePkey(Relation rel, RelMeta *rm)
 	Relation	pkindex;
 	Form_pg_index ind;
 	int			natts;
-	int			total = 0;
-	AttrNumber	attnos[ROW_CACHE_PKEY_MAX_ATTS];
-	int16		typlens[ROW_CACHE_PKEY_MAX_ATTS];
+	RowCachePkeyDesc descs[ROW_CACHE_PKEY_MAX_ATTS];
+	bool		eligible = false;
 
 	rm->n_pkey_attrs = 0;
-	rm->pkey_total_len = 0;
 
 	pkindex_oid = RelationGetPrimaryKeyIndex(rel, false);
 	if (!OidIsValid(pkindex_oid))
@@ -789,153 +826,296 @@ CheckEligiblePkey(Relation rel, RelMeta *rm)
 
 	if (ind == NULL || ind->indnkeyatts <= 0 ||
 		ind->indnkeyatts > ROW_CACHE_PKEY_MAX_ATTS)
-	{
-		index_close(pkindex, AccessShareLock);
-		return false;
-	}
+		goto out;
 
 	natts = ind->indnkeyatts;
 	for (int i = 0; i < natts; i++)
 	{
 		AttrNumber	attno = ind->indkey.values[i];
 		Form_pg_attribute attr;
+		Oid			collation;
+		RegProcedure expected_eq = InvalidOid;
 
 		if (attno <= 0)
-		{
-			/* 系统列 / 表达式键 —— 不支持 */
-			index_close(pkindex, AccessShareLock);
-			return false;
-		}
+			goto out;			/* 系统列 / 表达式键 */
 
 		attr = TupleDescAttr(RelationGetDescr(rel), attno - 1);
+		collation = pkindex->rd_indcollation[i];
 
-		/* 仅传值。拒绝传引用或异常 attlen。 */
-		if (!attr->attbyval ||
-			attr->attlen <= 0 ||
-			attr->attlen > (int) sizeof(uint64))
+		if (attr->attbyval)
 		{
-			index_close(pkindex, AccessShareLock);
-			return false;
+			if (attr->attlen != 1 && attr->attlen != 2 &&
+				attr->attlen != 4 && attr->attlen != 8)
+				goto out;
+		}
+		else
+		{
+			switch (attr->atttypid)
+			{
+				case TEXTOID:
+				case VARCHAROID:
+					expected_eq = F_TEXTEQ;
+					break;
+				case BPCHAROID:
+					expected_eq = F_BPCHAREQ;
+					break;
+				case BYTEAOID:
+					expected_eq = F_BYTEAEQ;
+					break;
+				case UUIDOID:
+					expected_eq = F_UUID_EQ;
+					break;
+				default:
+					goto out;
+			}
+
+			if (attr->atttypid == UUIDOID)
+			{
+				if (attr->attlen != 16)
+					goto out;
+			}
+			else if (attr->attlen != -1)
+				goto out;
+
+			if (attr->atttypid == TEXTOID ||
+				attr->atttypid == VARCHAROID ||
+				attr->atttypid == BPCHAROID)
+			{
+				if (!OidIsValid(collation) ||
+					!get_collation_isdeterministic(collation))
+					goto out;
+			}
+
+			/*
+			 * 白名单类型仍可能使用自定义 opclass。只有等值操作最终
+			 * 落到相应内置字节等值函数时,下面的规范化编码才成立。
+			 */
+			{
+				Oid			eqop;
+
+				eqop = get_opfamily_member(pkindex->rd_opfamily[i],
+									   pkindex->rd_opcintype[i],
+									   pkindex->rd_opcintype[i],
+									   BTEqualStrategyNumber);
+				if (!OidIsValid(eqop) || get_opcode(eqop) != expected_eq)
+					goto out;
+			}
 		}
 
-		if (total + attr->attlen > ROW_CACHE_PKEY_INLINE_BYTES)
-		{
-			index_close(pkindex, AccessShareLock);
-			return false;
-		}
-
-		attnos[i] = attno;
-		typlens[i] = attr->attlen;
-		total += attr->attlen;
+		descs[i].attno = attno;
+		descs[i].typlen = attr->attlen;
+		descs[i].byval = attr->attbyval;
+		descs[i].typid = attr->atttypid;
+		descs[i].collation = collation;
 	}
-
-	index_close(pkindex, AccessShareLock);
 
 	/* 把描述符提交进 RelMeta。 */
 	rm->n_pkey_attrs = natts;
-	rm->pkey_total_len = total;
-	for (int i = 0; i < natts; i++)
+	memcpy(rm->pkey_descs, descs, sizeof(RowCachePkeyDesc) * natts);
+	eligible = true;
+
+out:
+	index_close(pkindex, AccessShareLock);
+	return eligible;
+}
+
+static inline void
+SerializedPkeyInit(SerializedPkey *key)
+{
+	key->data = key->inline_data;
+	key->len = 0;
+	key->capacity = ROW_CACHE_PKEY_INLINE_BYTES;
+}
+
+static void
+SerializedPkeyRelease(SerializedPkey *key)
+{
+	if (key->data != key->inline_data)
+		pfree(key->data);
+	SerializedPkeyInit(key);
+}
+
+static bool
+SerializedPkeyEnsure(SerializedPkey *key, uint32 addlen)
+{
+	uint32		needed;
+	uint32		newcap;
+	uint8	   *newdata;
+
+	if (addlen > ROW_CACHE_PKEY_MAX_BYTES - key->len)
+		return false;
+	needed = key->len + addlen;
+	if (needed <= key->capacity)
+		return true;
+
+	newcap = key->capacity;
+	while (newcap < needed)
 	{
-		rm->pkey_attnos[i] = attnos[i];
-		rm->pkey_typlens[i] = typlens[i];
-		rm->pkey_byvals[i] = true;
+		if (newcap > ROW_CACHE_PKEY_MAX_BYTES / 2)
+		{
+			newcap = ROW_CACHE_PKEY_MAX_BYTES;
+			break;
+		}
+		newcap *= 2;
+	}
+
+	if (key->data == key->inline_data)
+	{
+		newdata = palloc(newcap);
+		memcpy(newdata, key->inline_data, key->len);
+	}
+	else
+		newdata = repalloc(key->data, newcap);
+
+	key->data = newdata;
+	key->capacity = newcap;
+	return true;
+}
+
+static bool
+SerializedPkeyAppend(SerializedPkey *key, const void *data, uint32 len)
+{
+	if (!SerializedPkeyEnsure(key, len))
+		return false;
+	if (len > 0)
+		memcpy(key->data + key->len, data, len);
+	key->len += len;
+	return true;
+}
+
+/*
+ * 单列规范化规则:
+ *   - by-value:保持原有 attlen 字节编码;
+ *   - uuid:固定 16 字节;
+ *   - text/varchar/bytea:去 TOAST/varlena 头,编码 uint32 长度 + payload;
+ *   - bpchar:在上述基础上去掉等值语义忽略的尾部空格。
+ */
+static bool
+SerializePkeyDatum(Datum value, const RowCachePkeyDesc *desc,
+						SerializedPkey *key)
+{
+	if (desc->byval)
+	{
+		if (desc->typlen != 1 && desc->typlen != 2 &&
+			desc->typlen != 4 && desc->typlen != 8)
+			return false;
+		if (!SerializedPkeyEnsure(key, desc->typlen))
+			return false;
+		store_att_byval(key->data + key->len, value, desc->typlen);
+		key->len += desc->typlen;
+		return true;
+	}
+
+	if (desc->typid == UUIDOID && desc->typlen == 16)
+		return SerializedPkeyAppend(key, DatumGetPointer(value), 16);
+
+	if (desc->typid == TEXTOID || desc->typid == VARCHAROID ||
+		desc->typid == BPCHAROID || desc->typid == BYTEAOID)
+	{
+		struct varlena *original = (struct varlena *) DatumGetPointer(value);
+		struct varlena *detoasted;
+		Size		raw_size;
+		uint32		payload_len;
+		bool		ok;
+
+		if (desc->typlen != -1)
+			return false;
+
+		raw_size = toast_raw_datum_size(value);
+		if (raw_size > (Size) ROW_CACHE_PKEY_MAX_BYTES + VARHDRSZ)
+			return false;
+
+		detoasted = PG_DETOAST_DATUM_PACKED(value);
+		payload_len = (uint32) VARSIZE_ANY_EXHDR(detoasted);
+		if (desc->typid == BPCHAROID)
+			payload_len = (uint32) bpchartruelen(VARDATA_ANY(detoasted),
+												 (int) payload_len);
+
+		ok = SerializedPkeyAppend(key, &payload_len, sizeof(payload_len)) &&
+			SerializedPkeyAppend(key, VARDATA_ANY(detoasted), payload_len);
+		if (detoasted != original)
+			pfree(detoasted);
+		return ok;
+	}
+
+	return false;
+}
+
+/*
+ * 共用编码器。变长列带长度前缀,避免复合键 ('ab','c') 与 ('a','bc')
+ * 拼接成相同字节串。nulls == NULL 表示调用方已保证全部非空。
+ */
+static bool
+SerializePkeyDatums(const Datum *values, const bool *nulls,
+						int n_pkey_attrs, const RowCachePkeyDesc *descs,
+						SerializedPkey *key)
+{
+	SerializedPkeyInit(key);
+	if (values == NULL || descs == NULL || n_pkey_attrs <= 0 ||
+		n_pkey_attrs > ROW_CACHE_PKEY_MAX_ATTS)
+		return false;
+
+	for (int i = 0; i < n_pkey_attrs; i++)
+	{
+		if ((nulls != NULL && nulls[i]) ||
+			!SerializePkeyDatum(values[i], &descs[i], key))
+		{
+			SerializedPkeyRelease(key);
+			return false;
+		}
 	}
 	return true;
 }
 
-static int
-SerializePkeyFromSlot(TupleTableSlot *slot, RelMeta *rm, uint8 *out_buf)
+static bool
+SerializePkeyFromSlot(TupleTableSlot *slot, int n_pkey_attrs,
+					  const RowCachePkeyDesc *descs,
+					  SerializedPkey *key)
 {
-	int			total = 0;
-
-	for (int i = 0; i < rm->n_pkey_attrs; i++)
-	{
-		AttrNumber	attno = rm->pkey_attnos[i];
-		int16		typlen = rm->pkey_typlens[i];
-
-		if (slot->tts_isnull[attno - 1])
-			return -1;
-
-		if (total + typlen > ROW_CACHE_PKEY_INLINE_BYTES)
-			return -1;
-
-		store_att_byval(out_buf + total,
-						slot->tts_values[attno - 1],
-						typlen);
-		total += typlen;
-	}
-	return total;
-}
-
-/*
- * 从 HeapTuple 序列化 pkey。schema(列数 / attno / typlen)由调用方
- * 显式传入,而不是从 RelMeta 读——DML 钩子据此可直接用 RelationData
- * 上的本地快照(rd_rowcache_pkey_*)序列化,无需触碰 shmem RelMeta。
- */
-static int
-SerializePkeyFromTuple(HeapTuple tuple, TupleDesc desc,
-					   int n_pkey_attrs, const AttrNumber *attnos,
-					   const int16 *typlens, uint8 *out_buf)
-{
-	int			total = 0;
+	Datum		values[ROW_CACHE_PKEY_MAX_ATTS];
+	bool		nulls[ROW_CACHE_PKEY_MAX_ATTS];
 
 	for (int i = 0; i < n_pkey_attrs; i++)
-	{
-		AttrNumber	attno = attnos[i];
-		int16		typlen = typlens[i];
-		Datum		d;
-		bool		isnull;
+		values[i] = slot_getattr(slot, descs[i].attno, &nulls[i]);
 
-		d = heap_getattr(tuple, attno, desc, &isnull);
-		if (isnull)
-			return -1;
-
-		if (total + typlen > ROW_CACHE_PKEY_INLINE_BYTES)
-			return -1;
-
-		store_att_byval(out_buf + total, d, typlen);
-		total += typlen;
-	}
-	return total;
+	return SerializePkeyDatums(values, nulls, n_pkey_attrs, descs, key);
 }
 
-static int
-SerializePkeyFromDatum(Datum d, RelMeta *rm, uint8 *out_buf)
+/* DML 使用 RelationData 的本地描述符,不触碰可能换代的共享 RelMeta。 */
+static bool
+SerializePkeyFromTuple(HeapTuple tuple, TupleDesc desc,
+					   int n_pkey_attrs, const RowCachePkeyDesc *descs,
+					   SerializedPkey *key)
 {
-	if (rm->n_pkey_attrs != 1)
-		return -1;
-	if (rm->pkey_typlens[0] > ROW_CACHE_PKEY_INLINE_BYTES)
-		return -1;
-	store_att_byval(out_buf, d, rm->pkey_typlens[0]);
-	return rm->pkey_typlens[0];
+	Datum		values[ROW_CACHE_PKEY_MAX_ATTS];
+	bool		nulls[ROW_CACHE_PKEY_MAX_ATTS];
+
+	for (int i = 0; i < n_pkey_attrs; i++)
+		values[i] = heap_getattr(tuple, descs[i].attno, desc, &nulls[i]);
+
+	return SerializePkeyDatums(values, nulls, n_pkey_attrs, descs, key);
 }
 
-
-static int
+static bool
 SerializePkeyFromDatumArray(const Datum *vals, int nvals,
-							RelMeta *rm, uint8 *out_buf)
+							const RowCachePkeyDesc *descs,
+							SerializedPkey *key)
 {
-	int		total = 0;
-
-	if (nvals != rm->n_pkey_attrs)
-		return -1;
-	if (rm->pkey_total_len > ROW_CACHE_PKEY_INLINE_BYTES)
-		return -1;
-
-	for (int i = 0; i < nvals; i++)
-	{
-		int16	typlen = rm->pkey_typlens[i];
-
-		store_att_byval(out_buf + total, vals[i], typlen);
-		total += typlen;
-	}
-	return total;
+	return SerializePkeyDatums(vals, NULL, nvals, descs, key);
 }
 
 static inline uint32
-ComputePkeyHashBytes(const uint8 *buf, int len)
+ComputePkeyHashBytes(const uint8 *buf, uint32 len)
 {
-	return hash_bytes(buf, len);
+	return hash_bytes(buf, (int) len);
+}
+
+static inline void
+StoreEntryPkey(GlobalEntry *entry, const SerializedPkey *key)
+{
+	Assert(key->len <= ROW_CACHE_PKEY_MAX_BYTES);
+	entry->pkey_len = key->len;
+	memcpy(EntryPkeyData(entry), key->data, key->len);
 }
 
 static inline LWLock *
@@ -1004,28 +1184,28 @@ BucketInsertHead(uint32 bucket, GlobalEntry *entry)
 }
 
 /*
- * 走一条桶链,找匹配 (dboid, relid, pkey_hash, pkey_len, pkey_buf) 的
+ * 走一条桶链,找匹配 (dboid, relid, pkey_hash, pkey_len, pkey bytes) 的
  * entry。
  *
  * 匹配条件:
  *   - dboid + relid 相等(模板克隆库的表 OID 可能相同,库号必须参与判等)
  *   - pkey_hash 相等(廉价的哈希碰撞过滤)
- *   - pkey_len 相等(单字节比较)
- *   - memcmp(pkey_buf, ..., pkey_len) 做最终判等
+ *   - pkey_len 相等
+ *   - memcmp(规范化键, ..., pkey_len) 做最终判等
  */
 static GlobalEntry *
 BucketLookup(uint32 bucket, Oid dboid, Oid relid, uint32 pkey_hash,
-			 const uint8 *pkey_buf, int pkey_len)
+			 const uint8 *pkey_buf, uint32 pkey_len)
 {
 	GlobalEntry *e;
 
 	for (e = RowCacheBuckets[bucket]; e != NULL; e = e->next)
 	{
 		if (e->dboid == dboid &&
-			e->relid == relid &&
-			e->pkey_hash == pkey_hash &&
-			e->pkey_len == pkey_len &&
-			memcmp(e->pkey_buf, pkey_buf, pkey_len) == 0)
+				e->relid == relid &&
+				e->pkey_hash == pkey_hash &&
+				e->pkey_len == pkey_len &&
+				memcmp(EntryPkeyDataConst(e), pkey_buf, pkey_len) == 0)
 			return e;
 	}
 	return NULL;
@@ -1399,8 +1579,10 @@ SegTryBump(int32 sid, uint32 need)
 
 	e = (GlobalEntry *) (SegBase(sid) + old);
 	e->span = need;
+	e->dboid = InvalidOid;
 	e->relid = InvalidOid;		/* 插链前的未完成标记 */
 	e->pkey_hash = 0;
+	e->pkey_len = 0;
 	e->next = NULL;
 	return e;
 }
@@ -1767,8 +1949,7 @@ RelationRowCacheLoadRelation(Relation rel)
 
 		while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
 		{
-			uint8		pkey_buf[ROW_CACHE_PKEY_INLINE_BYTES];
-			int			pkey_len;
+			SerializedPkey pkey;
 			uint32		pkey_hash;
 			uint32		bucket;
 			HeapTuple	htup;
@@ -1780,28 +1961,31 @@ RelationRowCacheLoadRelation(Relation rel)
 
 			slot_getallattrs(slot);
 
-			pkey_len = SerializePkeyFromSlot(slot, rm, pkey_buf);
-			if (pkey_len < 0)
+			if (!SerializePkeyFromSlot(slot, rm->n_pkey_attrs,
+									rm->pkey_descs, &pkey))
 			{
 				nskipped_pkey++;
 				continue;
 			}
 
-			pkey_hash = ComputePkeyHashBytes(pkey_buf, pkey_len);
+			pkey_hash = ComputePkeyHashBytes(pkey.data, pkey.len);
 			bucket = pkey_hash & RowCacheCtl->bucket_mask;
 
 			htup = ExecCopySlotHeapTuple(slot);
 			flat_size = FlatTupleComputeSize(slot, htup, &htup_off, &varlen_off);
 
-			e = SegAllocEntry(rm, MAXALIGN(sizeof(GlobalEntry)) + flat_size);
+			e = SegAllocEntry(rm, EntryFlatOffset(pkey.len) + flat_size);
 			if (e == NULL)
 			{
 				/* 单行超过段容量:不缓存该行(读路径 miss 回退)。 */
 				heap_freetuple(htup);
+				SerializedPkeyRelease(&pkey);
 				nskipped_big++;
 				continue;
 			}
 
+			StoreEntryPkey(e, &pkey);
+			SerializedPkeyRelease(&pkey);
 			FlatTupleFillInto(ENTRY_FLAT(e), flat_size, htup_off, varlen_off,
 							  slot, htup);
 			heap_freetuple(htup);
@@ -1809,8 +1993,6 @@ RelationRowCacheLoadRelation(Relation rel)
 			e->dboid = MyDatabaseId;
 			e->relid = relid;
 			e->pkey_hash = pkey_hash;
-			e->pkey_len = (uint8) pkey_len;
-			memcpy(e->pkey_buf, pkey_buf, pkey_len);
 			ItemPointerCopy(&slot->tts_tid, &e->tid);
 
 			part = PartitionLockForBucket(bucket);
@@ -1853,7 +2035,6 @@ RelationRowCacheLoadRelation(Relation rel)
 		pg_memory_barrier();
 		ReleaseAllSegmentsForRel(rm);
 		rm->n_pkey_attrs = 0;
-		rm->pkey_total_len = 0;
 		rm->dboid = InvalidOid;
 		rm->relid = InvalidOid;
 		LastLookupRelMeta = NULL;
@@ -1899,7 +2080,7 @@ RelationRowCacheLoadRelation(Relation rel)
  */
 static void
 InvalidateEntryByPkeyBytes(Oid dboid, Oid relid,
-						   const uint8 *pkey_buf, int pkey_len)
+						   const uint8 *pkey_buf, uint32 pkey_len)
 {
 	uint32			pkey_hash;
 	uint32			bucket;
@@ -1920,7 +2101,7 @@ InvalidateEntryByPkeyBytes(Oid dboid, Oid relid,
 			cur->relid == relid &&
 			cur->pkey_hash == pkey_hash &&
 			cur->pkey_len == pkey_len &&
-			memcmp(cur->pkey_buf, pkey_buf, pkey_len) == 0)
+			memcmp(EntryPkeyDataConst(cur), pkey_buf, pkey_len) == 0)
 		{
 			if (prev != NULL)
 				prev->next = cur->next;
@@ -1939,8 +2120,7 @@ InvalidateByHeapTuple(Relation rel, HeapTuple tuple)
 {
 	RelMeta	   *rm;
 	Oid			relid;
-	uint8		pkey_buf[ROW_CACHE_PKEY_INLINE_BYTES];
-	int			pkey_len;
+	SerializedPkey pkey;
 
 	if (RowCacheCtl == NULL)
 		return;
@@ -1968,22 +2148,20 @@ InvalidateByHeapTuple(Relation rel, HeapTuple tuple)
 	pg_atomic_fetch_add_u64(&rm->inval_counter, 1);
 
 	/* 用 reldata 的本地 pkey schema 快照序列化 */
-	pkey_len = SerializePkeyFromTuple(tuple, RelationGetDescr(rel),
-									  rel->rd_rowcache_pkey_n,
-									  rel->rd_rowcache_pkey_attnos,
-									  rel->rd_rowcache_pkey_typlens,
-									  pkey_buf);
-	if (pkey_len < 0)
+	if (!SerializePkeyFromTuple(tuple, RelationGetDescr(rel),
+								 rel->rd_rowcache_pkey_n,
+								 rel->rd_rowcache_pkey_descs, &pkey))
 		return;
 
-	InvalidateEntryByPkeyBytes(MyDatabaseId, relid, pkey_buf, pkey_len);
+	InvalidateEntryByPkeyBytes(MyDatabaseId, relid, pkey.data, pkey.len);
+	SerializedPkeyRelease(&pkey);
 }
 
 
 void
 RowCacheOnHeapUpdate(Relation rel, HeapTuple oldtup, HeapTuple newtup)
 {
-	(void) newtup;				
+	(void) newtup;
 	InvalidateByHeapTuple(rel, oldtup);
 }
 
@@ -2016,7 +2194,6 @@ RelationRowCacheDropRelation(Oid relid)
 	ReleaseAllSegmentsForRel(rm);
 
 	rm->n_pkey_attrs = 0;
-	rm->pkey_total_len = 0;
 	rm->dboid = InvalidOid;
 	rm->relid = InvalidOid;
 
@@ -2063,7 +2240,6 @@ RelationRowCacheDropDatabase(Oid dboid)
 			ReleaseAllSegmentsForRel(rm);
 
 			rm->n_pkey_attrs = 0;
-			rm->pkey_total_len = 0;
 			rm->dboid = InvalidOid;
 			rm->relid = InvalidOid;
 			ndropped++;
@@ -2083,7 +2259,7 @@ RelationRowCacheDropDatabase(Oid dboid)
 
 static bool
 DoPkeyFetchBytes(RelMeta *rm, Oid relid,
-				 const uint8 *pkey_buf, int pkey_len,
+				 const uint8 *pkey_buf, uint32 pkey_len,
 				 Snapshot snapshot, TupleTableSlot *slot,
 				 bool *is_visible, bool *has_hot_chain)
 {
@@ -2104,7 +2280,7 @@ DoPkeyFetchBytes(RelMeta *rm, Oid relid,
 	 * 硬保证在下面:查桶键锚定在不可变的 MyDatabaseId 上,即使 rm 在
 	 * 校验后被并发换代,也只可能命中(本库, 本表, 本键)的真条目。
 	 */
-	if (rm->dboid != MyDatabaseId)
+	if (rm->dboid != MyDatabaseId || rm->relid != relid)
 		return false;
 	if (pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
 		return false;
@@ -2214,7 +2390,7 @@ RowCacheTupDescHash(TupleDesc desc)
 	for (int i = 0; i < desc->natts; i++)
 	{
 		Form_pg_attribute att = TupleDescAttr(desc, i);
-		uint32		x[4];
+		uint32		x[5];
 
 		x[0] = (uint32) att->atttypid;
 		x[1] = (uint32) att->atttypmod;
@@ -2222,6 +2398,7 @@ RowCacheTupDescHash(TupleDesc desc)
 			((uint32) att->attbyval << 16) |
 			((uint32) att->attisdropped << 17);
 		x[3] = (uint32) att->attnum;
+		x[4] = (uint32) att->attcollation;
 		h = hash_combine64(h, hash_bytes_extended((const unsigned char *) x,
 												  sizeof(x), 0));
 	}
@@ -2268,8 +2445,10 @@ RelationRowCachePkeyFetch(Oid relid,
 						  bool *has_hot_chain)
 {
 	RelMeta	   *rm;
-	uint8		pkey_buf[ROW_CACHE_PKEY_INLINE_BYTES];
-	int			pkey_len;
+	RowCachePkeyDesc desc;
+	SerializedPkey pkey;
+	Datum		value = pkey_val;
+	bool		found;
 
 	Assert(is_visible != NULL && has_hot_chain != NULL);
 	*is_visible = false;
@@ -2282,15 +2461,25 @@ RelationRowCachePkeyFetch(Oid relid,
 	if (rm == NULL)
 		return false;
 
-	if (rm->n_pkey_attrs != 1)
+	/* 旧的非 bound API 不是执行器热路径;条件共享锁下取稳定描述符。 */
+	if (!LWLockConditionalAcquire(&rm->build_lock, LW_SHARED))
 		return false;
-
-	pkey_len = SerializePkeyFromDatum(pkey_val, rm, pkey_buf);
-	if (pkey_len < 0)
+	if (rm->dboid != MyDatabaseId || rm->relid != relid ||
+		pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED ||
+		rm->n_pkey_attrs != 1)
+	{
+		LWLockRelease(&rm->build_lock);
 		return false;
+	}
+	desc = rm->pkey_descs[0];
+	LWLockRelease(&rm->build_lock);
 
-	return DoPkeyFetchBytes(rm, relid, pkey_buf, pkey_len,
+	if (!SerializePkeyFromDatumArray(&value, 1, &desc, &pkey))
+		return false;
+	found = DoPkeyFetchBytes(rm, relid, pkey.data, pkey.len,
 							snapshot, slot, is_visible, has_hot_chain);
+	SerializedPkeyRelease(&pkey);
+	return found;
 }
 
 bool
@@ -2303,8 +2492,9 @@ RelationRowCachePkeyFetchComposite(Oid relid,
 								   bool *has_hot_chain)
 {
 	RelMeta	   *rm;
-	uint8		pkey_buf[ROW_CACHE_PKEY_INLINE_BYTES];
-	int			pkey_len;
+	RowCachePkeyDesc descs[ROW_CACHE_PKEY_MAX_ATTS];
+	SerializedPkey pkey;
+	bool		found;
 
 	Assert(is_visible != NULL && has_hot_chain != NULL);
 	*is_visible = false;
@@ -2319,15 +2509,24 @@ RelationRowCachePkeyFetchComposite(Oid relid,
 	if (rm == NULL)
 		return false;
 
-	if (rm->n_pkey_attrs != nvals)
+	if (!LWLockConditionalAcquire(&rm->build_lock, LW_SHARED))
 		return false;
-
-	pkey_len = SerializePkeyFromDatumArray(vals, nvals, rm, pkey_buf);
-	if (pkey_len < 0)
+	if (rm->dboid != MyDatabaseId || rm->relid != relid ||
+		pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED ||
+		rm->n_pkey_attrs != nvals)
+	{
+		LWLockRelease(&rm->build_lock);
 		return false;
+	}
+	memcpy(descs, rm->pkey_descs, sizeof(RowCachePkeyDesc) * nvals);
+	LWLockRelease(&rm->build_lock);
 
-	return DoPkeyFetchBytes(rm, relid, pkey_buf, pkey_len,
+	if (!SerializePkeyFromDatumArray(vals, nvals, descs, &pkey))
+		return false;
+	found = DoPkeyFetchBytes(rm, relid, pkey.data, pkey.len,
 							snapshot, slot, is_visible, has_hot_chain);
+	SerializedPkeyRelease(&pkey);
+	return found;
 }
 
 void
@@ -2371,20 +2570,37 @@ RelationRowCacheBindRelation(Relation rel)
 	pg_read_barrier();
 
 	/*
+	 * S4 描述符含 typid/byval,不能在槽位并发换代时无锁复制。绑定是
+	 * 冷路径,用 conditional SHARED 取得身份、指纹与描述符的一致快照。
+	 * 拿不到表示正被 load/drop/淘汰,当前查询回退,但保留 NULL 让下次
+	 * 绑定重试,不能把一次短暂锁竞争永久粘成 NOT_CACHED。
+	 */
+	if (!LWLockConditionalAcquire(&rm->build_lock, LW_SHARED))
+	{
+		rel->rd_rowcache_meta = NULL;
+		return;
+	}
+	if (rm->dboid != MyDatabaseId || rm->relid != relid ||
+		pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
+	{
+		LWLockRelease(&rm->build_lock);
+		rel->rd_rowcache_meta = NULL;
+		return;
+	}
+
+	/*
 	 * schema 指纹复核(S2):relcache 重建后的首次绑定走到这里。指纹
-	 * 相同(vacuum/analyze/GRANT 等例行维护触发的重建)→ 正常绑定,
-	 * 缓存零损失;不同(TRUNCATE/重写/加删改列等真 DDL)→ 失效整表。
-	 *
-	 * 用条件锁:拿不到(正被 load/drop/淘汰)就本轮按未缓存绑定,失效
-	 * 由下一个拿到锁的绑定者完成。期间无脏读窗口:本 backend 已绑
-	 * NOT_CACHED;其它 backend 要么还没消费 inval(受 DDL 的
-	 * AccessExclusiveLock 锁序保护,不可能正在查这张表),要么同样走到
-	 * 这里。
+	 * 相同(vacuum/analyze/GRANT 等例行维护触发的重建)则正常绑定;
+	 * 不同(TRUNCATE/重写/加删改列等真 DDL)则升级为排他锁失效整表。
 	 */
 	if (!RowCacheFingerprintMatches(rel, rm))
 	{
+		LWLockRelease(&rm->build_lock);
+
 		if (LWLockConditionalAcquire(&rm->build_lock, LW_EXCLUSIVE))
 		{
+			bool		invalidated = false;
+
 			if (rm->dboid == MyDatabaseId && rm->relid == relid &&
 				pg_atomic_read_u32(&rm->state) == RELMETA_ENABLED &&
 				!RowCacheFingerprintMatches(rel, rm))
@@ -2395,41 +2611,41 @@ RelationRowCacheBindRelation(Relation rel)
 				pg_memory_barrier();
 				ReleaseAllSegmentsForRel(rm);
 				rm->n_pkey_attrs = 0;
-				rm->pkey_total_len = 0;
 				rm->dboid = InvalidOid;
 				rm->relid = InvalidOid;
 				LastLookupRelMeta = NULL;
 				LastLookupRelid = InvalidOid;
-				LWLockRelease(&rm->build_lock);
-				pg_atomic_fetch_add_u32(&RowCacheCtl->global_gen.value, 1);
+				invalidated = true;
 			}
-			else
-				LWLockRelease(&rm->build_lock);
+			LWLockRelease(&rm->build_lock);
+			if (invalidated)
+				pg_atomic_fetch_add_u32(&RowCacheCtl->global_gen.value, 1);
 		}
-		rel->rd_rowcache_meta = ROWCACHE_NOT_CACHED;
+
+		/* 当前查询回退;若排他锁竞争失败,后续绑定继续尝试裁决。 */
+		rel->rd_rowcache_meta = NULL;
 		return;
 	}
 
 	n = rm->n_pkey_attrs;
 	if (n <= 0 || n > ROW_CACHE_PKEY_MAX_ATTS)
 	{
+		LWLockRelease(&rm->build_lock);
 		rel->rd_rowcache_meta = ROWCACHE_NOT_CACHED;
 		return;
 	}
 
 	rel->rd_rowcache_pkey_n = n;
-	for (int i = 0; i < n; i++)
-	{
-		rel->rd_rowcache_pkey_attnos[i] = rm->pkey_attnos[i];
-		rel->rd_rowcache_pkey_typlens[i] = rm->pkey_typlens[i];
-	}
-
+	memcpy(rel->rd_rowcache_pkey_descs, rm->pkey_descs,
+		   sizeof(RowCachePkeyDesc) * n);
 	rel->rd_rowcache_meta = rm;
+	LWLockRelease(&rm->build_lock);
 }
 
 bool
 RelationRowCachePkeyFetchBound(RelMeta *rm,
 							   Oid expected_relid,
+							   const RowCachePkeyDesc *descs,
 							   const Datum *vals,
 							   int nvals,
 							   Snapshot snapshot,
@@ -2437,8 +2653,8 @@ RelationRowCachePkeyFetchBound(RelMeta *rm,
 							   bool *is_visible,
 							   bool *has_hot_chain)
 {
-	uint8		pkey_buf[ROW_CACHE_PKEY_INLINE_BYTES];
-	int			pkey_len;
+	SerializedPkey pkey;
+	bool		found;
 
 	Assert(is_visible != NULL && has_hot_chain != NULL);
 	*is_visible = false;
@@ -2446,7 +2662,7 @@ RelationRowCachePkeyFetchBound(RelMeta *rm,
 
 	if (rm == NULL || rm == ROWCACHE_NOT_CACHED)
 		return false;
-	if (vals == NULL || nvals <= 0)
+	if (descs == NULL || vals == NULL || nvals <= 0)
 		return false;
 	if (!IsMVCCSnapshot(snapshot))
 		return false;
@@ -2458,15 +2674,13 @@ RelationRowCachePkeyFetchBound(RelMeta *rm,
 	if (pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED)
 		return false;
 
-	if (rm->n_pkey_attrs != nvals)
+	if (!SerializePkeyFromDatumArray(vals, nvals, descs, &pkey))
 		return false;
 
-	pkey_len = SerializePkeyFromDatumArray(vals, nvals, rm, pkey_buf);
-	if (pkey_len < 0)
-		return false;
-
-	return DoPkeyFetchBytes(rm, expected_relid, pkey_buf, pkey_len,
+	found = DoPkeyFetchBytes(rm, expected_relid, pkey.data, pkey.len,
 							snapshot, slot, is_visible, has_hot_chain);
+	SerializedPkeyRelease(&pkey);
+	return found;
 }
 
 /*
@@ -2498,11 +2712,9 @@ RelationRowCacheInvalGen(RelMeta *rm)
  */
 bool
 RelationRowCacheBackfillBound(RelMeta *rm, Oid expected_relid,
-							  const Datum *vals, int nvals,
 							  TupleTableSlot *slot, uint64 gen_seen)
 {
-	uint8		pkey_buf[ROW_CACHE_PKEY_INLINE_BYTES];
-	int			pkey_len;
+	SerializedPkey pkey;
 	uint32		pkey_hash;
 	uint32		bucket;
 	HeapTuple	src = NULL;
@@ -2514,6 +2726,8 @@ RelationRowCacheBackfillBound(RelMeta *rm, Oid expected_relid,
 	GlobalEntry *e;
 	LWLock	   *part;
 	bool		inserted = false;
+
+	SerializedPkeyInit(&pkey);
 
 	if (!row_cache_backfill)
 		return false;
@@ -2536,7 +2750,8 @@ RelationRowCacheBackfillBound(RelMeta *rm, Oid expected_relid,
 
 	if (rm->dboid != MyDatabaseId || rm->relid != expected_relid ||
 		pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED ||
-		rm->n_pkey_attrs != nvals)
+		rm->n_pkey_attrs <= 0 ||
+		rm->n_pkey_attrs > ROW_CACHE_PKEY_MAX_ATTS)
 		goto out;
 
 	/* 行状态三关。 */
@@ -2555,30 +2770,33 @@ RelationRowCacheBackfillBound(RelMeta *rm, Oid expected_relid,
 			goto out;
 	}
 
-	pkey_len = SerializePkeyFromDatumArray(vals, nvals, rm, pkey_buf);
-	if (pkey_len < 0)
+	/*
+	 * S4:按真实返回行的主键编码,不使用查询参数。即使其它索引的
+	 * collation 认为不同字节等价,回填条目仍与 DML 失效键完全一致。
+	 */
+	if (!SerializePkeyFromSlot(slot, rm->n_pkey_attrs,
+							rm->pkey_descs, &pkey))
 		goto out;
-	pkey_hash = ComputePkeyHashBytes(pkey_buf, pkey_len);
+	pkey_hash = ComputePkeyHashBytes(pkey.data, pkey.len);
 	bucket = pkey_hash & RowCacheCtl->bucket_mask;
 
 	slot_getallattrs(slot);
 	htup = ExecCopySlotHeapTuple(slot);
 	flat_size = FlatTupleComputeSize(slot, htup, &htup_off, &varlen_off);
 
-	e = SegBackfillAlloc(rm, MAXALIGN(sizeof(GlobalEntry)) + flat_size);
+	e = SegBackfillAlloc(rm, EntryFlatOffset(pkey.len) + flat_size);
 	if (e == NULL)
 	{
 		heap_freetuple(htup);
 		goto out;
 	}
 
+	StoreEntryPkey(e, &pkey);
 	FlatTupleFillInto(ENTRY_FLAT(e), flat_size, htup_off, varlen_off,
 					  slot, htup);
 	heap_freetuple(htup);
 
 	e->pkey_hash = pkey_hash;
-	e->pkey_len = (uint8) pkey_len;
-	memcpy(e->pkey_buf, pkey_buf, pkey_len);
 	ItemPointerCopy(&slot->tts_tid, &e->tid);
 
 	part = PartitionLockForBucket(bucket);
@@ -2590,7 +2808,7 @@ RelationRowCacheBackfillBound(RelMeta *rm, Oid expected_relid,
 	 */
 	if (pg_atomic_read_u64(&rm->inval_counter) == gen_seen &&
 		BucketLookup(bucket, MyDatabaseId, expected_relid, pkey_hash,
-					 pkey_buf, pkey_len) == NULL)
+					 pkey.data, pkey.len) == NULL)
 	{
 		e->dboid = MyDatabaseId;
 		e->relid = expected_relid;
@@ -2604,6 +2822,7 @@ RelationRowCacheBackfillBound(RelMeta *rm, Oid expected_relid,
 			 expected_relid);
 
 out:
+	SerializedPkeyRelease(&pkey);
 	if (src_should_free && src != NULL)
 		heap_freetuple(src);
 	LWLockRelease(&rm->build_lock);
@@ -2634,7 +2853,7 @@ RelationRowCachePkeyAttno(Oid relid)
 	if (rm->n_pkey_attrs != 1)
 		return 0;
 
-	return rm->pkey_attnos[0];
+	return rm->pkey_descs[0].attno;
 }
 
 int
@@ -2667,7 +2886,7 @@ RelationRowCachePkeyDescriptor(Oid relid, AttrNumber *out_attnos,
 		return 0;
 
 	for (int i = 0; i < n; i++)
-		out_attnos[i] = rm->pkey_attnos[i];
+		out_attnos[i] = rm->pkey_descs[i].attno;
 
 	return n;
 }

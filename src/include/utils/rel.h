@@ -38,6 +38,20 @@
  */
 #define ROW_CACHE_PKEY_MAX_ATTS		8
 
+/*
+ * 行缓存主键单列描述符。共享 RelMeta 与 backend 本地 RelationData 各持
+ * 一份同构快照:读/DML 路径据此规范化 Datum,不必在热路径查询系统目录,
+ * 也不会在 RelMeta 槽位并发换代时误读另一关系的类型信息。
+ */
+typedef struct RowCachePkeyDesc
+{
+	AttrNumber	attno;			/* heap attribute number (1-based) */
+	int16		typlen;
+	bool		byval;
+	Oid			typid;
+	Oid			collation;		/* primary-index collation, or InvalidOid */
+} RowCachePkeyDesc;
+
 
 /*
  * LockRelId and LockInfo really belong to lmgr.h, but it's more convenient
@@ -275,15 +289,14 @@ typedef struct RelationData
 	 *   其它                 -- 指向 shmem 中活的 RelMeta 槽
 	 *
 	 * rd_rowcache_pkey_* 是绑定时拍下的缓存 pkey 描述符镜像(列数、按 load/索引
-	 * 顺序排列的 heap attno、以及每列的 byval typlen)。由于 RelationClearRelation
+	 * 顺序排列的 heap attno、类型、传值方式及 collation)。由于 RelationClearRelation
 	 * 里的 swap 不会保留这些字段,一次 SI 驱动的重建会自动从新建的描述符刷新它们
 	 * (RelationBuildDesc 会重新绑定)。见 RelationRowCacheBindRelation()。用 "struct"
 	 * 是为了避免 include lib/relation_row_cache.h(那个头文件又 include 本头文件)。
 	 */
 	struct RelMeta *rd_rowcache_meta;
 	int			rd_rowcache_pkey_n;
-	AttrNumber	rd_rowcache_pkey_attnos[ROW_CACHE_PKEY_MAX_ATTS];
-	int16		rd_rowcache_pkey_typlens[ROW_CACHE_PKEY_MAX_ATTS];
+	RowCachePkeyDesc rd_rowcache_pkey_descs[ROW_CACHE_PKEY_MAX_ATTS];
 
 	/*
 	 * 绑定时拍下的全局代数快照(RowCacheControl.global_gen)。

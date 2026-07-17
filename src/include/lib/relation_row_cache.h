@@ -82,6 +82,7 @@ extern void RelationRowCacheBindRelation(Relation rel);
 
 extern bool RelationRowCachePkeyFetchBound(struct RelMeta *rm,
 										   Oid expected_relid,
+										   const RowCachePkeyDesc *descs,
 										   const Datum *vals,
 										   int nvals,
 										   Snapshot snapshot,
@@ -97,8 +98,6 @@ extern PGDLLIMPORT bool row_cache_backfill;
 extern uint64 RelationRowCacheInvalGen(struct RelMeta *rm);
 extern bool RelationRowCacheBackfillBound(struct RelMeta *rm,
 										  Oid expected_relid,
-										  const Datum *vals,
-										  int nvals,
 										  TupleTableSlot *slot,
 										  uint64 gen_seen);
 

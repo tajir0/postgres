@@ -17,9 +17,11 @@
 #include "access/skey.h"
 #include "access/stratnum.h"
 #include "catalog/pg_index.h"
+#include "catalog/pg_type_d.h"
 #include "executor/execRowcache.h"
 #include "executor/executor.h"
 #include "lib/relation_row_cache.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 
 
@@ -86,6 +88,7 @@ ExecInitIndexScanRowCache(IndexScanState *node)
 		{
 			ScanKey		sk = &node->iss_ScanKeys[i];
 			AttrNumber	heap_attno;
+			Oid			heap_type;
 
 			if (sk->sk_strategy != BTEqualStrategyNumber ||
 				(sk->sk_flags & disqualifying) != 0 ||
@@ -102,21 +105,31 @@ ExecInitIndexScanRowCache(IndexScanState *node)
 				break;
 			}
 
+			heap_type = TupleDescAttr(RelationGetDescr(scanRel),
+									  heap_attno - 1)->atttypid;
+
 			/*
-			 * 跨类型 ScanKey(如 int4 主键列 = int8 参数,btree 操作符族
-			 * 允许):缓存判等是"按缓存列宽序列化 + 裸字节 memcmp",参数
-			 * 物理宽度与列不一致时会被截断,产生错误命中(实测
-			 * id = 4294967296::int8 截成 4 字节 0,误命中 id=0)。参数
-			 * 类型必须与堆列类型一致,否则整个扫描回退原生路径。
-			 * (缓存序列化宽度与当前 tupdesc 的一致性由 schema 指纹保证,
-			 * 故与当前 atttypid 比较即等价于与缓存时类型比较。)
+			 * 跨类型 ScanKey 仍回退,但以索引 opclass 的声明输入类型为
+			 * 基准。varchar 默认使用 text opclass,二者 Datum 表示相同;
+			 * int4 列 = int8 参数则不匹配,避免按错误物理宽度编码。
 			 */
 			if (sk->sk_subtype != InvalidOid &&
-				sk->sk_subtype !=
-				TupleDescAttr(RelationGetDescr(scanRel), heap_attno - 1)->atttypid)
+				sk->sk_subtype != indexRel->rd_opcintype[i])
 			{
 				shape_ok = false;
 				break;
+			}
+
+			/* S4 字节等值只适用于确定性 collation。 */
+			if (heap_type == TEXTOID || heap_type == VARCHAROID ||
+				heap_type == BPCHAROID)
+			{
+				if (!OidIsValid(sk->sk_collation) ||
+					!get_collation_isdeterministic(sk->sk_collation))
+				{
+					shape_ok = false;
+					break;
+				}
 			}
 
 			node->iss_RowCachePkeyIndexHeapAttnos[i] = heap_attno;
@@ -138,7 +151,7 @@ ExecInitIndexScanRowCache(IndexScanState *node)
 
 				for (int i = 0; i < scanRel->rd_rowcache_pkey_n; i++)
 				{
-					if (scanRel->rd_rowcache_pkey_attnos[i] !=
+					if (scanRel->rd_rowcache_pkey_descs[i].attno !=
 						node->iss_RowCachePkeyIndexHeapAttnos[i])
 					{
 						attnos_match = false;
@@ -205,6 +218,7 @@ ExecIndexNextRowCache(IndexScanState *node, EState *estate,
 
 	hit = RelationRowCachePkeyFetchBound(node->iss_RowCacheMeta,
 										 RelationGetRelid(node->ss.ss_currentRelation),
+										 node->ss.ss_currentRelation->rd_rowcache_pkey_descs,
 										 vals, natts,
 										 estate->es_snapshot,
 										 slot, &visible,
@@ -235,16 +249,13 @@ ExecReScanIndexScanRowCache(IndexScanState *node)
  * ExecIndexRowCacheBackfill
  *
  * 点查 miss 后按需回填(S3):原生路径取到行、recheck 通过后,由
- * IndexNext 在返回该行之前调用。收集与探测同源的等值键 Datum,交给
- * 缓存层做行状态三关检查、竞态屏障比对与插入。best-effort:任何环节
- * 不满足直接放弃,不影响查询结果与延迟。
+ * IndexNext 在返回该行之前调用。缓存层从真实返回行重新提取主键,
+ * 再做行状态三关检查、竞态屏障比对与插入。best-effort:任何环节不
+ * 满足直接放弃,不影响查询结果与延迟。
  */
 void
 ExecIndexRowCacheBackfill(IndexScanState *node, TupleTableSlot *slot)
 {
-	Datum		vals[INDEX_MAX_KEYS];
-	int			natts;
-
 	if (node->iss_RowCacheMeta == NULL ||
 		!node->iss_PkeyAttempted ||
 		node->iss_RowCacheBackfilled)
@@ -255,18 +266,8 @@ ExecIndexRowCacheBackfill(IndexScanState *node, TupleTableSlot *slot)
 	if (node->iss_NumRuntimeKeys != 0 && !node->iss_RuntimeKeysReady)
 		return;
 
-	natts = node->iss_RowCachePkeyNatts;
-	for (int i = 0; i < natts; i++)
-	{
-		ScanKey		sk = &node->iss_ScanKeys[i];
-
-		if ((sk->sk_flags & SK_ISNULL) != 0)
-			return;
-		vals[i] = sk->sk_argument;
-	}
-
 	(void) RelationRowCacheBackfillBound(node->iss_RowCacheMeta,
 										 RelationGetRelid(node->ss.ss_currentRelation),
-										 vals, natts, slot,
+										 slot,
 										 node->iss_RowCacheInvalGen);
 }
