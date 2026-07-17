@@ -366,6 +366,42 @@ else
   fail "非确定性 collation 测试准备失败 (见 $OUT_DIR/nondet_setup.log)"
 fi
 
+# ---------------------------------------------------------------
+# 键长上限(ROW_CACHE_PKEY_MAX_BYTES = 16KB):超限行在所有路径
+# 一致拒绝——load 跳过、probe/回填 miss 回退,结果始终正确。
+# ---------------------------------------------------------------
+run_sql keycap_setup.log "
+CREATE TABLE t_keycap (k text COLLATE \"C\" PRIMARY KEY, v text NOT NULL);
+INSERT INTO t_keycap VALUES
+  (repeat('s', 100), 'cap-small'),
+  (repeat('L', 20000), 'cap-over');
+ANALYZE t_keycap;
+SELECT pg_load_relation_row_cache('row_cache_s4.t_keycap');
+"
+
+run_sql keycap_small.log "
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)
+  SELECT v FROM t_keycap WHERE k = repeat('s', 100);
+SELECT 'K1=' || v FROM t_keycap WHERE k = repeat('s', 100);
+"
+assert_index_searches keycap_small.log 0 "上限内键正常命中"
+assert_result keycap_small.log "K1=cap-small" "上限内键结果"
+
+run_sql keycap_over.log "
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)
+  SELECT v FROM t_keycap WHERE k = repeat('L', 20000);
+SELECT 'K2=' || v FROM t_keycap WHERE k = repeat('L', 20000);
+"
+assert_index_searches keycap_over.log 1 "超 16KB 键不缓存, 回退原生"
+assert_result keycap_over.log "K2=cap-over" "超限键结果正确"
+
+# 超限键连续两次点查都必须回退(不因回填意外入缓存)。
+run_sql keycap_over2.log "
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)
+  SELECT v FROM t_keycap WHERE k = repeat('L', 20000);
+"
+assert_index_searches keycap_over2.log 1 "超限键回填被拒, 仍回退原生"
+
 echo "=========================================="
 if [[ $FAILURES -eq 0 ]]; then
   echo " PASS - S4 变长主键、TOAST、复合边界、DML/回填与范围闸门全部正确"

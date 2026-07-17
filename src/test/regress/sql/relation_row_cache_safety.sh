@@ -15,6 +15,8 @@ set -euo pipefail
 #      active=false 的缓存行。
 #   ④ 延迟唯一索引:indimmediate=false 时事务内允许暂时重复,缓存
 #      单行命中会漏行。断言事务内插入重复键后 count(*) = 2。
+#   ⑤ 权限:load/drop 需要 MAINTAIN(owner 隐含);只读用户不得借
+#      load 取得 ShareLock 阻塞 DML。
 #
 # Usage / env: 同 relation_row_cache_correctness.sh。Exit 0 = PASS。
 # ================================================================
@@ -198,6 +200,39 @@ assert_result defer1.log "F1=2" "④ 延迟唯一索引下事务内重复键两�
 
 # ---------------------------------------------------------------
 # cleanup + verdict
+# ---------------------------------------------------------------
+# ⑤ 权限:load 持 ShareLock 挡写,只读(SELECT)用户不得调用;
+#    需要 MAINTAIN(owner 隐含)。drop 对称。
+# ---------------------------------------------------------------
+run_db "$PGDATABASE" priv_setup.log "
+DROP ROLE IF EXISTS rc_safety_reader;
+CREATE ROLE rc_safety_reader LOGIN;
+GRANT USAGE ON SCHEMA rc_safety TO rc_safety_reader;
+GRANT SELECT ON rc_safety.tx TO rc_safety_reader;
+"
+run_db "$PGDATABASE" priv_reader.log "
+SET ROLE rc_safety_reader;
+SELECT 'P1=' || pg_load_relation_row_cache('rc_safety.tx');
+SELECT 'P2=' || pg_drop_relation_row_cache('rc_safety.tx');
+RESET ROLE;
+"
+assert_result priv_reader.log "P1=false" "⑤ 只读用户 load 被拒(需 MAINTAIN)"
+assert_result priv_reader.log "P2=false" "⑤ 只读用户 drop 被拒"
+run_db "$PGDATABASE" priv_maintain.log "
+GRANT MAINTAIN ON rc_safety.tx TO rc_safety_reader;
+SET ROLE rc_safety_reader;
+SELECT 'P3=' || pg_load_relation_row_cache('rc_safety.tx');
+SELECT 'P4=' || pg_drop_relation_row_cache('rc_safety.tx');
+RESET ROLE;
+"
+assert_result priv_maintain.log "P3=true" "⑤ MAINTAIN 授权后 load 放行"
+assert_result priv_maintain.log "P4=true" "⑤ MAINTAIN 授权后 drop 放行"
+run_db "$PGDATABASE" priv_cleanup.log "
+REVOKE ALL ON rc_safety.tx FROM rc_safety_reader;
+REVOKE USAGE ON SCHEMA rc_safety FROM rc_safety_reader;
+DROP ROLE rc_safety_reader;
+" || true
+
 # ---------------------------------------------------------------
 run_db "$PGDATABASE" cleanup.log "
 SELECT pg_drop_relation_row_cache('rc_safety.tx');

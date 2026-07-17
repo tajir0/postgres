@@ -172,11 +172,14 @@ bool		row_cache_backfill = true;
  *                              - 8 列 int4       (32B)
  *                            更长的规范化键完整存放在条目头之后。
  *
- * ROW_CACHE_PKEY_MAX_BYTES — 单键编码上限。最终 entry 还要容纳同一行的
- * FlatCachedTuple,若两者合计超过一个段,该行仍按 oversized 跳过。
+ * ROW_CACHE_PKEY_MAX_BYTES — 单键编码上限(16KB)。桶链判等靠 pkey_hash
+ * 前滤 + 逐字节 memcmp,超长键让哈希碰撞时的比较成本失控,且几百 KB 的
+ * "主键"没有点查语义上的合理性。超限的行在所有路径同值拒绝:load 跳过
+ * 该行、probe/回填按 miss 回退、DML 失效因该行从未入缓存而无需动作——
+ * cap 在四条路径一致,不存在"缓存了却失效不掉"的组合。
  */
 #define ROW_CACHE_PKEY_INLINE_BYTES	32
-#define ROW_CACHE_PKEY_MAX_BYTES		ROW_CACHE_SEGMENT_SIZE
+#define ROW_CACHE_PKEY_MAX_BYTES	((uint32) (16 * 1024))
 
 StaticAssertDecl(ROW_CACHE_PKEY_MAX_ATTS <= INDEX_MAX_KEYS,
 				 "ROW_CACHE_PKEY_MAX_ATTS must not exceed INDEX_MAX_KEYS");
@@ -2147,7 +2150,21 @@ InvalidateByHeapTuple(Relation rel, HeapTuple tuple)
 	 */
 	pg_atomic_fetch_add_u64(&rm->inval_counter, 1);
 
-	/* 用 reldata 的本地 pkey schema 快照序列化 */
+	/*
+	 * 用 reldata 的本地 pkey schema 快照序列化。
+	 *
+	 * S4 起 by-ref 主键列在此处 detoast,两个调用点的上下文前提必须
+	 * 保持(挪动 heapam.c 的钩子位置前先读这里):
+	 *
+	 * 1. tuple 指向共享 buffer 页内数据,钩子必须在 ReleaseBuffer 之前
+	 *    调用(仅靠 pin 保命;content lock 已释放,detoast 打开 TOAST
+	 *    表读页是合法的)。
+	 * 2. heap_delete 路径上 heap_toast_delete 先于本钩子执行——旧行的
+	 *    out-of-line TOAST 行此刻已被本事务标删。detoast 仍能读回,依
+	 *    赖的是 SnapshotToast 的可见性规则不检查 xmax(删除只是标记,
+	 *    页上数据仍在,且删除事务尚未提交)。若未来 TOAST 可见性语义
+	 *    收紧,这里必须改为在 heap_toast_delete 之前取键。
+	 */
 	if (!SerializePkeyFromTuple(tuple, RelationGetDescr(rel),
 								 rel->rd_rowcache_pkey_n,
 								 rel->rd_rowcache_pkey_descs, &pkey))

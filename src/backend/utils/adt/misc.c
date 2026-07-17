@@ -103,7 +103,12 @@ load_relation_row_cache_internal(Oid relid)
 		return false;
 	}
 
-	if (pg_class_aclcheck(relid, GetUserId(), ACL_SELECT) != ACLCHECK_OK)
+	/*
+	 * MAINTAIN(而非 SELECT):load 持 ShareLock 挡写直至全表扫完,
+	 * 只读用户不应能借此阻塞大表的 DML 与 autovacuum。语义与 VACUUM/
+	 * ANALYZE 对齐(owner 隐含 MAINTAIN)。
+	 */
+	if (pg_class_aclcheck(relid, GetUserId(), ACL_MAINTAIN) != ACLCHECK_OK)
 	{
 		table_close(rel, ShareLock);
 		return false;
@@ -174,7 +179,8 @@ drop_relation_row_cache_internal(Oid relid)
 		return false;
 	}
 
-	if (pg_class_aclcheck(relid, GetUserId(), ACL_SELECT) != ACLCHECK_OK)
+	/* 与 load 对称:卸载他人表的缓存同样是维护操作。 */
+	if (pg_class_aclcheck(relid, GetUserId(), ACL_MAINTAIN) != ACLCHECK_OK)
 	{
 		table_close(rel, AccessShareLock);
 		return false;
