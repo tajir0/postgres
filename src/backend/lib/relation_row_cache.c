@@ -1244,14 +1244,30 @@ BucketLookup(uint32 bucket, Oid dboid, Oid relid, uint32 pkey_hash,
  * build_lock 时只用 ConditionalAcquire,失败换候选,不构成死锁。
  * ---------------------------------------------------------------- */
 
-/*
- * 把段 sid 里所有仍挂在哈希桶链上的 entry 摘掉。按 entry 地址匹配,
- * 幂等:已被 DML 失效摘掉的、或分配后从未插链的条目自然找不到,跳过。
- * 调用方保证没有并发写者会往该段追加(持有属主 build_lock,或段属主
- * 已不存在)。
- */
+/* 在 bucket 链上按地址摘除 e;找不到(已被 DML 摘/从未插链)即跳过。 */
+static inline void
+BucketUnlinkEntry(uint32 bucket, GlobalEntry *e)
+{
+	GlobalEntry *cur;
+	GlobalEntry *prev = NULL;
+
+	for (cur = RowCacheBuckets[bucket]; cur != NULL; cur = cur->next)
+	{
+		if (cur == e)
+		{
+			if (prev != NULL)
+				prev->next = e->next;
+			else
+				RowCacheBuckets[bucket] = e->next;
+			return;
+		}
+		prev = cur;
+	}
+}
+
+/* 逐条摘链(每条一次分区锁)。批量路径拿不到临时内存时的零分配回退。 */
 static void
-SegUnlinkEntries(int32 sid)
+SegUnlinkEntriesSlow(int32 sid)
 {
 	RowCacheSegment *seg = &RowCacheSegs[sid];
 	char	   *base = SegBase(sid);
@@ -1263,10 +1279,7 @@ SegUnlinkEntries(int32 sid)
 		GlobalEntry *e = (GlobalEntry *) (base + off);
 		uint32		bucket;
 		LWLock	   *part;
-		GlobalEntry *cur;
-		GlobalEntry *prev;
 
-		/* span 在 bump 时立即写入;为 0 说明段元数据损坏,防御退出。 */
 		if (e->span == 0)
 		{
 			elog(WARNING, "row cache: corrupted segment %d at offset %u",
@@ -1278,23 +1291,108 @@ SegUnlinkEntries(int32 sid)
 		part = PartitionLockForBucket(bucket);
 
 		LWLockAcquire(part, LW_EXCLUSIVE);
-		prev = NULL;
-		for (cur = RowCacheBuckets[bucket]; cur != NULL; cur = cur->next)
-		{
-			if (cur == e)
-			{
-				if (prev != NULL)
-					prev->next = e->next;
-				else
-					RowCacheBuckets[bucket] = e->next;
-				break;
-			}
-			prev = cur;
-		}
+		BucketUnlinkEntry(bucket, e);
 		LWLockRelease(part);
 
 		off += e->span;
 	}
+}
+
+/* 批量摘链的收集项。 */
+typedef struct SegUnlinkItem
+{
+	GlobalEntry *entry;
+	uint32		bucket;
+} SegUnlinkItem;
+
+/*
+ * 把段 sid 里所有仍挂在哈希桶链上的 entry 摘掉。按 entry 地址匹配,
+ * 幂等:已被 DML 失效摘掉的、或分配后从未插链的条目自然找不到,跳过。
+ * 调用方保证没有并发写者会往该段追加(持有属主 build_lock,或段属主
+ * 已不存在)。
+ *
+ * 批量路径:单遍收集段内条目,按分区做 counting sort,然后每个分区
+ * 只取一次排他锁、批量摘除落在该分区的全部条目——锁次数从 O(条目)
+ * 降到 O(分区数),对 ~5000 条的段约 40 倍锁开销差。临时数组用
+ * NO_OOM 分配,拿不到辅助内存时回退到零分配的逐条路径。
+ */
+static void
+SegUnlinkEntries(int32 sid)
+{
+	RowCacheSegment *seg = &RowCacheSegs[sid];
+	char	   *base = SegBase(sid);
+	uint32		used = pg_atomic_read_u32(&seg->used);
+	uint32		nmax = pg_atomic_read_u32(&seg->n_entries);
+	SegUnlinkItem *items;
+	SegUnlinkItem *sorted;
+	int			counts[ROW_CACHE_NUM_PARTITIONS];
+	int			offsets[ROW_CACHE_NUM_PARTITIONS];
+	uint32		off = 0;
+	uint32		cnt = 0;
+	int			pos;
+
+	if (nmax == 0 || used == 0)
+		return;
+
+	items = palloc_extended(sizeof(SegUnlinkItem) * (Size) nmax * 2,
+							MCXT_ALLOC_NO_OOM);
+	if (items == NULL)
+	{
+		SegUnlinkEntriesSlow(sid);
+		return;
+	}
+	sorted = items + nmax;
+
+	memset(counts, 0, sizeof(counts));
+
+	/* 单遍收集:条目地址 + 所属桶,并统计各分区条目数。 */
+	while (off < used && cnt < nmax)
+	{
+		GlobalEntry *e = (GlobalEntry *) (base + off);
+
+		if (e->span == 0)
+		{
+			elog(WARNING, "row cache: corrupted segment %d at offset %u",
+				 sid, off);
+			break;
+		}
+
+		items[cnt].entry = e;
+		items[cnt].bucket = e->pkey_hash & RowCacheCtl->bucket_mask;
+		counts[items[cnt].bucket % ROW_CACHE_NUM_PARTITIONS]++;
+		cnt++;
+		off += e->span;
+	}
+
+	/* counting sort:按分区聚簇。 */
+	pos = 0;
+	for (int p = 0; p < ROW_CACHE_NUM_PARTITIONS; p++)
+	{
+		offsets[p] = pos;
+		pos += counts[p];
+	}
+	for (uint32 i = 0; i < cnt; i++)
+		sorted[offsets[items[i].bucket % ROW_CACHE_NUM_PARTITIONS]++] =
+			items[i];
+
+	/* 每分区一次排他锁,批量摘除。 */
+	pos = 0;
+	for (int p = 0; p < ROW_CACHE_NUM_PARTITIONS; p++)
+	{
+		LWLock	   *part;
+
+		if (counts[p] == 0)
+			continue;
+
+		part = &RowCacheCtl->partition_locks[p];
+		LWLockAcquire(part, LW_EXCLUSIVE);
+		for (int i = 0; i < counts[p]; i++)
+			BucketUnlinkEntry(sorted[pos + i].bucket, sorted[pos + i].entry);
+		LWLockRelease(part);
+		pos += counts[p];
+	}
+
+	pfree(items);
 }
 
 /*
