@@ -61,8 +61,9 @@ for s in read_item read_stock read_customer update_stock insert_item delete_item
 done
 
 # ---- 仓数注入(幂等): 只改各脚本 `\set wid` 行的 random 上界, 不碰 iid/did/cid ----
+# 用 -i.bak(GNU 与 BSD sed 都兼容; .bak 已 gitignore)
 for f in read_stock update_stock read_customer; do
-  [ -f "$DIR/$f.sql" ] && sed -i "/set wid/s/random(1, *[0-9]*)/random(1, $WAREHOUSES)/" "$DIR/$f.sql"
+  [ -f "$DIR/$f.sql" ] && sed -i.bak "/set wid/s/random(1, *[0-9]*)/random(1, $WAREHOUSES)/" "$DIR/$f.sql"
 done
 
 load(){ "$PSQL" "${CONN[@]}" -Atc \
@@ -82,8 +83,13 @@ run(){ PGOPTIONS="-c row_cache_backfill=$1" "$PGBENCH" "${CONN[@]}" \
 
 # 提取: 全用 awk 单进程, 无 `grep|head` 的 SIGPIPE 隐患
 tps_of(){ awk '/tps = [0-9.]+ \(without/{print $3; exit}' "$1"; }
-lat_of(){ awk '/SQL script/{f=$0; sub(/.*\//,"",f); sub(/\.sql.*/,"",f)}
-               /latency average/{print f, $4}' "$1"; }
+# 只取"每脚本"段里的 ` - latency average = NUM ms`(带前导 -, 数字在 = 之后);
+# 跳过顶部无前导 - 的总览行。用 = 后取数, 不依赖字段序号。
+lat_of(){ awk '
+  /SQL script/{f=$0; sub(/.*\//,"",f); sub(/\.sql.*/,"",f); next}
+  /^[[:space:]]*-[[:space:]]*latency average/ && f!="" {
+    n=$0; sub(/.*=[[:space:]]*/,"",n); sub(/[[:space:]].*/,"",n); print f, n }
+  ' "$1"; }
 med_stdin(){ sort -n | awk '{a[NR]=$1} END{ if(NR==0){print "NA"}
              else print (NR%2)? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2 }'; }
 
