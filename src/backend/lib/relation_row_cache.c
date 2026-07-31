@@ -3299,3 +3299,78 @@ pg_row_cache_relation_stats(PG_FUNCTION_ARGS)
 
 	return (Datum) 0;
 }
+
+#define ROW_CACHE_SEG_COLS	10
+
+/*
+ * 段级明细:每个段一行,覆盖整个池(段数 = row_cache_size / 1MB,
+ * 可达数万行)。设计上刻意只给明细、不做聚合——用法照 pg_buffercache
+ * 的惯例,由调用方用 SQL 聚合收敛,例如:
+ *
+ *   -- 池整体状态
+ *   SELECT state, count(*), pg_size_pretty(sum(used))
+ *     FROM pg_row_cache_segments() GROUP BY state;
+ *   -- 各表占用与平均热度
+ *   SELECT relation::regclass, count(*), round(avg(score)::numeric,2)
+ *     FROM pg_row_cache_segments() WHERE relation IS NOT NULL GROUP BY 1;
+ *   -- 淘汰是否发生(seq_num > 0 表示该段被回收复用过)
+ *   SELECT count(*) FILTER (WHERE seq_num > 0), count(*)
+ *     FROM pg_row_cache_segments();
+ *
+ * 不持 seg_lock:段描述符字段都是标量,读到的是某一瞬间的近似快照
+ * (可能跨越一次淘汰),对观测足够,且绝不阻塞分配与洗段路径。
+ * 跨库可见:段的归属库号一并返回,便于确认池被哪个库占用。
+ */
+Datum
+pg_row_cache_segments(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Datum		values[ROW_CACHE_SEG_COLS];
+	bool		nulls[ROW_CACHE_SEG_COLS];
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	if (RowCacheCtl == NULL)
+		return (Datum) 0;
+
+	for (int32 s = 0; s < RowCacheCtl->n_segments; s++)
+	{
+		RowCacheSegment *seg = &RowCacheSegs[s];
+		uint32		state = seg->state;
+		Oid			dboid = seg->dboid;
+		Oid			relid = seg->relid;
+
+		memset(nulls, 0, sizeof(nulls));
+		values[0] = Int32GetDatum(s);
+		values[1] = CStringGetTextDatum(
+			state == RC_SEG_FREE ? "free" :
+			state == RC_SEG_ACTIVE ? "active" :
+			state == RC_SEG_FULL ? "full" : "unknown");
+
+		/* 空闲段无属主。relation 只在本库的段上给出,跨库段仅给 dboid。 */
+		if (!OidIsValid(relid))
+		{
+			nulls[2] = true;	/* dboid */
+			nulls[3] = true;	/* relation */
+		}
+		else
+		{
+			values[2] = ObjectIdGetDatum(dboid);
+			if (dboid == MyDatabaseId)
+				values[3] = ObjectIdGetDatum(relid);
+			else
+				nulls[3] = true;	/* 别库的 relid 在本库无法解析 */
+		}
+
+		values[4] = Int64GetDatum((int64) pg_atomic_read_u32(&seg->used));
+		values[5] = Int64GetDatum((int64) pg_atomic_read_u32(&seg->n_entries));
+		values[6] = Float8GetDatum(seg->score);
+		values[7] = Int64GetDatum((int64) pg_atomic_read_u32(&seg->recent_get_cnt));
+		values[8] = Int32GetDatum((int32) pg_atomic_read_u32(&seg->pin_cnt));
+		values[9] = Int64GetDatum((int64) seg->seq_num);
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+
+	return (Datum) 0;
+}
