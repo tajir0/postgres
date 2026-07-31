@@ -125,6 +125,19 @@ EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)
 assert_searches probe_cold.log 1 "② 未访问过的行仍未缓存(按需填充)"
 
 # ---------------------------------------------------------------
+# ②b 观测函数:enable 后应"0 段 0 条目",回填后段/条目/命中数增长
+# ---------------------------------------------------------------
+run_sql stats_after_probe.log "
+SELECT 'S1=' || n_segments || '/' || n_entries || '/' || hit_count || '/' || backfill_count
+FROM pg_row_cache_relation_stats('rc_enable.t'::regclass);
+"
+if grep -qE "^S1=[1-9][0-9]*/[1-9][0-9]*/[1-9][0-9]*/[1-9][0-9]*$" "$OUT_DIR/stats_after_probe.log"; then
+  ok "②b 观测函数: 回填后段数/条目数/命中数/回填数均 > 0 ($(grep -o 'S1=.*' "$OUT_DIR/stats_after_probe.log"))"
+else
+  fail "②b 观测函数数值异常 (见 $OUT_DIR/stats_after_probe.log)"
+fi
+
+# ---------------------------------------------------------------
 # ③ enable 不阻塞写(AccessShareLock);load 会被挡(ShareLock)
 # ---------------------------------------------------------------
 "$PSQL" "${PSQL_OPTS[@]}" >"$OUT_DIR/holder.log" 2>&1 <<'EOSQL' &

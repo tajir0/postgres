@@ -68,6 +68,7 @@
 #include "common/hashfn.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_type_d.h"
+#include "funcapi.h"
 #include "executor/tuptable.h"
 #include "lib/relation_row_cache.h"
 #include "miscadmin.h"
@@ -235,6 +236,19 @@ typedef struct RelMeta
 	 * UPDATE 摘链扑空 → 回填复活死行"的窗口。
 	 */
 	pg_atomic_uint64 inval_counter;
+
+	/*
+	 * 观测计数(S3+):供 pg_row_cache_relation_stats() 暴露,用于判断
+	 * 热点是否收敛、pool 是否够用。只做统计、不参与任何判定,故用
+	 * 放松内存序累加(u64 溢出实际不可达)。
+	 *
+	 * hit/miss 只统计"武装了缓存的探测"(rd_rowcache_meta 已绑定且状态
+	 * ENABLED),不统计根本没走到探测的查询——否则分母会被全表扫描等
+	 * 无关负载污染,命中率失去意义。
+	 */
+	pg_atomic_uint64 hit_cnt;		/* 探测命中(可见且可用) */
+	pg_atomic_uint64 miss_cnt;		/* 探测未命中/不可见/HOT 链 → 回退 */
+	pg_atomic_uint64 backfill_cnt;	/* 回填成功插入的行数 */
 } RelMeta;
 
 typedef struct GlobalEntry
@@ -680,6 +694,9 @@ RowCacheShmemInit(void)
 		rm->fp_relfilenumber = InvalidRelFileNumber;
 		rm->fp_tupdesc_hash = 0;
 		pg_atomic_init_u64(&rm->inval_counter, 0);
+		pg_atomic_init_u64(&rm->hit_cnt, 0);
+		pg_atomic_init_u64(&rm->miss_cnt, 0);
+		pg_atomic_init_u64(&rm->backfill_cnt, 0);
 	}
 
 	/* 桶头全空。 */
@@ -2053,6 +2070,11 @@ RelationRowCacheLoadRelation(Relation rel, bool scan_rows)
 
 	pg_atomic_write_u32(&rm->state, RELMETA_LOADING);
 
+	/* 观测计数归零:每次 load/enable 重新开始统计。 */
+	pg_atomic_write_u64(&rm->hit_cnt, 0);
+	pg_atomic_write_u64(&rm->miss_cnt, 0);
+	pg_atomic_write_u64(&rm->backfill_cnt, 0);
+
 	if (!CheckEligiblePkey(rel, rm))
 	{
 		pg_atomic_write_u32(&rm->state, RELMETA_DISABLED);
@@ -2855,6 +2877,18 @@ RelationRowCachePkeyFetchBound(RelMeta *rm,
 	found = DoPkeyFetchBytes(rm, expected_relid, pkey.data, pkey.len,
 							snapshot, slot, is_visible, has_hot_chain);
 	SerializedPkeyRelease(&pkey);
+
+	/*
+	 * 观测记账:按执行器的真实判定标准(见 ExecIndexNextRowCache)——
+	 * 只有"找到 + 对本快照可见 + 非 HOT 链头"才算命中并省掉原生路径;
+	 * 其余(未命中/不可见/HOT 链)都要回退,一律计 miss。
+	 * 因此 hit/(hit+miss) 就是"缓存实际省掉了多少次索引+堆访问"的比率。
+	 */
+	if (found && *is_visible && !*has_hot_chain)
+		pg_atomic_fetch_add_u64(&rm->hit_cnt, 1);
+	else
+		pg_atomic_fetch_add_u64(&rm->miss_cnt, 1);
+
 	return found;
 }
 
@@ -2993,8 +3027,11 @@ RelationRowCacheBackfillBound(RelMeta *rm, Oid expected_relid,
 	LWLockRelease(part);
 
 	if (inserted)
+	{
+		pg_atomic_fetch_add_u64(&rm->backfill_cnt, 1);
 		elog(DEBUG2, "row cache: backfilled one row of relation %u",
 			 expected_relid);
+	}
 
 out:
 	SerializedPkeyRelease(&pkey);
@@ -3172,4 +3209,93 @@ RowCacheWasherMain(Datum main_arg)
 		if (rc & WL_LATCH_SET)
 			ResetLatch(MyLatch);
 	}
+}
+
+/* ----------------------------------------------------------------
+ * 观测:pg_row_cache_relation_stats()
+ *
+ * 判断三件事:热点收没收敛(hit_ratio 是否在爬升后稳定)、pool 够不够
+ * (n_segments 是否顶到池上限、backfill 是否持续高企说明反复淘汰回填)、
+ * 以及某表到底有没有真的在被缓存服务。
+ * ---------------------------------------------------------------- */
+
+#define ROW_CACHE_STATS_COLS	9
+
+/*
+ * 单表统计。relid 为 InvalidOid(SQL 层传 NULL)时返回本库所有已注册
+ * 关系;否则只返回该表。
+ *
+ * 段数与条目数按段链现场统计:持 build_lock SHARED 保证遍历期间段链
+ * 稳定;拿不到锁(表正被 load/drop/淘汰)则跳过该表,不阻塞观测。
+ */
+Datum
+pg_row_cache_relation_stats(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Oid			filter_relid = PG_ARGISNULL(0) ? InvalidOid : PG_GETARG_OID(0);
+	Datum		values[ROW_CACHE_STATS_COLS];
+	bool		nulls[ROW_CACHE_STATS_COLS];
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	if (RowCacheCtl == NULL)
+		return (Datum) 0;
+
+	for (int i = 0; i < ROW_CACHE_MAX_RELATIONS; i++)
+	{
+		RelMeta    *rm = &RowCacheCtl->relmetas[i];
+		uint32		state;
+		int64		nsegs = 0;
+		int64		nentries = 0;
+		int64		bytes_used = 0;
+		uint64		hits,
+					misses,
+					backfills;
+		double		ratio;
+
+		/* 只报本库的表(缓存身份是 (dboid, relid))。 */
+		if (rm->dboid != MyDatabaseId || !OidIsValid(rm->relid))
+			continue;
+		if (OidIsValid(filter_relid) && rm->relid != filter_relid)
+			continue;
+
+		state = pg_atomic_read_u32(&rm->state);
+
+		/* 段链现场统计;拿不到 build_lock 说明正被维护,跳过。 */
+		if (!LWLockConditionalAcquire(&rm->build_lock, LW_SHARED))
+			continue;
+		if (rm->dboid == MyDatabaseId && rm->relid != InvalidOid)
+		{
+			for (int32 s = rm->first_seg; s >= 0; s = RowCacheSegs[s].next_seg)
+			{
+				nsegs++;
+				nentries += pg_atomic_read_u32(&RowCacheSegs[s].n_entries);
+				bytes_used += pg_atomic_read_u32(&RowCacheSegs[s].used);
+			}
+		}
+		LWLockRelease(&rm->build_lock);
+
+		hits = pg_atomic_read_u64(&rm->hit_cnt);
+		misses = pg_atomic_read_u64(&rm->miss_cnt);
+		backfills = pg_atomic_read_u64(&rm->backfill_cnt);
+		ratio = (hits + misses) > 0 ?
+			(double) hits * 100.0 / (double) (hits + misses) : 0.0;
+
+		memset(nulls, 0, sizeof(nulls));
+		values[0] = ObjectIdGetDatum(rm->relid);
+		values[1] = CStringGetTextDatum(
+			state == RELMETA_ENABLED ? "enabled" :
+			state == RELMETA_LOADING ? "loading" : "disabled");
+		values[2] = Int64GetDatum(nsegs);
+		values[3] = Int64GetDatum(nentries);
+		values[4] = Int64GetDatum(bytes_used);
+		values[5] = Int64GetDatum((int64) hits);
+		values[6] = Int64GetDatum((int64) misses);
+		values[7] = Float8GetDatum(ratio);
+		values[8] = Int64GetDatum((int64) backfills);
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+
+	return (Datum) 0;
 }
