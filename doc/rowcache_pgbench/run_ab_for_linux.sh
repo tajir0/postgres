@@ -66,10 +66,24 @@ for f in read_stock update_stock read_customer; do
   [ -f "$DIR/$f.sql" ] && sed -i.bak "/set wid/s/random(1, *[0-9]*)/random(1, $WAREHOUSES)/" "$DIR/$f.sql"
 done
 
+# MODE=load(默认): 全量预热, 缓存立刻满。
+# MODE=enable    : 只注册不预热, 行靠点查 miss 后回填爬入 —— 此时
+#                  "LOADONLY(回填关)"组等价于"注册了但永远填不进去",
+#                  该组吞吐应与 OFF 基线基本持平; 真正有意义的是 ON 组。
+MODE="${MODE:-load}"
+REGFN="pg_${MODE}_relation_row_cache"
+
 load(){ "$PSQL" "${CONN[@]}" -Atc \
-  "select pg_load_relation_row_cache('bmsql_item');
-   select pg_load_relation_row_cache('bmsql_customer');
-   select pg_load_relation_row_cache('bmsql_stock');" >/dev/null 2>&1 || true; }
+  "select $REGFN('bmsql_item');
+   select $REGFN('bmsql_customer');
+   select $REGFN('bmsql_stock');" >/dev/null 2>&1 || true; }
+
+# 每轮结束后打印缓存实际状态(需要 pg_row_cache_relation_stats)
+show_stats(){ "$PSQL" "${CONN[@]}" -Atc \
+  "select '      [stats] '||relation::regclass||' segs='||n_segments||
+          ' rows='||n_entries||' hit='||hit_count||' miss='||miss_count||
+          ' hit%='||round(hit_ratio::numeric,1)||' backfill='||backfill_count
+     from pg_row_cache_relation_stats(NULL) order by 1;" 2>/dev/null || true; }
 drop(){ "$PSQL" "${CONN[@]}" -Atc \
   "select pg_drop_relation_row_cache('bmsql_item');
    select pg_drop_relation_row_cache('bmsql_customer');
@@ -96,7 +110,7 @@ med_stdin(){ sort -n | awk '{a[NR]=$1} END{ if(NR==0){print "NA"}
 DATA="$OUT/_latdata.tmp"; : > "$DATA"
 TPSD="$OUT/_tpsdata.tmp"; : > "$TPSD"
 
-echo "== 行缓存 A/B  仓数=$WAREHOUSES  每轮=${DURATION}s x ${ITERS}轮  并发=$CLIENTS 线程=$JOBS =="
+echo "== 行缓存 A/B  模式=$MODE  仓数=$WAREHOUSES  每轮=${DURATION}s x ${ITERS}轮  并发=$CLIENTS 线程=$JOBS =="
 echo "   (每组约 $((DURATION * ITERS / 60)) 分钟, 三组共约 $((DURATION * ITERS * 3 / 60)) 分钟)"
 for grp in OFF LOADONLY ON; do
   for i in $(seq 1 "$ITERS"); do
@@ -107,6 +121,7 @@ for grp in OFF LOADONLY ON; do
       LOADONLY) load; run off "$f" ;;
       ON)       load; run on  "$f" ;;
     esac
+    [ "$grp" = "OFF" ] || show_stats
     t=$(tps_of "$f")
     if [ -z "$t" ]; then
       echo "FAILED (无 tps, 见 $f)"; grep -iE "error|fatal|too many" "$f" | head -2 | sed 's/^/      /'
