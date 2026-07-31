@@ -48,7 +48,11 @@ extern void RowCacheOnHeapDelete(Relation rel,
 								 HeapTuple oldtup);
 
 /* 加载 / 卸载一张关系的缓存。 */
-extern void RelationRowCacheLoadRelation(Relation rel);
+/*
+ * scan_rows = true  : load 语义(注册 + 全表灌入),调用方须持 ShareLock。
+ * scan_rows = false : enable 语义(只注册, 行靠按需回填), AccessShareLock 足够。
+ */
+extern void RelationRowCacheLoadRelation(Relation rel, bool scan_rows);
 extern void RelationRowCacheDropRelation(Oid relid);
 
 /* DROP DATABASE 钩子:清掉目标库的全部缓存槽与段(命令及 WAL redo 调用)。 */

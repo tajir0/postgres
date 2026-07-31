@@ -67,7 +67,9 @@ typedef struct ValidIOData
 static bool pg_input_is_valid_common(FunctionCallInfo fcinfo,
 									 text *txt, text *typname,
 									 ErrorSaveContext *escontext);
+static bool register_relation_row_cache_internal(Oid relid, bool scan_rows);
 static bool load_relation_row_cache_internal(Oid relid);
+static bool enable_relation_row_cache_internal(Oid relid);
 static bool drop_relation_row_cache_internal(Oid relid);
 
 /*
@@ -76,10 +78,25 @@ static bool drop_relation_row_cache_internal(Oid relid);
  * 返回 true 表示成功；返回 false 表示关系不存在、关系类型不支持
  * 或权限不足。
  */
+/*
+ * 注册一张关系的行缓存。scan_rows 决定语义:
+ *
+ *   true  (load)   全表扫描灌入。须持 ShareLock 挡写:扫描拷贝某行之后、
+ *                  ENABLED 之前,并发 DML 的行级失效会因 state != ENABLED
+ *                  被跳过,而该 DML 打的 xmax 不在已拷贝的副本上——缓存会
+ *                  带着"xmax 干净的旧版本"上线。挡写让整个 LOADING 窗口内
+ *                  表静止,窗口关闭。
+ *
+ *   false (enable) 只注册,不扫描。没有扫描窗口 ⇒ 上述洞不存在 ⇒ 只需
+ *                  AccessShareLock,不阻塞 DML 与 autovacuum(大表尤其
+ *                  重要)。行由按需回填逐步填入;回填自身的微秒级窗口由
+ *                  RelMeta.inval_counter 屏障处理。
+ */
 static bool
-load_relation_row_cache_internal(Oid relid)
+register_relation_row_cache_internal(Oid relid, bool scan_rows)
 {
 	Relation	rel;
+	LOCKMODE	lockmode = scan_rows ? ShareLock : AccessShareLock;
 
 	if (!OidIsValid(relid))
 		return false;
@@ -96,39 +113,43 @@ load_relation_row_cache_internal(Oid relid)
 	if (pg_class_aclcheck(relid, GetUserId(), ACL_MAINTAIN) != ACLCHECK_OK)
 		return false;
 
-	/*
-	 * ShareLock:load 期间挡住 INSERT/UPDATE/DELETE(允许并发读)。
-	 *
-	 * 必须挡写:load 扫描拷贝某行之后、ENABLED 之前,并发 DML 的行级
-	 * 失效会因 state != ENABLED 被跳过,而该 DML 打的 xmax 不在已拷贝
-	 * 的副本上——缓存会带着"xmax 干净的旧版本"上线,后续命中判可见,
-	 * 返回过期行。挡写让整个 LOADING 窗口内表静止,窗口关闭。
-	 * (按需回填的同类微秒级窗口由 RelMeta.inval_counter 屏障处理。)
-	 */
-	rel = try_table_open(relid, ShareLock);
+	rel = try_table_open(relid, lockmode);
 	if (rel == NULL)
 		return false;
 
 	if (!RELKIND_HAS_TABLE_AM(rel->rd_rel->relkind))
 	{
-		table_close(rel, ShareLock);
+		table_close(rel, lockmode);
 		return false;
 	}
 
 	/*
-	 * 锁后权威复查:MAINTAIN(而非 SELECT)——load 持 ShareLock 挡写
-	 * 直至全表扫完,只读用户不应能借此阻塞大表的 DML 与 autovacuum。
-	 * 语义与 VACUUM/ANALYZE 对齐(owner 隐含 MAINTAIN)。
+	 * 锁后权威复查:MAINTAIN(而非 SELECT)——注册行缓存是维护操作,
+	 * 且 load 持 ShareLock 挡写直至全表扫完,只读用户不应能借此阻塞大表
+	 * 的 DML 与 autovacuum。语义与 VACUUM/ANALYZE 对齐(owner 隐含
+	 * MAINTAIN)。
 	 */
 	if (pg_class_aclcheck(relid, GetUserId(), ACL_MAINTAIN) != ACLCHECK_OK)
 	{
-		table_close(rel, ShareLock);
+		table_close(rel, lockmode);
 		return false;
 	}
 
-	RelationRowCacheLoadRelation(rel);
-	table_close(rel, ShareLock);
+	RelationRowCacheLoadRelation(rel, scan_rows);
+	table_close(rel, lockmode);
 	return true;
+}
+
+static bool
+load_relation_row_cache_internal(Oid relid)
+{
+	return register_relation_row_cache_internal(relid, true);
+}
+
+static bool
+enable_relation_row_cache_internal(Oid relid)
+{
+	return register_relation_row_cache_internal(relid, false);
 }
 
 /*
@@ -165,6 +186,45 @@ pg_load_relation_row_cache_name(PG_FUNCTION_ARGS)
 
 	relid = DatumGetObjectId(relid_datum);
 	PG_RETURN_BOOL(load_relation_row_cache_internal(relid));
+}
+
+/*
+ * pg_enable_relation_row_cache(oid)
+ * 按 table oid 开启行缓存,但不预热:只注册元数据与 schema 指纹,
+ * 行由点查 miss 后的按需回填逐步填入。
+ *
+ * 相对 load 的取舍:零预热成本、只有真被访问的行才占用段空间、且只取
+ * AccessShareLock 不阻塞 DML;代价是有命中率爬升期。适合大表;小而热
+ * 的表用 pg_load_relation_row_cache 一次装满更划算。
+ */
+Datum
+pg_enable_relation_row_cache_oid(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+
+	PG_RETURN_BOOL(enable_relation_row_cache_internal(relid));
+}
+
+/*
+ * pg_enable_relation_row_cache(text)
+ * 按表名开启行缓存(不预热)。入参通过 regclassin 解析。
+ */
+Datum
+pg_enable_relation_row_cache_name(PG_FUNCTION_ARGS)
+{
+	char	   *class_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	Datum		relid_datum;
+	Oid			relid;
+	ErrorSaveContext escontext = {T_ErrorSaveContext};
+
+	if (!DirectInputFunctionCallSafe(regclassin, class_name,
+									 InvalidOid, -1,
+									 (Node *) &escontext,
+									 &relid_datum))
+		PG_RETURN_BOOL(false);
+
+	relid = DatumGetObjectId(relid_datum);
+	PG_RETURN_BOOL(enable_relation_row_cache_internal(relid));
 }
 
 /*

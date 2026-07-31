@@ -1999,8 +1999,23 @@ RowCacheUnflattenToSlot(const FlatCachedTuple *flat,
 	return true;
 }
 
+/*
+ * 注册一张关系的行缓存。
+ *
+ * scan_rows = true (load 语义):注册后全表扫描,把每一行灌进缓存。
+ * 适合小而热的表——一次装满、命中率立刻 100%。调用方须持 ShareLock
+ * 挡写(见 misc.c 的说明:扫描窗口内的 DML 失效会因 state != ENABLED
+ * 被跳过)。
+ *
+ * scan_rows = false (enable 语义):只注册 RelMeta、拍 schema 指纹、
+ * 置 ENABLED,不插入任何条目——行靠点查 miss 后按需回填自然爬进来。
+ * 适合大表:零预热成本、只有真被访问的行才占段;且因为没有扫描窗口,
+ * 调用方只需 AccessShareLock,不阻塞 DML 与 autovacuum。
+ *
+ * 两种语义共用资格检查与指纹拍摄,差别仅在于是否扫描。
+ */
 void
-RelationRowCacheLoadRelation(Relation rel)
+RelationRowCacheLoadRelation(Relation rel, bool scan_rows)
 {
 	Oid			relid = RelationGetRelid(rel);
 	RelMeta    *rm;
@@ -2050,6 +2065,28 @@ RelationRowCacheLoadRelation(Relation rel)
 	/* schema 指纹:bind 慢路径复核用(S2)。 */
 	rm->fp_relfilenumber = rel->rd_locator.relNumber;
 	rm->fp_tupdesc_hash = RowCacheTupDescHash(RelationGetDescr(rel));
+
+	/*
+	 * enable 语义(scan_rows = false):跳过全表扫描,直接置 ENABLED。
+	 * 资格检查与指纹已在上面完成,行由按需回填逐步填入。
+	 */
+	if (!scan_rows)
+	{
+		pg_write_barrier();
+		pg_atomic_write_u32(&rm->state, RELMETA_ENABLED);
+
+		LastLookupRelMeta = NULL;
+		LastLookupRelid = InvalidOid;
+
+		LWLockRelease(&rm->build_lock);
+		pg_atomic_fetch_add_u32(&RowCacheCtl->global_gen.value, 1);
+
+		elog(DEBUG1, "row cache: enabled relation %u (no preload; rows arrive via backfill)",
+			 relid);
+
+		RelationRowCacheBindRelation(rel);
+		return;
+	}
 
 	if (!ActiveSnapshotSet())
 	{
