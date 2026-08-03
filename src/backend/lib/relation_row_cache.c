@@ -373,6 +373,13 @@ typedef struct RowCacheControl
 	/* 段池:段数在启动时由 row_cache_size 固化,之后只读。 */
 	int32			n_segments;
 	int32			free_seg_head;		/* 全局空闲段链头;-1 = 空 */
+
+	/*
+	 * 空闲段计数。与 free_seg_head 链表严格同步维护(均在 seg_lock 下),
+	 * 单独存一份原子量是为了让回填能在**不取任何锁**的前提下判断"还有没有
+	 * 段可用" —— 见 RelationRowCacheBackfillBound 的入口闸门。
+	 */
+	pg_atomic_uint32 free_seg_count;
 	uint64			seg_alloc_counter;	/* 单调递增,发放 alloc_seq */
 	TimestampTz		last_score_refresh;	/* 上次衰减打分时刻(seg_lock 下) */
 
@@ -723,6 +730,7 @@ RowCacheShmemInit(void)
 		seg->wash_idle_rounds = 0;
 	}
 	RowCacheCtl->free_seg_head = (nsegs > 0) ? 0 : -1;
+	pg_atomic_init_u32(&RowCacheCtl->free_seg_count, (uint32) nsegs);
 }
 
 /* ----------------------------------------------------------------
@@ -1453,6 +1461,19 @@ SegPrepareReuse(int32 sid)
 	seg->wash_idle_rounds = 0;
 }
 
+/*
+ * 把段挂回全局空闲链并同步计数。调用方持 seg_lock EXCLUSIVE。
+ * 所有"归还空闲段"的路径都必须走这里,否则 free_seg_count 会与链表脱节
+ * (回填的入口闸门依赖该计数)。
+ */
+static inline void
+SegPushFree(int32 sid)
+{
+	RowCacheSegs[sid].next_seg = RowCacheCtl->free_seg_head;
+	RowCacheCtl->free_seg_head = sid;
+	pg_atomic_fetch_add_u32(&RowCacheCtl->free_seg_count, 1);
+}
+
 /* 调用方持 seg_lock EXCLUSIVE。保留 ACTIVE 段已经积累的热点分数。 */
 static inline void
 SegSeal(RowCacheSegment *seg)
@@ -1486,8 +1507,7 @@ ReleaseAllSegmentsForRel(RelMeta *rm)
 		int32		next = seg->next_seg;
 
 		SegPrepareReuse(sid);
-		seg->next_seg = RowCacheCtl->free_seg_head;
-		RowCacheCtl->free_seg_head = sid;
+		SegPushFree(sid);
 		sid = next;
 	}
 	rm->first_seg = -1;
@@ -1686,6 +1706,7 @@ SegPopOrEvict(Oid loading_dboid, Oid loading_relid)
 
 		RowCacheCtl->free_seg_head = RowCacheSegs[sid].next_seg;
 		RowCacheSegs[sid].next_seg = -1;
+		pg_atomic_fetch_sub_u32(&RowCacheCtl->free_seg_count, 1);
 		return sid;
 	}
 	/* 空闲链耗尽 = 段需求信号,washer 据此维持水位。 */
@@ -1778,6 +1799,7 @@ SegBackfillAlloc(RelMeta *rm, Size need)
 
 		nid = RowCacheCtl->free_seg_head;
 		RowCacheCtl->free_seg_head = RowCacheSegs[nid].next_seg;
+		pg_atomic_fetch_sub_u32(&RowCacheCtl->free_seg_count, 1);
 
 		{
 			RowCacheSegment *nseg = &RowCacheSegs[nid];
@@ -2921,6 +2943,7 @@ RelationRowCacheInvalGen(RelMeta *rm)
  */
 bool
 RelationRowCacheBackfillBound(RelMeta *rm, Oid expected_relid,
+							  const RowCachePkeyDesc *descs, int nvals,
 							  TupleTableSlot *slot, uint64 gen_seen)
 {
 	SerializedPkey pkey;
@@ -2928,7 +2951,7 @@ RelationRowCacheBackfillBound(RelMeta *rm, Oid expected_relid,
 	uint32		bucket;
 	HeapTuple	src = NULL;
 	bool		src_should_free = false;
-	HeapTuple	htup;
+	HeapTuple	htup = NULL;
 	Size		flat_size;
 	uint32		htup_off;
 	uint32		varlen_off;
@@ -2944,48 +2967,69 @@ RelationRowCacheBackfillBound(RelMeta *rm, Oid expected_relid,
 		return false;
 	if (RowCacheCtl == NULL)
 		return false;
+	if (descs == NULL || nvals <= 0 || nvals > ROW_CACHE_PKEY_MAX_ATTS)
+		return false;
+
+	/*
+	 * 空闲段闸门:空闲链干涸时回填注定失败(SegBackfillAlloc 只弹空闲链、
+	 * 绝不淘汰), 此时**连 build_lock SHARED 都不要去拿** —— 否则就是
+	 * "明知会失败还先把唯一能造段的人挡在门外":washer 淘汰段时对属主表
+	 * 用 conditional EXCLUSIVE, 高并发回填持续持有 SHARED 会让它每轮都
+	 * 失败, 于是 free 永远补不上、回填永远失败, 形成自维持的死循环
+	 * (实测 30 并发即 100% 触发, 缓存内容被冻结成随机快照)。
+	 *
+	 * 让路后 washer 下一轮即可拿到 EXCLUSIVE 补足水位, 回填随之恢复 ——
+	 * 系统在"回填"与"造段"之间自动交替, 具备自愈能力。
+	 *
+	 * 代价:当前写入段剩余空间(< 1 个段)在此期间不会被用满, 相对僵局
+	 * 的代价可忽略。
+	 */
+	if (pg_atomic_read_u32(&RowCacheCtl->free_seg_count) == 0)
+	{
+		/*
+		 * 必须照常登记段需求:washer 只在 seg_demand > 0 时才洗段, 而本
+		 * 闸门跳过了 SegBackfillAlloc(原本的信号来源)。漏掉这一步会把
+		 * washer 的唤醒信号一并切断, 空闲链永远补不上 —— 比原问题更糟。
+		 */
+		pg_atomic_fetch_add_u32(&RowCacheCtl->seg_demand, 1);
+		return false;
+	}
 
 	/* 快速预检:期间已有 DML,不必白做 flatten。 */
 	if (pg_atomic_read_u64(&rm->inval_counter) != gen_seen)
 		return false;
 
-	/*
-	 * build_lock SHARED(conditional):挡住 drop/load/指纹失效/淘汰
-	 * (均取 EXCLUSIVE)对段链与段内存的并发变更;表正被维护时直接
-	 * 放弃。多个回填者 SHARED 共享,互相靠原子 bump 并行。
+	/* ---------------- 以下为锁外准备(不需要 build_lock) ----------------
+	 *
+	 * 行状态三关、主键序列化、元组物化与尺寸测量都只依赖 slot 与 backend
+	 * 本地的 pkey 描述符快照, 与共享状态无关。把它们放在取锁之前, 使
+	 * build_lock SHARED 的持有窗口从"整行 flatten + 分配 + 插链"缩到
+	 * "分配 + memcpy + 插链", 显著降低 washer 撞不进缝隙的概率。
 	 */
-	if (!LWLockConditionalAcquire(&rm->build_lock, LW_SHARED))
-		return false;
-
-	if (rm->dboid != MyDatabaseId || rm->relid != expected_relid ||
-		pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED ||
-		rm->n_pkey_attrs <= 0 ||
-		rm->n_pkey_attrs > ROW_CACHE_PKEY_MAX_ATTS)
-		goto out;
 
 	/* 行状态三关。 */
 	src = ExecFetchSlotHeapTuple(slot, false, &src_should_free);
 	if (src == NULL || src->t_data == NULL)
-		goto out;
+		goto out_nolock;
 	{
 		uint16		infomask = src->t_data->t_infomask;
 
 		if (!(infomask & HEAP_XMIN_COMMITTED))
-			goto out;
+			goto out_nolock;
 		if (!(infomask & HEAP_XMAX_INVALID) &&
 			!HEAP_XMAX_IS_LOCKED_ONLY(infomask))
-			goto out;
+			goto out_nolock;
 		if (HeapTupleIsHotUpdated(src))
-			goto out;
+			goto out_nolock;
 	}
 
 	/*
 	 * S4:按真实返回行的主键编码,不使用查询参数。即使其它索引的
 	 * collation 认为不同字节等价,回填条目仍与 DML 失效键完全一致。
+	 * 描述符用 backend 本地快照(与探测同源),不读共享 rm->pkey_descs。
 	 */
-	if (!SerializePkeyFromSlot(slot, rm->n_pkey_attrs,
-							rm->pkey_descs, &pkey))
-		goto out;
+	if (!SerializePkeyFromSlot(slot, nvals, descs, &pkey))
+		goto out_nolock;
 	pkey_hash = ComputePkeyHashBytes(pkey.data, pkey.len);
 	bucket = pkey_hash & RowCacheCtl->bucket_mask;
 
@@ -2993,17 +3037,30 @@ RelationRowCacheBackfillBound(RelMeta *rm, Oid expected_relid,
 	htup = ExecCopySlotHeapTuple(slot);
 	flat_size = FlatTupleComputeSize(slot, htup, &htup_off, &varlen_off);
 
+	/* ---------------- 以下需要 build_lock SHARED ----------------
+	 *
+	 * 挡住 drop/load/指纹失效/淘汰(均取 EXCLUSIVE)对段链与段内存的
+	 * 并发变更;表正被维护时直接放弃。多个回填者 SHARED 共享,互相靠
+	 * 原子 bump 并行。
+	 */
+	if (!LWLockConditionalAcquire(&rm->build_lock, LW_SHARED))
+		goto out_nolock;
+
+	/* 锁内复查身份与描述符形状(锁外快照可能已过期)。 */
+	if (rm->dboid != MyDatabaseId || rm->relid != expected_relid ||
+		pg_atomic_read_u32(&rm->state) != RELMETA_ENABLED ||
+		rm->n_pkey_attrs != nvals)
+		goto out;
+
 	e = SegBackfillAlloc(rm, EntryFlatOffset(pkey.len) + flat_size);
 	if (e == NULL)
-	{
-		heap_freetuple(htup);
-		goto out;
-	}
+		goto out;				/* 段池无空闲段:htup 由统一出口释放 */
 
 	StoreEntryPkey(e, &pkey);
 	FlatTupleFillInto(ENTRY_FLAT(e), flat_size, htup_off, varlen_off,
 					  slot, htup);
 	heap_freetuple(htup);
+	htup = NULL;
 
 	e->pkey_hash = pkey_hash;
 	ItemPointerCopy(&slot->tts_tid, &e->tid);
@@ -3034,10 +3091,15 @@ RelationRowCacheBackfillBound(RelMeta *rm, Oid expected_relid,
 	}
 
 out:
+	LWLockRelease(&rm->build_lock);
+
+out_nolock:
+	/* 统一出口:out_nolock 处尚未持有 build_lock,其余资源两处相同。 */
+	if (htup != NULL)
+		heap_freetuple(htup);
 	SerializedPkeyRelease(&pkey);
 	if (src_should_free && src != NULL)
 		heap_freetuple(src);
-	LWLockRelease(&rm->build_lock);
 	return inserted;
 }
 
@@ -3132,11 +3194,7 @@ RowCacheWashRound(void)
 	demand = pg_atomic_exchange_u32(&RowCacheCtl->seg_demand, 0);
 	if (demand > 0)
 	{
-		free_cnt = 0;
-		for (int32 s = RowCacheCtl->free_seg_head; s >= 0;
-			 s = RowCacheSegs[s].next_seg)
-			free_cnt++;
-
+		free_cnt = (int32) pg_atomic_read_u32(&RowCacheCtl->free_seg_count);
 		target = Max(1, RowCacheCtl->n_segments / 16);
 
 		while (free_cnt < target)
@@ -3145,8 +3203,7 @@ RowCacheWashRound(void)
 
 			if (sid < 0)
 				break;			/* 没有可淘汰段(全 FREE/ACTIVE/表被锁) */
-			RowCacheSegs[sid].next_seg = RowCacheCtl->free_seg_head;
-			RowCacheCtl->free_seg_head = sid;
+			SegPushFree(sid);
 			free_cnt++;
 		}
 

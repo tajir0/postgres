@@ -102,6 +102,8 @@ extern PGDLLIMPORT bool row_cache_backfill;
 extern uint64 RelationRowCacheInvalGen(struct RelMeta *rm);
 extern bool RelationRowCacheBackfillBound(struct RelMeta *rm,
 										  Oid expected_relid,
+										  const RowCachePkeyDesc *descs,
+										  int nvals,
 										  TupleTableSlot *slot,
 										  uint64 gen_seen);
 

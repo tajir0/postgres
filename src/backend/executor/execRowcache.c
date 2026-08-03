@@ -268,6 +268,8 @@ ExecIndexRowCacheBackfill(IndexScanState *node, TupleTableSlot *slot)
 
 	(void) RelationRowCacheBackfillBound(node->iss_RowCacheMeta,
 										 RelationGetRelid(node->ss.ss_currentRelation),
+										 node->ss.ss_currentRelation->rd_rowcache_pkey_descs,
+										 node->ss.ss_currentRelation->rd_rowcache_pkey_n,
 										 slot,
 										 node->iss_RowCacheInvalGen);
 }
