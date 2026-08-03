@@ -295,6 +295,14 @@ typedef struct SerializedPkey
 #define ROW_CACHE_SEAL_IDLE_ROUNDS	5		/* ACTIVE 段空闲 N 轮(约 1s)后封存 */
 
 /*
+ * washer 补水位时属主 build_lock 被在途回填占住的重试参数。
+ * 单次让路 0.2ms(约一个回填持锁窗口), 一轮最多重试 32 次 —— 最坏
+ * 额外耗时 ~6.4ms, 远小于 200ms 的洗段周期, 不影响打分节奏。
+ */
+#define ROW_CACHE_WASH_RETRY_MAX	32
+#define ROW_CACHE_WASH_RETRY_USEC	200
+
+/*
  * 段描述符(池外定长数组)。字段无原子:分配/封存由持 build_lock 的
  * loader 单写;归还/淘汰在 seg_lock(+victim build_lock)下串行。
  */
@@ -1614,11 +1622,14 @@ SegPickVictim(Oid exempt_dboid, Oid exempt_relid,
  * 调用方持 seg_lock EXCLUSIVE。返回段号(已不在任何链上)。
  */
 static int32
-SegEvictOne(Oid exempt_dboid, Oid exempt_relid)
+SegEvictOne(Oid exempt_dboid, Oid exempt_relid, bool *lock_busy)
 {
 	Oid			skip_dboids[ROW_CACHE_MAX_RELATIONS];
 	Oid			skip_relids[ROW_CACHE_MAX_RELATIONS];
 	int			nskip = 0;
+
+	if (lock_busy != NULL)
+		*lock_busy = false;
 
 	/* 打分陈旧时补一轮刷新(washer 常态每周期维护)。 */
 	if (TimestampDifferenceExceeds(RowCacheCtl->last_score_refresh,
@@ -1636,7 +1647,17 @@ SegEvictOne(Oid exempt_dboid, Oid exempt_relid)
 		int32		cur;
 
 		if (victim < 0)
-			return -1;			/* 候选已穷尽:真·无可淘汰段 */
+		{
+			/*
+			 * 候选穷尽。区分两种情形供调用方决策:
+			 *   nskip > 0 —— 候选是被"属主锁忙"逐个排除掉的, 属临时状态,
+			 *                 稍后重试有意义(washer 据此重试);
+			 *   nskip = 0 —— 池里真的没有可淘汰的 FULL 段, 重试纯属浪费。
+			 */
+			if (lock_busy != NULL && nskip > 0)
+				*lock_busy = true;
+			return -1;
+		}
 
 		vseg = &RowCacheSegs[victim];
 		vrm = FindRelMeta(vseg->dboid, vseg->relid);
@@ -1654,9 +1675,13 @@ SegEvictOne(Oid exempt_dboid, Oid exempt_relid)
 
 		if (!LWLockConditionalAcquire(&vrm->build_lock, LW_EXCLUSIVE))
 		{
-			/* 属主正被 load/drop:记入 skip 集合,换下一个属主。 */
+			/* 属主锁忙(load/drop 或高并发回填持 SHARED):记入 skip 换下一个。 */
 			if (nskip >= ROW_CACHE_MAX_RELATIONS)
+			{
+				if (lock_busy != NULL)
+					*lock_busy = true;
 				return -1;		/* 防御:不应发生(属主数受槽数限制) */
+			}
 			skip_dboids[nskip] = vseg->dboid;
 			skip_relids[nskip] = vseg->relid;
 			nskip++;
@@ -1711,7 +1736,8 @@ SegPopOrEvict(Oid loading_dboid, Oid loading_relid)
 	}
 	/* 空闲链耗尽 = 段需求信号,washer 据此维持水位。 */
 	pg_atomic_fetch_add_u32(&RowCacheCtl->seg_demand, 1);
-	return SegEvictOne(loading_dboid, loading_relid);
+	/* load 路径不重试:它自己持有本表 build_lock, 等不起也不该等。 */
+	return SegEvictOne(loading_dboid, loading_relid, NULL);
 }
 
 /*
@@ -3183,6 +3209,7 @@ RowCacheWashRound(void)
 	int32		free_cnt;
 	int32		target;
 	uint32		demand;
+	int			retries = 0;
 
 	if (RowCacheCtl == NULL)
 		return;
@@ -3197,14 +3224,38 @@ RowCacheWashRound(void)
 		free_cnt = (int32) pg_atomic_read_u32(&RowCacheCtl->free_seg_count);
 		target = Max(1, RowCacheCtl->n_segments / 16);
 
+		/*
+		 * 补水位。属主锁忙时不能一失败就退出整轮 —— 高并发回填持续持有
+		 * build_lock SHARED, 单表场景下一次 conditional 失败就 break 会
+		 * 让 washer 每轮只洗出一两段, 水位永远补不回来(实测 free 恒 0
+		 * 而 sum(seq_num) 仅缓慢增长)。
+		 *
+		 * 改为:锁忙则**先放开 seg_lock**, 让在途回填跑完手上的活, 稍后
+		 * 重试。绝不能持着 seg_lock 睡 —— 那会阻塞所有回填换段, 比不重试
+		 * 更糟。真的没有可淘汰段(lock_busy = false)则立即退出, 不做无谓
+		 * 等待。
+		 */
 		while (free_cnt < target)
 		{
-			int32		sid = SegEvictOne(InvalidOid, InvalidOid);
+			bool		lock_busy = false;
+			int32		sid = SegEvictOne(InvalidOid, InvalidOid, &lock_busy);
 
-			if (sid < 0)
-				break;			/* 没有可淘汰段(全 FREE/ACTIVE/表被锁) */
-			SegPushFree(sid);
-			free_cnt++;
+			if (sid >= 0)
+			{
+				SegPushFree(sid);
+				free_cnt++;
+				continue;
+			}
+
+			if (!lock_busy || ++retries > ROW_CACHE_WASH_RETRY_MAX)
+				break;			/* 无可淘汰段, 或本轮重试已用尽 */
+
+			LWLockRelease(&RowCacheCtl->seg_lock);
+			pg_usleep(ROW_CACHE_WASH_RETRY_USEC);
+			LWLockAcquire(&RowCacheCtl->seg_lock, LW_EXCLUSIVE);
+
+			/* 让路期间空闲段可能已被消耗或补充, 重新取真实值。 */
+			free_cnt = (int32) pg_atomic_read_u32(&RowCacheCtl->free_seg_count);
 		}
 
 		/*
