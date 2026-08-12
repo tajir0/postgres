@@ -43,6 +43,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_database_d.h"
 #include "commands/vacuum.h"
+#include "lib/relation_row_cache.h"
 #include "pgstat.h"
 #include "port/pg_bitutils.h"
 #include "storage/lmgr.h"
@@ -3167,6 +3168,8 @@ l1:
 	 */
 	CacheInvalidateHeapTuple(relation, &tp, NULL);
 
+	RowCacheOnHeapDelete(relation, &tp);
+
 	/* Now we can release the buffer */
 	ReleaseBuffer(buffer);
 
@@ -4158,6 +4161,8 @@ l2:
 	 * sinval messages.)
 	 */
 	CacheInvalidateHeapTuple(relation, &oldtup, heaptup);
+
+	RowCacheOnHeapUpdate(relation, &oldtup, heaptup);
 
 	/* Now we can release the buffer(s) */
 	if (newbuf != buffer)

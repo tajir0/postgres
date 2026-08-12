@@ -51,6 +51,7 @@
 #include "common/file_utils.h"
 #include "common/scram-common.h"
 #include "jit/jit.h"
+#include "lib/relation_row_cache.h"
 #include "libpq/auth.h"
 #include "libpq/libpq.h"
 #include "libpq/oauth.h"
@@ -825,6 +826,15 @@ struct config_bool ConfigureNamesBool[] =
 			GUC_EXPLAIN
 		},
 		&enable_indexonlyscan,
+		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"row_cache_backfill", PGC_USERSET, RESOURCES_MEM,
+			gettext_noop("Enables on-demand row cache backfill after point-query misses."),
+			gettext_noop("Backfill is best-effort: it never evicts segments and never waits for memory.")
+		},
+		&row_cache_backfill,
 		true,
 		NULL, NULL, NULL
 	},
@@ -2383,6 +2393,20 @@ struct config_int ConfigureNamesInt[] =
 		&NBuffers,
 		16384, 16, INT_MAX / 2,
 		NULL, NULL, NULL
+	},
+
+	{
+		{"row_cache_size", PGC_POSTMASTER, RESOURCES_MEM,
+			gettext_noop("Sets the size of the shared row cache data pool."),
+			gettext_noop("The pool is carved into fixed 1MB segments at server start; "
+						 "rows are bump-allocated into segments and reclaimed segment-wise. "
+						 "Zero disables the row cache entirely: no shared memory is "
+						 "reserved and the background washer is not started."),
+			GUC_UNIT_MB
+		},
+		&row_cache_size_mb,
+		ROW_CACHE_DEFAULT_SIZE_MB, ROW_CACHE_MIN_SIZE_MB, ROW_CACHE_MAX_SIZE_MB,
+		check_row_cache_size, NULL, NULL
 	},
 
 	{

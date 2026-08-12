@@ -68,6 +68,7 @@
 #include "commands/publicationcmds.h"
 #include "commands/trigger.h"
 #include "common/int.h"
+#include "lib/relation_row_cache.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -1277,6 +1278,15 @@ retry:
 
 	/* make sure relation is marked as having no open file yet */
 	relation->rd_smgr = NULL;
+
+	/*
+	 * 从共享 RelMeta 数组绑定行缓存快照(rd_rowcache_meta + pkey 描述符)。
+	 * 缓存模块未 attach(bootstrap)或该关系无缓存时为 no-op。只碰共享内存,
+	 * 从不读系统表,所以在随后那段"禁止读 catalog"的区域里是安全的。由于
+	 * RelationClearRelation 的重建会把这些字段从新建的描述符 swap 进来,一次
+	 * SI 失效(行缓存 Load/Drop 会广播它)会自动刷新这份绑定。
+	 */
+	RelationRowCacheBindRelation(relation);
 
 	/*
 	 * now we can free the memory allocated for pg_class_tuple

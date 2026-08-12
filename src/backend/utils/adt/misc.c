@@ -23,6 +23,7 @@
 
 #include "access/sysattr.h"
 #include "access/table.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
 #include "catalog/system_fk_info.h"
@@ -40,6 +41,8 @@
 #include "storage/fd.h"
 #include "storage/latch.h"
 #include "tcop/tcopprot.h"
+#include "lib/relation_row_cache.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -64,6 +67,261 @@ typedef struct ValidIOData
 static bool pg_input_is_valid_common(FunctionCallInfo fcinfo,
 									 text *txt, text *typname,
 									 ErrorSaveContext *escontext);
+static bool register_relation_row_cache_internal(Oid relid, bool scan_rows);
+static bool load_relation_row_cache_internal(Oid relid);
+static bool enable_relation_row_cache_internal(Oid relid);
+static bool disable_relation_row_cache_internal(Oid relid);
+
+/*
+ * 根据 relid 加载关系到后端两级行缓存。
+ *
+ * 返回 true 表示成功；返回 false 表示关系不存在、关系类型不支持
+ * 或权限不足。
+ */
+/*
+ * 注册一张关系的行缓存。scan_rows 决定语义:
+ *
+ *   true  (load)   全表扫描灌入。须持 ShareLock 挡写:扫描拷贝某行之后、
+ *                  ENABLED 之前,并发 DML 的行级失效会因 state != ENABLED
+ *                  被跳过,而该 DML 打的 xmax 不在已拷贝的副本上——缓存会
+ *                  带着"xmax 干净的旧版本"上线。挡写让整个 LOADING 窗口内
+ *                  表静止,窗口关闭。
+ *
+ *   false (enable) 只注册,不扫描。没有扫描窗口 ⇒ 上述洞不存在 ⇒ 只需
+ *                  AccessShareLock,不阻塞 DML 与 autovacuum(大表尤其
+ *                  重要)。行由按需回填逐步填入;回填自身的微秒级窗口由
+ *                  RelMeta.inval_counter 屏障处理。
+ */
+static bool
+register_relation_row_cache_internal(Oid relid, bool scan_rows)
+{
+	Relation	rel;
+	LOCKMODE	lockmode = scan_rows ? ShareLock : AccessShareLock;
+
+	/*
+	 * fail immediately if feature is disabled —— 必须早于 try_table_open:
+	 * load 语义取 ShareLock,特性关闭时还去锁队列里排一趟队毫无意义,
+	 * 而且会连带阻塞其后本可与写事务并行的 DML。
+	 */
+	if (!RowCacheIsEnabled())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("row cache is disabled"),
+				 errhint("Set \"row_cache_size\" to a nonzero value.")));
+
+	if (!OidIsValid(relid))
+		return false;
+
+	/*
+	 * 锁前权限预检(best-effort):未授权请求绝不能进入 ShareLock 的
+	 * 等待队列——PG 锁队列公平排队,一个排在长写事务之后的未授权
+	 * ShareLock 请求,会连带阻塞其后本可与写事务并行的 RowExclusiveLock
+	 * (正常 DML)。此处无锁读 syscache 只作快速拒绝,不作准;等待期间
+	 * 的权限/表变化由取锁后的复查兜底。
+	 */
+	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid)))
+		return false;
+	if (pg_class_aclcheck(relid, GetUserId(), ACL_MAINTAIN) != ACLCHECK_OK)
+		return false;
+
+	rel = try_table_open(relid, lockmode);
+	if (rel == NULL)
+		return false;
+
+	if (!RELKIND_HAS_TABLE_AM(rel->rd_rel->relkind))
+	{
+		table_close(rel, lockmode);
+		return false;
+	}
+
+	/*
+	 * 锁后权威复查:MAINTAIN(而非 SELECT)——注册行缓存是维护操作,
+	 * 且 load 持 ShareLock 挡写直至全表扫完,只读用户不应能借此阻塞大表
+	 * 的 DML 与 autovacuum。语义与 VACUUM/ANALYZE 对齐(owner 隐含
+	 * MAINTAIN)。
+	 */
+	if (pg_class_aclcheck(relid, GetUserId(), ACL_MAINTAIN) != ACLCHECK_OK)
+	{
+		table_close(rel, lockmode);
+		return false;
+	}
+
+	RelationRowCacheLoadRelation(rel, scan_rows);
+	table_close(rel, lockmode);
+	return true;
+}
+
+static bool
+load_relation_row_cache_internal(Oid relid)
+{
+	return register_relation_row_cache_internal(relid, true);
+}
+
+static bool
+enable_relation_row_cache_internal(Oid relid)
+{
+	return register_relation_row_cache_internal(relid, false);
+}
+
+/*
+ * pg_load_relation_row_cache(oid)
+ * 按 table oid 加载关系到后端两级行缓存。
+ */
+Datum
+pg_load_relation_row_cache_oid(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+
+	PG_RETURN_BOOL(load_relation_row_cache_internal(relid));
+}
+
+/*
+ * pg_load_relation_row_cache(text)
+ * 按表名加载关系到后端两级行缓存。
+ *
+ * 入参通过 regclassin 解析，支持 schema.table 以及带引号标识符。
+ */
+Datum
+pg_load_relation_row_cache_name(PG_FUNCTION_ARGS)
+{
+	char	   *class_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	Datum		relid_datum;
+	Oid			relid;
+	ErrorSaveContext escontext = {T_ErrorSaveContext};
+
+	if (!DirectInputFunctionCallSafe(regclassin, class_name,
+									 InvalidOid, -1,
+									 (Node *) &escontext,
+									 &relid_datum))
+		PG_RETURN_BOOL(false);
+
+	relid = DatumGetObjectId(relid_datum);
+	PG_RETURN_BOOL(load_relation_row_cache_internal(relid));
+}
+
+/*
+ * pg_enable_relation_row_cache(oid)
+ * 按 table oid 开启行缓存,但不预热:只注册元数据与 schema 指纹,
+ * 行由点查 miss 后的按需回填逐步填入。
+ *
+ * 相对 load 的取舍:零预热成本、只有真被访问的行才占用段空间、且只取
+ * AccessShareLock 不阻塞 DML;代价是有命中率爬升期。适合大表;小而热
+ * 的表用 pg_load_relation_row_cache 一次装满更划算。
+ */
+Datum
+pg_enable_relation_row_cache_oid(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+
+	PG_RETURN_BOOL(enable_relation_row_cache_internal(relid));
+}
+
+/*
+ * pg_enable_relation_row_cache(text)
+ * 按表名开启行缓存(不预热)。入参通过 regclassin 解析。
+ */
+Datum
+pg_enable_relation_row_cache_name(PG_FUNCTION_ARGS)
+{
+	char	   *class_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	Datum		relid_datum;
+	Oid			relid;
+	ErrorSaveContext escontext = {T_ErrorSaveContext};
+
+	if (!DirectInputFunctionCallSafe(regclassin, class_name,
+									 InvalidOid, -1,
+									 (Node *) &escontext,
+									 &relid_datum))
+		PG_RETURN_BOOL(false);
+
+	relid = DatumGetObjectId(relid_datum);
+	PG_RETURN_BOOL(enable_relation_row_cache_internal(relid));
+}
+
+/*
+ * 根据 relid 从后端两级行缓存中清除关系。
+ *
+ * 返回 true 表示成功；返回 false 表示关系不存在、关系类型不支持
+ * 或权限不足。
+ */
+static bool
+disable_relation_row_cache_internal(Oid relid)
+{
+	Relation	rel;
+
+	/* fail immediately if feature is disabled(与 load 对称) */
+	if (!RowCacheIsEnabled())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("row cache is disabled"),
+				 errhint("Set \"row_cache_size\" to a nonzero value.")));
+
+	if (!OidIsValid(relid))
+		return false;
+
+	/* 与 load 对称:锁前预检,未授权请求不进入锁等待队列。 */
+	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid)))
+		return false;
+	if (pg_class_aclcheck(relid, GetUserId(), ACL_MAINTAIN) != ACLCHECK_OK)
+		return false;
+
+	rel = try_table_open(relid, AccessShareLock);
+	if (rel == NULL)
+		return false;
+
+	if (!RELKIND_HAS_TABLE_AM(rel->rd_rel->relkind))
+	{
+		table_close(rel, AccessShareLock);
+		return false;
+	}
+
+	/* 与 load 对称:卸载他人表的缓存同样是维护操作。 */
+	if (pg_class_aclcheck(relid, GetUserId(), ACL_MAINTAIN) != ACLCHECK_OK)
+	{
+		table_close(rel, AccessShareLock);
+		return false;
+	}
+
+	table_close(rel, AccessShareLock);
+	RelationRowCacheDropRelation(relid);
+	return true;
+}
+
+/*
+ * pg_disable_relation_row_cache(oid)
+ * 按 table oid 从后端两级行缓存中清除关系。
+ */
+Datum
+pg_disable_relation_row_cache_oid(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+
+	PG_RETURN_BOOL(disable_relation_row_cache_internal(relid));
+}
+
+/*
+ * pg_disable_relation_row_cache(text)
+ * 按表名从后端两级行缓存中清除关系。
+ *
+ * 入参通过 regclassin 解析，支持 schema.table 以及带引号标识符。
+ */
+Datum
+pg_disable_relation_row_cache_name(PG_FUNCTION_ARGS)
+{
+	char	   *class_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	Datum		relid_datum;
+	Oid			relid;
+	ErrorSaveContext escontext = {T_ErrorSaveContext};
+
+	if (!DirectInputFunctionCallSafe(regclassin, class_name,
+									 InvalidOid, -1,
+									 (Node *) &escontext,
+									 &relid_datum))
+		PG_RETURN_BOOL(false);
+
+	relid = DatumGetObjectId(relid_datum);
+	PG_RETURN_BOOL(disable_relation_row_cache_internal(relid));
+}
 
 
 /*
@@ -1122,3 +1380,4 @@ any_value_transfn(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_DATUM(PG_GETARG_DATUM(0));
 }
+

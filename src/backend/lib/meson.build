@@ -9,5 +9,6 @@ backend_sources += files(
   'integerset.c',
   'knapsack.c',
   'pairingheap.c',
+  'relation_row_cache.c',
   'rbtree.c',
 )

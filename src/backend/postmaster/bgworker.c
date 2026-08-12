@@ -15,6 +15,7 @@
 #include "access/parallel.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
+#include "lib/relation_row_cache.h"
 #include "pgstat.h"
 #include "port/atomics.h"
 #include "postmaster/bgworker_internals.h"
@@ -132,6 +133,9 @@ static const struct
 	},
 	{
 		"TablesyncWorkerMain", TablesyncWorkerMain
+	},
+	{
+		"RowCacheWasherMain", RowCacheWasherMain
 	}
 };
 

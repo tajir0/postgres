@@ -31,6 +31,29 @@
 
 
 /*
+ * 行缓存 pkey 描述符的容量上限。放在这里(而不是 lib/relation_row_cache.h,
+ * 那个头文件会 include 本头文件,放过去会形成循环依赖),好让 RelationData 能
+ * 内嵌一份缓存 pkey schema 的 backend 本地快照。必须与 lib/relation_row_cache.c
+ * 中的权威用法一致,那里用 StaticAssert 保证 ROW_CACHE_PKEY_MAX_ATTS <= INDEX_MAX_KEYS。
+ */
+#define ROW_CACHE_PKEY_MAX_ATTS		8
+
+/*
+ * 行缓存主键单列描述符。共享 RelMeta 与 backend 本地 RelationData 各持
+ * 一份同构快照:读/DML 路径据此规范化 Datum,不必在热路径查询系统目录,
+ * 也不会在 RelMeta 槽位并发换代时误读另一关系的类型信息。
+ */
+typedef struct RowCachePkeyDesc
+{
+	AttrNumber	attno;			/* heap attribute number (1-based) */
+	int16		typlen;
+	bool		byval;
+	Oid			typid;
+	Oid			collation;		/* primary-index collation, or InvalidOid */
+} RowCachePkeyDesc;
+
+
+/*
  * LockRelId and LockInfo really belong to lmgr.h, but it's more convenient
  * to declare them here so we can have a LockInfoData field in a Relation.
  */
@@ -253,6 +276,36 @@ typedef struct RelationData
 	bool		pgstat_enabled; /* should relation stats be counted */
 	/* use "struct" here to avoid needing to include pgstat.h: */
 	struct PgStat_TableStatus *pgstat_info; /* statistics collection area */
+
+	/*
+	 * 行缓存绑定:本关系所对应共享 RelMeta 的一份 backend 本地快照,好让执行器 /
+	 * DML 钩子访问缓存时,不必每次都去扫全局 RelMeta 数组。
+	 *
+	 * rd_rowcache_meta 编码三种状态:
+	 *   NULL                 -- 尚未绑定(首次使用时惰性填充,或在
+	 *                           RelationBuildDesc 时主动填充)
+	 *   ROWCACHE_NOT_CACHED  -- 已绑定,且确认本关系没有缓存
+	 *                           (常见情形:单指针快速拒绝)
+	 *   其它                 -- 指向 shmem 中活的 RelMeta 槽
+	 *
+	 * rd_rowcache_pkey_* 是绑定时拍下的缓存 pkey 描述符镜像(列数、按 load/索引
+	 * 顺序排列的 heap attno、类型、传值方式及 collation)。由于 RelationClearRelation
+	 * 里的 swap 不会保留这些字段,一次 SI 驱动的重建会自动从新建的描述符刷新它们
+	 * (RelationBuildDesc 会重新绑定)。见 RelationRowCacheBindRelation()。用 "struct"
+	 * 是为了避免 include lib/relation_row_cache.h(那个头文件又 include 本头文件)。
+	 */
+	struct RelMeta *rd_rowcache_meta;
+	int			rd_rowcache_pkey_n;
+	RowCachePkeyDesc rd_rowcache_pkey_descs[ROW_CACHE_PKEY_MAX_ATTS];
+
+	/*
+	 * 绑定时拍下的全局代数快照(RowCacheControl.global_gen)。
+	 * RelationRowCacheBindRelation 用它判断这份 rd_rowcache_* 是否最新:
+	 * 若 != 当前 global_gen,说明此后有 backend Load/Drop 过缓存,需要重绑。
+	 * 这让"先碰过表、绑了 NOT_CACHED 的 backend"也能在别人 Load 后及时
+	 * 感知(避免 DML 漏失效 / 读路径明明已 Load 却回落原生)。
+	 */
+	uint32		rd_rowcache_gen;
 } RelationData;
 
 

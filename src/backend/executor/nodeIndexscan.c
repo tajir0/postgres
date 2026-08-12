@@ -33,6 +33,8 @@
 #include "access/relscan.h"
 #include "access/tableam.h"
 #include "catalog/pg_am.h"
+#include "access/stratnum.h"
+#include "executor/execRowcache.h"
 #include "executor/executor.h"
 #include "executor/nodeIndexscan.h"
 #include "lib/pairingheap.h"
@@ -89,6 +91,15 @@ IndexNext(IndexScanState *node)
 	 * extract necessary information from index scan node
 	 */
 	estate = node->ss.ps.state;
+	slot = node->ss.ss_ScanTupleSlot;
+
+	/* 行缓存 pkey 快路径(命中即直接返回 slot;否则按 B-树路径继续)。 */
+	if (ExecIndexNextRowCache(node, estate, slot) == ROW_CACHE_TUPLE_RETURNED)
+		return slot;
+
+	/* 若之前某次 IndexNext 已报告扫描结束,直接短路。 */
+	if (node->iss_ReachedEnd)
+		return ExecClearTuple(slot);
 
 	/*
 	 * Determine which direction to scan the index in based on the plan's scan
@@ -98,7 +109,6 @@ IndexNext(IndexScanState *node)
 									 ((IndexScan *) node->ss.ps.plan)->indexorderdir);
 	scandesc = node->iss_ScanDesc;
 	econtext = node->ss.ps.ps_ExprContext;
-	slot = node->ss.ss_ScanTupleSlot;
 
 	if (scandesc == NULL)
 	{
@@ -146,6 +156,9 @@ IndexNext(IndexScanState *node)
 				continue;
 			}
 		}
+
+		/* 点查 miss 后的 best-effort 行缓存回填(S3)。 */
+		ExecIndexRowCacheBackfill(node, slot);
 
 		return slot;
 	}
@@ -588,6 +601,9 @@ ExecReScanIndexScan(IndexScanState *node)
 					 node->iss_ScanKeys, node->iss_NumScanKeys,
 					 node->iss_OrderByKeys, node->iss_NumOrderByKeys);
 	node->iss_ReachedEnd = false;
+
+	/* 为新一轮扫描重新武装行缓存 pkey 快路径(NestLoop 内层每外层 tuple rescan)。 */
+	ExecReScanIndexScanRowCache(node);
 
 	ExecScanReScan(&node->ss);
 }
@@ -1087,6 +1103,18 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
 	{
 		indexstate->iss_RuntimeContext = NULL;
 	}
+
+	/*
+	 * 绑定关系级行缓存快路径。
+	 *
+	 * 优化(#1):先解析 scan 关系的 rd_rowcache_meta 快照,只有这张表
+	 * "确实被行缓存"时才继续做下面的静态 shape 资格计算 + attno 对位
+	 * 匹配。TPC-C 里绝大多数索引扫描打在未缓存的表上(NewOrder 一笔
+	 * ~23 次点查只有 ~10 次是 item),让它们在这里一个指针判断就早退,
+	 * 行缓存对未缓存表近乎零成本——既省掉每次 ExecInit 的 shape 循环,
+	 * 也避免行缓存的存在拖累未缓存表的索引路径。详见 execRowcache.c。
+	 */
+	ExecInitIndexScanRowCache(indexstate);
 
 	/*
 	 * all done.
