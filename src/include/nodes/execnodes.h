@@ -1695,6 +1695,17 @@ typedef struct
  *		PscanLen		   size of parallel index scan descriptor
  * ----------------
  */
+
+/*
+ * 行缓存 per-scan 探测状态(见 IndexScanState.iss_RowCacheProbe)。
+ */
+typedef enum RowCacheProbeState
+{
+	ROW_CACHE_PROBE_NONE = 0,	/* 本轮尚未探测 */
+	ROW_CACHE_PROBE_FALLBACK,	/* 本轮固定继续原生路径 */
+	ROW_CACHE_PROBE_SERVED,		/* 已探测且命中:那唯一一行已返回,本轮结束 */
+} RowCacheProbeState;
+
 typedef struct IndexScanState
 {
 	ScanState	ss;				/* its first field is NodeTag */
@@ -1745,20 +1756,21 @@ typedef struct IndexScanState
 	 * iss_RowCachePkeyIndexNatts:索引的键列数(对上面的资格检查而言
 	 *   == iss_NumScanKeys)。
 	 *
-	 * iss_PkeyAttempted:per-scan 标志,在本扫描实例的第一次 IndexNext 查过
-	 *   缓存后为 true。rescan 时重置,使 NestedLoop 内层扫描对每个新外层
-	 *   tuple 重新查缓存。
+	 * iss_RowCacheProbe:per-scan 探测状态。rescan 时归零,使
+	 *   NestedLoop 内层对每个新外层 tuple 重新查缓存。命中后
+	 *   保留 SERVED,使下一次 IndexNext 返回空 slot,而不会改走
+	 *   原生索引路径将同一行重复返回。
 	 */
 	bool		iss_RowCachePkeyShapeOk;
 	AttrNumber	iss_RowCachePkeyIndexHeapAttnos[INDEX_MAX_KEYS];
 	int			iss_RowCachePkeyIndexNatts;
-	bool		iss_PkeyAttempted;
+	RowCacheProbeState iss_RowCacheProbe;
 
 	/*
 	 * S3 按需回填状态。iss_RowCacheInvalGen:探测 miss 时(读堆之前)
 	 * 记下的该表失效代数,回填插入前在分区锁内比对,期间有 DML 即放弃
 	 * (竞态屏障,防回填复活旧版本)。iss_RowCacheBackfilled:每个扫描
-	 * 实例至多回填一次;rescan 时随 iss_PkeyAttempted 一并重置。
+	 * 实例至多回填一次;rescan 时随 iss_RowCacheProbe 一并重置。
 	 */
 	uint64		iss_RowCacheInvalGen;
 	bool		iss_RowCacheBackfilled;

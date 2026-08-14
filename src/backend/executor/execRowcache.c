@@ -3,7 +3,7 @@
  * execRowcache.c
  *	  执行器接入行缓存的适配层:
  *	    ExecInitIndexScanRowCache  — pkey资格判定 + 绑定 RelMeta
- *	    ExecIndexNextRowCache      — 缓存探测;命中即出 slot,否则回退
+ *	    ExecIndexNextRowCache      — 缓存探测与扫描结束裁决
  *	    ExecReScanIndexScanRowCache — per-scan 状态恢复
  *
  *	  本文件依赖 IndexScanState / EState 等执行器结构体;关系级核心
@@ -41,7 +41,7 @@ ExecInitIndexScanRowCache(IndexScanState *node)
 
 	node->iss_RowCachePkeyShapeOk = false;
 	node->iss_RowCachePkeyIndexNatts = 0;
-	node->iss_PkeyAttempted = false;
+	node->iss_RowCacheProbe = ROW_CACHE_PROBE_NONE;
 	node->iss_RowCacheMeta = NULL;
 	node->iss_RowCachePkeyNatts = 0;
 	node->iss_RowCacheInvalGen = 0;
@@ -176,7 +176,7 @@ ExecInitIndexScanRowCache(IndexScanState *node)
  * 行缓存 pkey 路径。
  *
  */
-RowCacheProbeResult
+bool
 ExecIndexNextRowCache(IndexScanState *node, EState *estate,
 					  TupleTableSlot *slot)
 {
@@ -186,10 +186,23 @@ ExecIndexNextRowCache(IndexScanState *node, EState *estate,
 	bool		has_hot_chain = false;
 	bool		hit;
 
-	if (node->iss_RowCacheMeta == NULL || node->iss_PkeyAttempted)
-		return ROW_CACHE_FALLBACK;
+	if (node->iss_RowCacheMeta == NULL)
+		return false;
 
-	node->iss_PkeyAttempted = true;
+	/*
+	 * true 表示本次 IndexNext 已由行缓存处理:slot 或者包含
+	 * 命中行,或者被清空以表示那唯一一行已返回。false 则走原生路径。
+	 */
+	if (node->iss_RowCacheProbe == ROW_CACHE_PROBE_SERVED)
+	{
+		ExecClearTuple(slot);
+		return true;
+	}
+	if (node->iss_RowCacheProbe == ROW_CACHE_PROBE_FALLBACK)
+		return false;
+
+	/* 本轮若不能命中,之后固定继续原生路径。 */
+	node->iss_RowCacheProbe = ROW_CACHE_PROBE_FALLBACK;
 
 	/*
 	 * 回填竞态屏障 c1(S3):必须在原生路径读堆之前记下本表失效代数。
@@ -200,7 +213,7 @@ ExecIndexNextRowCache(IndexScanState *node, EState *estate,
 
 	/* 所有运行期 ScanKey 必须就绪(NestLoop 内层扫描)。 */
 	if (node->iss_NumRuntimeKeys != 0 && !node->iss_RuntimeKeysReady)
-		return ROW_CACHE_FALLBACK;
+		return false;
 
 	/*
 	 * 从等值 ScanKey 收集每个缓存 pkey 列一个 Datum。attno 匹配已在
@@ -212,7 +225,7 @@ ExecIndexNextRowCache(IndexScanState *node, EState *estate,
 		ScanKey		sk = &node->iss_ScanKeys[i];
 
 		if ((sk->sk_flags & SK_ISNULL) != 0)
-			return ROW_CACHE_FALLBACK;
+			return false;
 		vals[i] = sk->sk_argument;
 	}
 
@@ -226,22 +239,22 @@ ExecIndexNextRowCache(IndexScanState *node, EState *estate,
 
 	if (hit && visible && !has_hot_chain)
 	{
-		node->iss_ReachedEnd = true;
-		return ROW_CACHE_TUPLE_RETURNED;
+		node->iss_RowCacheProbe = ROW_CACHE_PROBE_SERVED;
+		return true;
 	}
 
 	/*
 	 * miss,或缓存里那个 tuple 对我们的 snapshot 不可见、或处于一条
 	 * HOT 链的链头。回退 B-树,走 HOT 链并对着堆重新检查可见性。
 	 */
-	return ROW_CACHE_FALLBACK;
+	return false;
 }
 
 
 void
 ExecReScanIndexScanRowCache(IndexScanState *node)
 {
-	node->iss_PkeyAttempted = false;
+	node->iss_RowCacheProbe = ROW_CACHE_PROBE_NONE;
 	node->iss_RowCacheBackfilled = false;
 }
 
@@ -257,7 +270,7 @@ void
 ExecIndexRowCacheBackfill(IndexScanState *node, TupleTableSlot *slot)
 {
 	if (node->iss_RowCacheMeta == NULL ||
-		!node->iss_PkeyAttempted ||
+		node->iss_RowCacheProbe != ROW_CACHE_PROBE_FALLBACK ||
 		node->iss_RowCacheBackfilled)
 		return;
 

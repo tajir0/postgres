@@ -93,13 +93,9 @@ IndexNext(IndexScanState *node)
 	estate = node->ss.ps.state;
 	slot = node->ss.ss_ScanTupleSlot;
 
-	/* 行缓存 pkey 快路径(命中即直接返回 slot;否则按 B-树路径继续)。 */
-	if (ExecIndexNextRowCache(node, estate, slot) == ROW_CACHE_TUPLE_RETURNED)
+	/* 行缓存已给出本次结果:命中行或空 slot(EOF)。 */
+	if (ExecIndexNextRowCache(node, estate, slot))
 		return slot;
-
-	/* 若之前某次 IndexNext 已报告扫描结束,直接短路。 */
-	if (node->iss_ReachedEnd)
-		return ExecClearTuple(slot);
 
 	/*
 	 * Determine which direction to scan the index in based on the plan's scan
