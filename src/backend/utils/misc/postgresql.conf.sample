@@ -135,10 +135,8 @@
 					# (change requires restart)
 #huge_page_size = 0			# zero for system default
 					# (change requires restart)
-					# (change requires restart)
 #row_cache_size = 0			# 0 disables the row cache; otherwise
 					# min 16MB (change requires restart)
-#row_cache_backfill = on		# on-demand backfill after point-query misses
 #temp_buffers = 8MB			# min 800kB
 #max_prepared_transactions = 0		# zero disables the feature
 					# (change requires restart)

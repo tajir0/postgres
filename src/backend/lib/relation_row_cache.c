@@ -114,9 +114,6 @@
 /* 数据池大小(MB)。段数 = row_cache_size_mb(段固定 1MB)。 */
 int			row_cache_size_mb = ROW_CACHE_DEFAULT_SIZE_MB;
 
-/* GUC:点查 miss 后按需回填开关(S3)。 */
-bool		row_cache_backfill = true;
-
 /* RelMeta.state 取值。 */
 #define RELMETA_DISABLED	0
 #define RELMETA_LOADING		1
@@ -2985,8 +2982,6 @@ RelationRowCacheBackfillBound(RelMeta *rm, Oid expected_relid,
 
 	SerializedPkeyInit(&pkey);
 
-	if (!row_cache_backfill)
-		return false;
 	if (rm == NULL || rm == ROWCACHE_NOT_CACHED || slot == NULL)
 		return false;
 	if (RowCacheCtl == NULL)

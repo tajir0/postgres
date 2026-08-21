@@ -830,15 +830,6 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
-		{"row_cache_backfill", PGC_USERSET, RESOURCES_MEM,
-			gettext_noop("Enables on-demand row cache backfill after point-query misses."),
-			gettext_noop("Backfill is best-effort: it never evicts segments and never waits for memory.")
-		},
-		&row_cache_backfill,
-		true,
-		NULL, NULL, NULL
-	},
-	{
 		{"enable_bitmapscan", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables the planner's use of bitmap-scan plans."),
 			NULL,

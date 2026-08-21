@@ -127,10 +127,9 @@ extern bool RelationRowCachePkeyFetchBound(struct RelMeta *rm,
 										   bool *has_hot_chain);
 
 /*
- * S3:点查 miss 按需回填。GUC row_cache_backfill 总开关;
+ * S3:点查 miss 按需回填(随行缓存启用而生效,无独立开关)。
  * InvalGen 是回填竞态屏障的代数读取(探测 miss 时、读堆之前记下)。
  */
-extern PGDLLIMPORT bool row_cache_backfill;
 extern uint64 RelationRowCacheInvalGen(struct RelMeta *rm);
 extern bool RelationRowCacheBackfillBound(struct RelMeta *rm,
 										  Oid expected_relid,
